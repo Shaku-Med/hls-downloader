@@ -1,0 +1,39 @@
+{
+    "manifest_version": 3,
+    "name": "HLS Grabber",
+    "version": "1.0",
+    "description": "Grabs HLS, DASH, and direct video URLs (including many social sites) and saves them with ffmpeg",
+    "permissions": [
+      "webRequest",
+      "nativeMessaging",
+      "storage",
+      "tabs",
+      "cookies",
+      "alarms"
+    ],
+    "host_permissions": [
+      "<all_urls>"
+    ],
+    "background": {
+      "service_worker": "background.js"
+    },
+    "icons": {
+      "16": "asset/icon-16.png",
+      "32": "asset/icon-32.png",
+      "48": "asset/icon-48.png",
+      "128": "asset/icon-128.png"
+    },
+    "action": {
+      "default_popup": "popup.html",
+      "default_icon": {
+        "16": "asset/icon-16.png",
+        "32": "asset/icon-32.png",
+        "48": "asset/icon-48.png",
+        "128": "asset/icon-128.png"
+      }
+    },
+    "options_ui": {
+      "page": "options.html",
+      "open_in_tab": true
+    }
+  }
