@@ -257,6 +257,8 @@ const NATIVE = 'com.medzy.hlsgrabber';
 const JOBS_KEY = 'hlsGrabJobsState';
 const USER_PATH_KEY = 'userDownloadPath';
 const KEEP_ALARM = 'hlsGrabKeepAlive';
+const HLS_AUTH_REFRESH_ALARM = 'hlsAuthRefresh';
+const HLS_AUTH_MIN_MS = 90 * 1000; // between proactive refreshes
 const MAX_SLOTS = 4;
 
 /** @type {{ port: chrome.runtime.Port | null, jobId: string | null }[]} */
@@ -339,8 +341,154 @@ function syncBadgeAlarm() {
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === KEEP_ALARM) {
     void chrome.storage.session.get(JOBS_KEY);
+    return;
+  }
+  if (a.name === HLS_AUTH_REFRESH_ALARM) {
+    void maybeProactiveHlsAuthRefresh();
   }
 });
+
+function jobLooksLikeHls(j) {
+  if (!j) return false;
+  const u = (j.streamUrl || j.url || '').toLowerCase();
+  const sk = (j.streamKind || '').toLowerCase();
+  if (u.includes('m3u8') || u.includes('m3u') || u.includes('master') || u.includes('playlist.m3u8')) {
+    return true;
+  }
+  if (['hls', 'hls_by_header', 'm3u8', 'm3u', 'apple_hls', 'social'].some((k) => sk.includes(k))) {
+    return true;
+  }
+  return false;
+}
+
+function getCookieStringPromise(streamUrl, pageUrl) {
+  return new Promise((resolve) => {
+    if (!streamUrl) {
+      resolve('');
+      return;
+    }
+    chrome.cookies.getAll({ url: streamUrl }, (forStream) => {
+      const map = new Map();
+      for (const c of forStream || []) {
+        map.set(c.name, c.value);
+      }
+      if (!pageUrl || !/^https?:/i.test(pageUrl)) {
+        resolve(
+          Array.from(map.entries())
+            .map(([a, b]) => `${a}=${b}`)
+            .join('; ')
+        );
+        return;
+      }
+      chrome.cookies.getAll({ url: pageUrl }, (forTab) => {
+        for (const c of forTab || []) {
+          if (!map.has(c.name)) {
+            map.set(c.name, c.value);
+          }
+        }
+        resolve(
+          Array.from(map.entries())
+            .map(([a, b]) => `${a}=${b}`)
+            .join('; ')
+        );
+      });
+    });
+  });
+}
+
+async function maybeProactiveHlsAuthRefresh() {
+  const st = await readJobsState();
+  const jobs = st.jobs || [];
+  const outDir = await getUserDownloadPath();
+  if (!outDir) {
+    return;
+  }
+  const now = Date.now();
+  for (let si = 0; si < MAX_SLOTS; si++) {
+    const jobId = slots[si].jobId;
+    if (!jobId) {
+      continue;
+    }
+    const j = jobs.find((x) => x.id === jobId);
+    if (!j || j.status !== 'downloading' || !jobLooksLikeHls(j) || j.tabId == null) {
+      continue;
+    }
+    const last = j.lastAuthRefresh || j.startedAt || 0;
+    if (now - last < HLS_AUTH_MIN_MS) {
+      continue;
+    }
+    if (j.startedAt && now - j.startedAt < 45_000) {
+      continue; // let first minute finish without a refresh kill
+    }
+    let port;
+    try {
+      port = ensurePort(si);
+    } catch (e) {
+      console.warn('HLS auth refresh: no port', e);
+      continue;
+    }
+    let tab;
+    try {
+      tab = await chrome.tabs.get(j.tabId);
+    } catch {
+      continue;
+    }
+    const list = detectedStreams[j.tabId] || [];
+    const match = list.find((e) => e && e.url === j.streamUrl) || list.find((e) => e && e.url && e.url.includes('m3u8'));
+    const streamUrl = j.streamUrl || (match && match.url);
+    if (!streamUrl) {
+      continue;
+    }
+    const tabUrl = tab.url || '';
+    const u = (globalThis && globalThis.navigator && globalThis.navigator.userAgent) || '';
+    const cookie = await getCookieStringPromise(
+      streamUrl,
+      tabUrl
+    );
+    const payload = {
+      type: 'refresh',
+      jobId,
+      url: streamUrl,
+      filename: (j.fileStem || j.label || 'video').toString() || 'video',
+      userAgent: u || undefined,
+      cookie: cookie || undefined,
+      outputDirectory: outDir,
+      streamKind: j.streamKind || undefined,
+      capturedHeaders: (match && match.capturedHeaders) || {},
+    };
+    if (tabUrl && /^https?:/i.test(tabUrl)) {
+      payload.referer = tabUrl;
+      try {
+        payload.origin = new URL(tabUrl).origin;
+      } catch (_) {
+        // ignore
+      }
+    }
+    try {
+      port.postMessage(payload);
+      await patchJob(jobId, { lastAuthRefresh: now, detail: 'Refreshing session' });
+    } catch (e) {
+      console.warn('HLS auth refresh post', e);
+    }
+  }
+}
+
+function ensureHlsAuthAlarm() {
+  chrome.alarms.get(HLS_AUTH_REFRESH_ALARM, (a) => {
+    if (a) {
+      return;
+    }
+    chrome.alarms.create(HLS_AUTH_REFRESH_ALARM, { periodInMinutes: 1 });
+  });
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  ensureHlsAuthAlarm();
+});
+chrome.runtime.onStartup.addListener(() => {
+  ensureHlsAuthAlarm();
+});
+ensureHlsAuthAlarm();
 
 function findSlotIndexByJobId(jobId) {
   for (let i = 0; i < MAX_SLOTS; i++) {
@@ -589,6 +737,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         detail: 'Waiting',
         error: null,
         outputPath: null,
+        tabId: payload.tabId ?? null,
+        streamUrl: payload.url,
+        streamKind: payload.streamKind || null,
+        fileStem: (payload.filename || label).toString(),
+        lastAuthRefresh: Date.now(),
+        startedAt: Date.now(),
       });
       pendingQueue.push({ jobId, payload: base });
       tryDispatch();

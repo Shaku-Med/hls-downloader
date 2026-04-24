@@ -275,13 +275,16 @@ function renderStreams(streams, pageTitle, hasPath) {
       setStatusRunInBackground(statusEl);
 
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        const tabUrl = tabs[0]?.url || '';
+        const tab = tabs[0];
+        const tabUrl = tab?.url || '';
+        const tabId = tab?.id;
         const capturedHeaders = stream.capturedHeaders || {};
         buildCookieHeader(url, tabUrl, (cookie) => {
           const payload = {
             jobId,
             url,
             filename,
+            tabId: tabId != null ? tabId : undefined,
             streamKind: kind || undefined,
             cookie: cookie || undefined,
             userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : undefined,
