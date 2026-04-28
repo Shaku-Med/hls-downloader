@@ -35,5 +35,18 @@
     "options_ui": {
       "page": "options.html",
       "open_in_tab": true
-    }
+    },
+    "content_scripts": [
+      {
+        "matches": ["http://*/*", "https://*/*"],
+        "js": ["fab.js"],
+        "run_at": "document_idle"
+      }
+    ],
+    "web_accessible_resources": [
+      {
+        "resources": ["asset/icon-16.png", "asset/icon-32.png", "asset/icon-48.png", "asset/icon-128.png"],
+        "matches": ["http://*/*", "https://*/*"]
+      }
+    ]
   }

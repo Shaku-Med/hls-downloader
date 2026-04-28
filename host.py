@@ -15,7 +15,11 @@ import re
 import time
 import hashlib
 import tempfile
-from typing import Optional, Set, Any, Dict
+import shutil
+import urllib.error
+import urllib.request
+from urllib.parse import urljoin, urlsplit, urlunsplit
+from typing import Optional, Set, Any, Dict, List, Tuple
 
 DEFAULT_DOWNLOAD_DIR = os.path.abspath(
     os.path.normpath(os.path.expanduser(os.path.join("~", "Downloads", "TOB")))
@@ -215,7 +219,9 @@ def _clear_active_if(p: Optional[subprocess.Popen]) -> None:
 def _request_cancel() -> None:
     with _PROC_LOCK:
         p = _active_ffmpeg
-    if p is None or p.poll() is not None:
+    has_proc = p is not None and p.poll() is None
+    jid = (_CURRENT_JOB_ID or "").strip()
+    if not has_proc and not jid:
         send_message(
             with_job_id(
                 {
@@ -230,6 +236,8 @@ def _request_cancel() -> None:
         )
         return
     _CANCEL_EVENT.set()
+    if not has_proc:
+        return
     try:
         p.terminate()
     except Exception:
@@ -289,6 +297,639 @@ def _use_hls_aac_bsf(url: str, message) -> bool:
     return False
 
 
+# --- Obfuscated HLS (image-wrapped .ts segments) ---
+
+_PNG_SIG = b"\x89PNG\r\n\x1a\n"
+_PNG_IEND = b"IEND\xae\x42\x60\x82"
+_JPEG_SIG = b"\xff\xd8\xff"
+_GIF_SIG = b"GIF8"
+_WEBP_RIFF = b"RIFF"
+_WEBP_MAGIC = b"WEBP"
+
+
+def _headers_dict_from_block(header_block: str) -> Dict[str, str]:
+    d: Dict[str, str] = {}
+    for line in (header_block or "").split("\r\n"):
+        if not line.strip():
+            continue
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        d[k.strip()] = v.strip()
+    return d
+
+
+def _m3u8_base_url(playlist_url: str) -> str:
+    """Directory base for resolving relative segment URIs (RFC 3986 / HLS)."""
+    u = urlsplit(playlist_url)
+    path = u.path or "/"
+    if "/" in path.rstrip("/"):
+        dirpath = path.rsplit("/", 1)[0] + "/"
+    else:
+        dirpath = "/"
+    return urlunsplit((u.scheme, u.netloc, dirpath, "", ""))
+
+
+def _http_get_bytes(
+    url: str,
+    header_block: str,
+    *,
+    max_bytes: Optional[int] = None,
+    timeout: float = 60.0,
+) -> bytes:
+    headers = _headers_dict_from_block(header_block)
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    out = bytearray()
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        chunk = 64 * 1024
+        while True:
+            if max_bytes is not None and len(out) >= max_bytes:
+                break
+            to_read = chunk
+            if max_bytes is not None:
+                to_read = min(chunk, max_bytes - len(out))
+                if to_read <= 0:
+                    break
+            b = resp.read(to_read)
+            if not b:
+                break
+            out.extend(b)
+    return bytes(out)
+
+
+def _http_get_text(url: str, header_block: str, timeout: float = 60.0) -> str:
+    return _http_get_bytes(url, header_block, max_bytes=None, timeout=timeout).decode(
+        "utf-8", errors="replace"
+    )
+
+
+def _is_master_playlist(text: str) -> bool:
+    return "#EXT-X-STREAM-INF" in text
+
+
+def _select_highest_bandwidth_variant_uri(text: str, base_url: str) -> Optional[str]:
+    lines = [ln.strip() for ln in text.splitlines()]
+    best_bw = -1
+    best_uri: Optional[str] = None
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("#EXT-X-STREAM-INF"):
+            m = re.search(r"BANDWIDTH=(\d+)", line, re.I)
+            bw = int(m.group(1)) if m else 0
+            uri = None
+            j = i + 1
+            while j < len(lines):
+                ln = lines[j]
+                if not ln:
+                    j += 1
+                    continue
+                if ln.startswith("#"):
+                    j += 1
+                    continue
+                uri = ln
+                break
+            if uri:
+                if bw > best_bw:
+                    best_bw = bw
+                    best_uri = uri
+            i = j + 1 if uri else i + 1
+            continue
+        i += 1
+    if best_uri:
+        return urljoin(base_url, best_uri)
+    # No BANDWIDTH match: first stream URI after any STREAM-INF
+    for i, line in enumerate(lines):
+        if line.startswith("#EXT-X-STREAM-INF"):
+            for j in range(i + 1, len(lines)):
+                ln = lines[j]
+                if not ln or ln.startswith("#"):
+                    continue
+                return urljoin(base_url, ln)
+            break
+    return None
+
+
+def _resolve_variant_playlist_url(start_url: str, header_block: str) -> Tuple[str, str]:
+    """
+    Fetch playlist chain; if master, follow highest-bandwidth variant.
+    Returns (variant_playlist_url, variant_playlist_text).
+    """
+    base0 = _m3u8_base_url(start_url)
+    text = _http_get_text(start_url, header_block, timeout=45.0)
+    cur_url = start_url
+    guard = 0
+    while _is_master_playlist(text) and guard < 8:
+        guard += 1
+        var = _select_highest_bandwidth_variant_uri(text, _m3u8_base_url(cur_url))
+        if not var:
+            break
+        cur_url = var
+        text = _http_get_text(cur_url, header_block, timeout=45.0)
+    return cur_url, text
+
+
+def _parse_hls_media_segment_uris(playlist_text: str, playlist_url: str) -> List[str]:
+    base = _m3u8_base_url(playlist_url)
+    out: List[str] = []
+    for line in playlist_text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(urljoin(base, s))
+    return out
+
+
+def _looks_like_ts_at(data: bytes, idx: int) -> bool:
+    n = len(data)
+    if idx < 0 or idx + 376 >= n:
+        return False
+    return (
+        data[idx] == 0x47
+        and data[idx + 188] == 0x47
+        and data[idx + 376] == 0x47
+    )
+
+
+def _find_mpegts_payload_start(data: bytes, start: int = 0) -> int:
+    n = len(data)
+    begin = max(0, start)
+    last_triple = n - 565
+    for i in range(begin, last_triple + 1):
+        if _looks_like_ts_at(data, i):
+            return i
+    for i in range(begin, max(begin, n - 189)):
+        if i + 188 < n and data[i] == 0x47 and data[i + 188] == 0x47:
+            return i
+    return 0
+
+
+def _strip_png_prefix(data: bytes) -> Optional[bytes]:
+    if not data.startswith(_PNG_SIG):
+        return None
+    idx = data.find(_PNG_IEND)
+    if idx < 0:
+        return None
+    off = idx + len(_PNG_IEND)
+    if off <= len(data):
+        return data[off:]
+    return None
+
+
+def _strip_jpeg_prefix(data: bytes) -> Optional[bytes]:
+    if len(data) < 3 or not data.startswith(_JPEG_SIG):
+        return None
+    j = data.rfind(b"\xff\xd9")
+    if j < 0:
+        return None
+    off = j + 2
+    if off <= len(data):
+        return data[off:]
+    return None
+
+
+def _strip_gif_prefix(data: bytes) -> Optional[bytes]:
+    if len(data) < 6 or not data.startswith(_GIF_SIG):
+        return None
+    off = _find_mpegts_payload_start(data, start=6)
+    if off > 0:
+        return data[off:]
+    return None
+
+
+def _strip_webp_prefix(data: bytes) -> Optional[bytes]:
+    if len(data) < 12:
+        return None
+    if data[0:4] != _WEBP_RIFF or data[8:12] != _WEBP_MAGIC:
+        return None
+    chunk_size = struct.unpack("<I", data[4:8])[0]
+    off = 8 + int(chunk_size)
+    if off > len(data):
+        return None
+    return data[off:]
+
+
+def _obfuscation_kind_from_magic(data: bytes) -> Optional[str]:
+    if len(data) >= 8 and data.startswith(_PNG_SIG):
+        return "png"
+    if len(data) >= 3 and data.startswith(_JPEG_SIG):
+        return "jpeg"
+    if len(data) >= 6 and data.startswith(_GIF_SIG):
+        return "gif"
+    if len(data) >= 12 and data[0:4] == _WEBP_RIFF and data[8:12] == _WEBP_MAGIC:
+        return "webp"
+    return None
+
+
+def _extract_ts_payload(data: bytes, hint: Optional[str]) -> bytes:
+    """Remove image wrapper if present; otherwise return data or TS slice from generic scan."""
+    if not data:
+        return data
+    if data[0] == 0x47 and _looks_like_ts_at(data, 0):
+        return data
+
+    order = []
+    if hint in ("png", "jpeg", "gif", "webp", "generic"):
+        order.append(hint)
+    for k in ("png", "jpeg", "gif", "webp"):
+        if k not in order:
+            order.append(k)
+    if "generic" not in order:
+        order.append("generic")
+
+    for kind in order:
+        if kind == "png":
+            s = _strip_png_prefix(data)
+            if s is not None and s:
+                return s
+        elif kind == "jpeg":
+            s = _strip_jpeg_prefix(data)
+            if s is not None and s:
+                return s
+        elif kind == "gif":
+            s = _strip_gif_prefix(data)
+            if s is not None and s:
+                return s
+        elif kind == "webp":
+            s = _strip_webp_prefix(data)
+            if s is not None and s:
+                return s
+        elif kind == "generic":
+            off = _find_mpegts_payload_start(data, 0)
+            if off > 0:
+                return data[off:]
+    off2 = _find_mpegts_payload_start(data, 0)
+    if off2 > 0:
+        return data[off2:]
+    return data
+
+
+def _detect_obfuscated_segments(
+    url: str, header_block: str
+) -> Tuple[Optional[str], int]:
+    """
+    Download variant playlist and sample first segment.
+    Returns (obfuscation_kind, sample_video_offset). kind None => use normal ffmpeg.
+    sample_video_offset is informational (0 if plain TS / unknown).
+    """
+    try:
+        var_url, var_text = _resolve_variant_playlist_url(url, header_block)
+    except (urllib.error.URLError, OSError, ValueError, UnicodeError):
+        return None, 0
+
+    seg_urls = _parse_hls_media_segment_uris(var_text, var_url)
+    if not seg_urls:
+        return None, 0
+
+    sample_url = seg_urls[0]
+    try:
+        head = _http_get_bytes(sample_url, header_block, max_bytes=4 * 1024 * 1024, timeout=90.0)
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, 0
+
+    if not head:
+        return None, 0
+
+    if head[0] == 0x47 and _looks_like_ts_at(head, 0):
+        return None, 0
+
+    kind = _obfuscation_kind_from_magic(head)
+    if kind is None:
+        off = _find_mpegts_payload_start(head, 0)
+        if off > 0:
+            return "generic", off
+        return None, 0
+
+    payload = _extract_ts_payload(head, kind)
+    if not payload or (payload[0] != 0x47):
+        try:
+            full = _http_get_bytes(sample_url, header_block, max_bytes=None, timeout=120.0)
+        except (urllib.error.URLError, OSError, ValueError):
+            return None, 0
+        payload = _extract_ts_payload(full, kind)
+
+    if not payload or payload[0] != 0x47:
+        off = _find_mpegts_payload_start(head, 0)
+        if off > 0 and kind:
+            return kind if kind != "generic" else "generic", off
+        return None, 0
+
+    if kind == "png" and head.startswith(_PNG_SIG):
+        idx = head.find(_PNG_IEND)
+        off = (idx + len(_PNG_IEND)) if idx >= 0 else 0
+        return "png", off
+    if kind == "jpeg" and head.startswith(_JPEG_SIG):
+        j = head.rfind(b"\xff\xd9")
+        off = (j + 2) if j >= 0 else 0
+        return "jpeg", off
+    if kind == "webp" and len(head) >= 12:
+        cs = struct.unpack("<I", head[4:8])[0]
+        return "webp", 8 + int(cs)
+    if kind == "gif":
+        off = _find_mpegts_payload_start(head, 6)
+        return "gif", off
+
+    return kind, 0
+
+
+def _download_segment_bytes(url: str, header_block: str) -> bytes:
+    last_err: Optional[BaseException] = None
+    for attempt in range(3):
+        try:
+            return _http_get_bytes(url, header_block, max_bytes=None, timeout=120.0)
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(1.0)
+    if last_err:
+        raise last_err
+    return b""
+
+
+def _download_obfuscated_hls(
+    url: str,
+    message: dict,
+    output_path: str,
+    header_block: str,
+    job_id: str,
+    obfuscation_kind: Optional[str] = None,
+) -> None:
+    """
+    Manual segment download + strip + concat + ffmpeg remux.
+    """
+    global _active_ffmpeg
+    kind_hint = obfuscation_kind
+    if not kind_hint:
+        kind_hint, _ = _detect_obfuscated_segments(url, header_block)
+    if not kind_hint:
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": "Obfuscated HLS: download path invoked but segments do not appear wrapped.",
+                },
+                job_id,
+            )
+        )
+        return
+    temp_root = os.path.join(
+        tempfile.gettempdir(),
+        "hgr_hls_" + hashlib.sha1((job_id or url).encode("utf-8", errors="replace")).hexdigest()[:16],
+    )
+    proc: Optional[subprocess.Popen] = None
+    try:
+        os.makedirs(temp_root, exist_ok=True)
+        send_message(
+            with_job_id(
+                {
+                    "type": "progress",
+                    "phase": "fetch",
+                    "detail": "Resolving obfuscated HLS playlist…",
+                    "output": output_path,
+                },
+                job_id,
+            )
+        )
+        var_url, var_text = _resolve_variant_playlist_url(url, header_block)
+        seg_urls = _parse_hls_media_segment_uris(var_text, var_url)
+        if not seg_urls:
+            send_message(
+                with_job_id(
+                    {"type": "done", "success": False, "error": "Obfuscated HLS: no segment URLs in playlist."},
+                    job_id,
+                )
+            )
+            return
+
+        total = len(seg_urls)
+        combined_ts = os.path.join(temp_root, "combined.ts")
+        seg_paths: List[str] = []
+
+        for i, seg_url in enumerate(seg_urls, start=1):
+            if _CANCEL_EVENT.is_set():
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "canceled": True,
+                            "error": "Canceled",
+                        },
+                        job_id,
+                    )
+                )
+                return
+            send_message(
+                with_job_id(
+                    {
+                        "type": "progress",
+                        "phase": "fetch",
+                        "detail": f"[{i}/{total}] Downloading…",
+                        "output": output_path,
+                    },
+                    job_id,
+                )
+            )
+            try:
+                raw = _download_segment_bytes(seg_url, header_block)
+            except (urllib.error.URLError, OSError, ValueError) as e:
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "error": f"Segment download failed ({i}/{total}): {e}",
+                        },
+                        job_id,
+                    )
+                )
+                return
+
+            per_hint = _obfuscation_kind_from_magic(raw)
+            hint = per_hint or kind_hint
+            cleaned = _extract_ts_payload(raw, hint)
+            if not cleaned:
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "error": f"Obfuscated HLS: empty payload after strip at segment {i}/{total}.",
+                        },
+                        job_id,
+                    )
+                )
+                return
+            seg_path = os.path.join(temp_root, f"seg_{i:05d}.ts")
+            with open(seg_path, "wb") as sf:
+                sf.write(cleaned)
+            seg_paths.append(seg_path)
+            time.sleep(0.05)
+
+        if _CANCEL_EVENT.is_set():
+            send_message(
+                with_job_id(
+                    {"type": "done", "success": False, "canceled": True, "error": "Canceled"},
+                    job_id,
+                )
+            )
+            return
+
+        with open(combined_ts, "wb") as combined:
+            for sp in seg_paths:
+                with open(sp, "rb") as inf:
+                    shutil.copyfileobj(inf, combined)
+
+        if not os.path.isfile(combined_ts) or os.path.getsize(combined_ts) < 64:
+            send_message(
+                with_job_id(
+                    {
+                        "type": "done",
+                        "success": False,
+                        "error": "Obfuscated HLS: combined transport stream is empty or too small.",
+                    },
+                    job_id,
+                )
+            )
+            return
+
+        send_message(
+            with_job_id(
+                {
+                    "type": "progress",
+                    "phase": "encoding",
+                    "detail": "Remuxing to MP4 (ffmpeg)…",
+                    "output": output_path,
+                },
+                job_id,
+            )
+        )
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-nostdin",
+            "-loglevel",
+            "info",
+            "-stats",
+            "-i",
+            combined_ts,
+            "-c",
+            "copy",
+            "-bsf:a",
+            "aac_adtstoasc",
+            output_path,
+        ]
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            send_message(
+                with_job_id(
+                    {"type": "done", "success": False, "error": "ffmpeg not found in PATH"},
+                    job_id,
+                )
+            )
+            return
+        except Exception as e:
+            send_message(with_job_id({"type": "done", "success": False, "error": str(e)}, job_id))
+            return
+
+        with _PROC_LOCK:
+            _active_ffmpeg = proc
+
+        stderr_lines: List[str] = []
+        last_send = 0.0
+        throttle_s = 0.35
+
+        def read_stderr_ff():
+            nonlocal last_send
+            try:
+                for raw in iter(proc.stderr.readline, b""):
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace")
+                    stderr_lines.append(line)
+                    if len(stderr_lines) > 200:
+                        stderr_lines.pop(0)
+                    if "time=" not in line:
+                        continue
+                    parsed = _parse_ffmpeg_progress(line)
+                    now = time.monotonic()
+                    if now - last_send < throttle_s:
+                        continue
+                    last_send = now
+                    parts = []
+                    if parsed.get("time"):
+                        parts.append(f"time {parsed['time']}")
+                    if parsed.get("size"):
+                        parts.append(f"size {parsed['size']}")
+                    if parsed.get("speed"):
+                        parts.append(parsed["speed"])
+                    send_message(
+                        with_job_id(
+                            {
+                                "type": "progress",
+                                "phase": "encoding",
+                                "detail": ", ".join(parts) if parts else line.strip()[:120],
+                                "output": output_path,
+                                **parsed,
+                            },
+                            job_id,
+                        )
+                    )
+            finally:
+                try:
+                    proc.stderr.close()
+                except OSError:
+                    pass
+
+        t_ff = threading.Thread(target=read_stderr_ff, daemon=True)
+        t_ff.start()
+        code = proc.wait()
+        t_ff.join(timeout=2.0)
+        _clear_active_if(proc)
+
+        if _CANCEL_EVENT.is_set():
+            send_message(
+                with_job_id(
+                    {"type": "done", "success": False, "canceled": True, "error": "Canceled"},
+                    job_id,
+                )
+            )
+            return
+        tail = "".join(stderr_lines[-30:]).strip()
+        if code == 0:
+            send_message(
+                with_job_id(
+                    {
+                        "type": "done",
+                        "success": True,
+                        "output": output_path,
+                        "detail": "Finished",
+                    },
+                    job_id,
+                )
+            )
+        else:
+            err = f"ffmpeg exited with code {code}"
+            if tail:
+                err = err + ": " + tail[-500:]
+            send_message(with_job_id({"type": "done", "success": False, "error": err}, job_id))
+    finally:
+        _clear_active_if(proc)
+        try:
+            if os.path.isdir(temp_root):
+                shutil.rmtree(temp_root, ignore_errors=True)
+        except OSError:
+            pass
+
+
 def _build_ffmpeg_cmd_list(
     url, message, output_path, header_block, *, resume_from_sec: float = 0.0
 ):
@@ -302,20 +943,13 @@ def _build_ffmpeg_cmd_list(
     ]
     # HLS: default live_start_index is -3 (near live edge) which can make ffmpeg only
     # follow a short sliding window. Force start from the first listed segment, reload
-    # playlists longer, and retry flaky HTTP / segments so full VOD length is read.
+    # playlists longer, and retry flaky segments (without TCP reconnect flags — they
+    # destabilize some CDNs).
     if _is_hls_input(url, message):
         if resume_from_sec and resume_from_sec > 0.05:
             pre.extend(["-ss", f"{float(resume_from_sec):.3f}"])
         pre.extend(
             [
-                "-reconnect",
-                "1",
-                "-reconnect_at_eof",
-                "1",
-                "-reconnect_streamed",
-                "1",
-                "-reconnect_delay_max",
-                "8",
                 "-protocol_whitelist",
                 "file,http,https,tcp,tls,crypto,ffurl",
                 "-analyzeduration",
@@ -720,20 +1354,44 @@ def run_ffmpeg_with_updates(url, filename, message):
     header_block = build_ffmpeg_header_block(message, url)
     cmd = _build_ffmpeg_cmd_list(url, message, output_path, header_block, resume_from_sec=0.0)
 
-    send_message(
-        with_job_id(
-            {
-                "type": "progress",
-                "phase": "starting",
-                "detail": "Starting ffmpeg",
-                "output": output_path,
-            },
-            job_id,
-        )
-    )
-
     proc: Optional[subprocess.Popen] = None
     try:
+        if _is_hls_input(url, message):
+            send_message(
+                with_job_id(
+                    {
+                        "type": "progress",
+                        "phase": "starting",
+                        "detail": "Checking for image-wrapped segments…",
+                        "output": output_path,
+                    },
+                    job_id,
+                )
+            )
+            ob_kind: Optional[str] = None
+            try:
+                ob_kind, _ob_off = _detect_obfuscated_segments(url, header_block)
+            except Exception:
+                ob_kind = None
+            if ob_kind:
+                _JOB_LIVE[job_id] = {"output": output_path, "tsec": 0.0, "url": url}
+                _download_obfuscated_hls(
+                    url, message, output_path, header_block, job_id, ob_kind
+                )
+                return
+
+        send_message(
+            with_job_id(
+                {
+                    "type": "progress",
+                    "phase": "starting",
+                    "detail": "Starting ffmpeg",
+                    "output": output_path,
+                },
+                job_id,
+            )
+        )
+
         try:
             proc = subprocess.Popen(
                 cmd,

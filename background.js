@@ -257,8 +257,6 @@ const NATIVE = 'com.medzy.hlsgrabber';
 const JOBS_KEY = 'hlsGrabJobsState';
 const USER_PATH_KEY = 'userDownloadPath';
 const KEEP_ALARM = 'hlsGrabKeepAlive';
-const HLS_AUTH_REFRESH_ALARM = 'hlsAuthRefresh';
-const HLS_AUTH_MIN_MS = 90 * 1000; // between proactive refreshes
 const MAX_SLOTS = 4;
 
 /** @type {{ port: chrome.runtime.Port | null, jobId: string | null }[]} */
@@ -292,8 +290,35 @@ async function readJobsState() {
   return data[JOBS_KEY] || defaultJobsState();
 }
 
+let _fabLiveNotifyTimer = null;
+
+function scheduleFabContentBroadcast() {
+  if (_fabLiveNotifyTimer) return;
+  _fabLiveNotifyTimer = setTimeout(() => {
+    _fabLiveNotifyTimer = null;
+    chrome.tabs.query({}, (tabs) => {
+      const msg = { type: 'HLS_GRABBER_LIVE_UPDATE' };
+      for (const t of tabs || []) {
+        if (t.id == null) continue;
+        chrome.tabs.sendMessage(t.id, msg).catch(() => {});
+      }
+    });
+  }, 48);
+}
+
+function broadcastCloseFloatPanel() {
+  chrome.tabs.query({}, (tabs) => {
+    const msg = { type: 'HLS_GRABBER_CLOSE_FLOAT_PANEL' };
+    for (const t of tabs || []) {
+      if (t.id == null) continue;
+      chrome.tabs.sendMessage(t.id, msg).catch(() => {});
+    }
+  });
+}
+
 async function writeJobsState(jobs) {
   await chrome.storage.session.set({ [JOBS_KEY]: { jobs: [...jobs] } });
+  scheduleFabContentBroadcast();
 }
 
 async function upsertJob(job) {
@@ -341,25 +366,8 @@ function syncBadgeAlarm() {
 chrome.alarms.onAlarm.addListener((a) => {
   if (a.name === KEEP_ALARM) {
     void chrome.storage.session.get(JOBS_KEY);
-    return;
-  }
-  if (a.name === HLS_AUTH_REFRESH_ALARM) {
-    void maybeProactiveHlsAuthRefresh();
   }
 });
-
-function jobLooksLikeHls(j) {
-  if (!j) return false;
-  const u = (j.streamUrl || j.url || '').toLowerCase();
-  const sk = (j.streamKind || '').toLowerCase();
-  if (u.includes('m3u8') || u.includes('m3u') || u.includes('master') || u.includes('playlist.m3u8')) {
-    return true;
-  }
-  if (['hls', 'hls_by_header', 'm3u8', 'm3u', 'apple_hls', 'social'].some((k) => sk.includes(k))) {
-    return true;
-  }
-  return false;
-}
 
 function getCookieStringPromise(streamUrl, pageUrl) {
   return new Promise((resolve) => {
@@ -396,100 +404,6 @@ function getCookieStringPromise(streamUrl, pageUrl) {
   });
 }
 
-async function maybeProactiveHlsAuthRefresh() {
-  const st = await readJobsState();
-  const jobs = st.jobs || [];
-  const outDir = await getUserDownloadPath();
-  if (!outDir) {
-    return;
-  }
-  const now = Date.now();
-  for (let si = 0; si < MAX_SLOTS; si++) {
-    const jobId = slots[si].jobId;
-    if (!jobId) {
-      continue;
-    }
-    const j = jobs.find((x) => x.id === jobId);
-    if (!j || j.status !== 'downloading' || !jobLooksLikeHls(j) || j.tabId == null) {
-      continue;
-    }
-    const last = j.lastAuthRefresh || j.startedAt || 0;
-    if (now - last < HLS_AUTH_MIN_MS) {
-      continue;
-    }
-    if (j.startedAt && now - j.startedAt < 45_000) {
-      continue; // let first minute finish without a refresh kill
-    }
-    let port;
-    try {
-      port = ensurePort(si);
-    } catch (e) {
-      console.warn('HLS auth refresh: no port', e);
-      continue;
-    }
-    let tab;
-    try {
-      tab = await chrome.tabs.get(j.tabId);
-    } catch {
-      continue;
-    }
-    const list = detectedStreams[j.tabId] || [];
-    const match = list.find((e) => e && e.url === j.streamUrl) || list.find((e) => e && e.url && e.url.includes('m3u8'));
-    const streamUrl = j.streamUrl || (match && match.url);
-    if (!streamUrl) {
-      continue;
-    }
-    const tabUrl = tab.url || '';
-    const u = (globalThis && globalThis.navigator && globalThis.navigator.userAgent) || '';
-    const cookie = await getCookieStringPromise(
-      streamUrl,
-      tabUrl
-    );
-    const payload = {
-      type: 'refresh',
-      jobId,
-      url: streamUrl,
-      filename: (j.fileStem || j.label || 'video').toString() || 'video',
-      userAgent: u || undefined,
-      cookie: cookie || undefined,
-      outputDirectory: outDir,
-      streamKind: j.streamKind || undefined,
-      capturedHeaders: (match && match.capturedHeaders) || {},
-    };
-    if (tabUrl && /^https?:/i.test(tabUrl)) {
-      payload.referer = tabUrl;
-      try {
-        payload.origin = new URL(tabUrl).origin;
-      } catch (_) {
-        // ignore
-      }
-    }
-    try {
-      port.postMessage(payload);
-      await patchJob(jobId, { lastAuthRefresh: now, detail: 'Refreshing session' });
-    } catch (e) {
-      console.warn('HLS auth refresh post', e);
-    }
-  }
-}
-
-function ensureHlsAuthAlarm() {
-  chrome.alarms.get(HLS_AUTH_REFRESH_ALARM, (a) => {
-    if (a) {
-      return;
-    }
-    chrome.alarms.create(HLS_AUTH_REFRESH_ALARM, { periodInMinutes: 1 });
-  });
-}
-
-chrome.runtime.onInstalled.addListener(() => {
-  ensureHlsAuthAlarm();
-});
-chrome.runtime.onStartup.addListener(() => {
-  ensureHlsAuthAlarm();
-});
-ensureHlsAuthAlarm();
-
 function findSlotIndexByJobId(jobId) {
   for (let i = 0; i < MAX_SLOTS; i++) {
     if (slots[i].jobId === jobId) return i;
@@ -520,12 +434,13 @@ function onHostMessage(msg, slotIndex) {
       await patchJob(jobId, {
         status: 'canceled',
         error: msg.error || 'Canceled',
+        detail: '',
         outputPath: null,
       });
     } else if (msg.success) {
       await patchJob(jobId, {
         status: 'completed',
-        detail: 'Saved',
+        detail: (msg.detail && String(msg.detail).trim()) || 'Saved',
         error: null,
         outputPath: msg.output || null,
       });
@@ -533,6 +448,7 @@ function onHostMessage(msg, slotIndex) {
       await patchJob(jobId, {
         status: 'error',
         error: msg.error || 'Failed',
+        detail: '',
         outputPath: null,
       });
     }
@@ -547,7 +463,11 @@ function onSlotDisconnect(slotIndex) {
   const err = chrome.runtime.lastError?.message;
   (async () => {
     if (j) {
-      await patchJob(j, { status: 'error', error: err || 'Lost connection to the download helper' });
+      await patchJob(j, {
+        status: 'error',
+        error: err || 'Lost connection to the download helper',
+        detail: '',
+      });
     }
     tryDispatch();
   })();
@@ -579,6 +499,7 @@ async function launchOnSlot(slotIndex, jobId, basePayload) {
     await patchJob(jobId, {
       status: 'error',
       error: 'Set a save folder in Options (right-click the extension icon).',
+      detail: '',
     });
     tryDispatch();
     return;
@@ -590,7 +511,7 @@ async function launchOnSlot(slotIndex, jobId, basePayload) {
     ensurePort(slotIndex).postMessage(full);
   } catch (e) {
     slots[slotIndex].jobId = null;
-    await patchJob(jobId, { status: 'error', error: String(e) });
+    await patchJob(jobId, { status: 'error', error: String(e), detail: '' });
     tryDispatch();
   }
   syncBadgeAlarm();
@@ -622,17 +543,26 @@ function removeFromPendingOnly(jobId) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'POPUP_OPENED') {
+    broadcastCloseFloatPanel();
+    respond(sendResponse, { ok: true });
+    return true;
+  }
+
   if (message.type === 'GET_STREAMS') {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-      const tabId = tabs[0]?.id;
-      const pageTitle = (tabs[0]?.title || '').trim();
+    const tabIdFromMsg =
+      message.tabId != null && message.tabId >= 0 ? message.tabId : null;
+    const senderTabId = sender.tab && sender.tab.id >= 0 ? sender.tab.id : null;
+    const effectiveTabId = tabIdFromMsg != null ? tabIdFromMsg : senderTabId;
+
+    const finish = (tabId, pageTitle) => {
       Promise.all([chrome.storage.session.get(JOBS_KEY), chrome.storage.local.get(USER_PATH_KEY)])
         .then(([sess, local]) => {
           const jobsState = (sess && sess[JOBS_KEY]) || defaultJobsState();
           const userDownloadPath = (local && local[USER_PATH_KEY] && String(local[USER_PATH_KEY]).trim()) || '';
           respond(sendResponse, {
             streams: sortStreamsForUi(detectedStreams[tabId] || []),
-            pageTitle,
+            pageTitle: pageTitle || '',
             jobs: jobsState.jobs || [],
             userDownloadPath,
             maxParallel: MAX_SLOTS,
@@ -644,7 +574,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           console.error('GET_STREAMS', err);
           respond(sendResponse, {
             streams: sortStreamsForUi(detectedStreams[tabId] || []),
-            pageTitle,
+            pageTitle: pageTitle || '',
             jobs: [],
             userDownloadPath: '',
             maxParallel: MAX_SLOTS,
@@ -652,6 +582,23 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             running: 0,
           });
         });
+    };
+
+    if (effectiveTabId != null) {
+      chrome.tabs.get(effectiveTabId, (tab) => {
+        if (chrome.runtime.lastError || !tab) {
+          finish(effectiveTabId, '');
+          return;
+        }
+        finish(tab.id, (tab.title || '').trim());
+      });
+      return true;
+    }
+
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tid = tabs[0]?.id;
+      const pageTitle = (tabs[0]?.title || '').trim();
+      finish(tid, pageTitle);
     });
     return true;
   }
@@ -690,7 +637,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     (async () => {
       const jobId = message.jobId;
       if (removeFromPendingOnly(jobId)) {
-        await patchJob(jobId, { status: 'canceled', error: 'Canceled before it started' });
+        await patchJob(jobId, { status: 'canceled', error: 'Canceled before it started', detail: '' });
         tryDispatch();
         respond(sendResponse, { ok: true });
         return;
@@ -700,7 +647,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         try {
           slots[si].port.postMessage({ type: 'cancel', jobId });
         } catch (e) {
-          await patchJob(jobId, { status: 'error', error: String(e) });
+          await patchJob(jobId, { status: 'error', error: String(e), detail: '' });
           slots[si].jobId = null;
           tryDispatch();
         }
@@ -727,9 +674,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         });
         return;
       }
+      const tabIdForJob = payload.tabId != null ? payload.tabId : sender.tab?.id ?? null;
+      let tabUrl = '';
+      if (tabIdForJob != null) {
+        try {
+          const t = await chrome.tabs.get(tabIdForJob);
+          tabUrl = (t && t.url) || '';
+        } catch (_) {
+          // ignore
+        }
+      }
+      let cookie = (payload.cookie && String(payload.cookie).trim()) || '';
+      if (!cookie) {
+        cookie = await getCookieStringPromise(payload.url, tabUrl);
+      }
+      const { jobId: _jid, outputDirectory: _od, ...rest } = payload;
+      const base = {
+        ...rest,
+        tabId: tabIdForJob ?? undefined,
+        cookie: cookie || undefined,
+      };
+      if (!base.userAgent) {
+        try {
+          base.userAgent = (typeof navigator !== 'undefined' && navigator.userAgent) || undefined;
+        } catch (_) {
+          // ignore
+        }
+      }
+      if (!base.referer && tabUrl && /^https?:/i.test(tabUrl)) {
+        base.referer = tabUrl;
+        try {
+          base.origin = new URL(tabUrl).origin;
+        } catch (_) {
+          // ignore
+        }
+      }
       const jobId = payload.jobId || genJobId();
       const label = (payload.filename || 'video').toString() || 'video';
-      const { jobId: _jid, outputDirectory: _od, ...base } = payload;
       await upsertJob({
         id: jobId,
         label,
@@ -737,7 +718,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         detail: 'Waiting',
         error: null,
         outputPath: null,
-        tabId: payload.tabId ?? null,
+        tabId: tabIdForJob ?? null,
         streamUrl: payload.url,
         streamKind: payload.streamKind || null,
         fileStem: (payload.filename || label).toString(),

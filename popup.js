@@ -80,7 +80,13 @@ function renderJobsBanner(jobs, meta) {
     t.textContent = (job.label || 'video') + ' (' + (job.status || '') + ')';
     const d = document.createElement('div');
     d.className = 'job-detail';
-    d.textContent = job.detail || job.error || '';
+    if (job.status === 'error') {
+      d.textContent = job.error || '';
+    } else if (job.status === 'canceled') {
+      d.textContent = job.error || 'Canceled';
+    } else {
+      d.textContent = job.detail || job.error || '';
+    }
     card.appendChild(t);
     card.appendChild(d);
     if (job.outputPath && job.status === 'completed') {
@@ -326,6 +332,11 @@ function renderStreams(streams, pageTitle, hasPath) {
 }
 
 function loadUi() {
+  try {
+    chrome.runtime.sendMessage({ type: 'POPUP_OPENED' });
+  } catch (_) {
+    // ignore
+  }
   chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
     const hasPath = !!(response && response.userDownloadPath);
     setPathBar(response && response.userDownloadPath);
