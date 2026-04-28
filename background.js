@@ -1,6 +1,11 @@
 // tabId -> [{ url, streamKind, capturedHeaders }]
 const detectedStreams = {};
 
+/** @type {Record<number, ReturnType<typeof setTimeout>>} */
+const _ytdlpPageTimer = {};
+/** @type {Record<number, Record<string, string>>} */
+const _ytdlpPageCap = {};
+
 function shouldIgnoreAsNoiseUrl(url) {
   const u = String(url).toLowerCase();
   if (u.startsWith('blob:') || u.startsWith('data:')) return true;
@@ -162,10 +167,54 @@ function upsertStream(tabId, url, capturedHeaders, streamKind) {
   chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
 }
 
+/**
+ * Social + YouTube CDNs: yt-dlp uses the tab URL only, one list row, no raw stream URLs.
+ */
+function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
+  if (!tabId || tabId < 0) return;
+  _ytdlpPageCap[tabId] = { ...(_ytdlpPageCap[tabId] || {}), ...(capturedHeaders || {}) };
+  if (_ytdlpPageTimer[tabId]) {
+    clearTimeout(_ytdlpPageTimer[tabId]);
+  }
+  _ytdlpPageTimer[tabId] = setTimeout(() => {
+    delete _ytdlpPageTimer[tabId];
+    const capSnap = _ytdlpPageCap[tabId];
+    delete _ytdlpPageCap[tabId];
+    chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) return;
+      const pageUrl = (tab.url || '').trim();
+      if (!/^https?:/i.test(pageUrl)) return;
+      if (!detectedStreams[tabId]) detectedStreams[tabId] = [];
+      const list = detectedStreams[tabId];
+      let merged = { ...(capSnap || {}) };
+      for (const e of list) {
+        if ((e.streamKind === 'social' || e.streamKind === 'yt') && e.capturedHeaders) {
+          merged = { ...e.capturedHeaders, ...merged };
+        }
+      }
+      const rest = list.filter((e) => e.streamKind !== 'social' && e.streamKind !== 'yt');
+      const lower = pageUrl.toLowerCase();
+      const kind =
+        lower.includes('youtube.com') || lower.includes('youtu.be') ? 'yt' : 'social';
+      rest.push({
+        url: pageUrl,
+        streamKind: kind,
+        pageDownload: true,
+        capturedHeaders: merged,
+      });
+      detectedStreams[tabId] = rest;
+      console.log('yt-dlp page placeholder:', kind, pageUrl);
+      chrome.action.setBadgeText({ text: String(rest.length), tabId });
+      chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
+    });
+  }, 140);
+}
+
 /** Prefer master / playlist URLs and progressive video in the popup list. */
 function sortStreamsForUi(list) {
   if (!list || !list.length) return [];
   const score = (s) => {
+    if (s && s.pageDownload) return 150;
     const u = ((s && s.url) || '').toLowerCase();
     if (hlsMediaSegmentUrl(u)) return -1000;
     if (/(^|[/._-])(main|master|index|source|highest|progressive|manifest)[^/]*\.(m3u8|m3u|mpd|mp4)(?:[?#]|$)/i.test(u)) {
@@ -212,7 +261,12 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     const hit = classifyVideoFromUrl(url);
     if (!hit) return;
     const tabId = details.tabId;
+    if (tabId < 0) return;
     const captured = pickForwardHeaders(details.requestHeaders);
+    if (hit.kind === 'social' || hit.kind === 'yt') {
+      upsertYtdlpPagePlaceholder(tabId, captured);
+      return;
+    }
     upsertStream(tabId, url, captured, hit.kind);
   },
   { urls: ['<all_urls>'] },
@@ -242,12 +296,22 @@ chrome.webRequest.onHeadersReceived.addListener(
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.status === 'loading') {
+    if (_ytdlpPageTimer[tabId]) {
+      clearTimeout(_ytdlpPageTimer[tabId]);
+      delete _ytdlpPageTimer[tabId];
+    }
+    delete _ytdlpPageCap[tabId];
     detectedStreams[tabId] = [];
     chrome.action.setBadgeText({ text: '', tabId });
   }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  if (_ytdlpPageTimer[tabId]) {
+    clearTimeout(_ytdlpPageTimer[tabId]);
+    delete _ytdlpPageTimer[tabId];
+  }
+  delete _ytdlpPageCap[tabId];
   delete detectedStreams[tabId];
 });
 
@@ -256,6 +320,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 const NATIVE = 'com.medzy.hlsgrabber';
 const JOBS_KEY = 'hlsGrabJobsState';
 const USER_PATH_KEY = 'userDownloadPath';
+const YTDLP_MAX_HEIGHT_KEY = 'ytDlpMaxHeight';
 const KEEP_ALARM = 'hlsGrabKeepAlive';
 const MAX_SLOTS = 4;
 
@@ -659,6 +724,112 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'GET_YTDLP_FORMATS') {
+    (async () => {
+      const payload = message.payload || {};
+      if (!payload.url) {
+        respond(sendResponse, { ok: false, error: 'No stream URL', formats: [] });
+        return;
+      }
+      const tabIdForJob = payload.tabId != null ? payload.tabId : sender.tab?.id ?? null;
+      let tabUrl = '';
+      if (tabIdForJob != null) {
+        try {
+          const t = await chrome.tabs.get(tabIdForJob);
+          tabUrl = (t && t.url) || '';
+        } catch (_) {
+          // ignore
+        }
+      }
+      let cookie = (payload.cookie && String(payload.cookie).trim()) || '';
+      if (!cookie) {
+        cookie = await getCookieStringPromise(payload.url, tabUrl);
+      }
+      const requestId = genJobId();
+      const base = {
+        type: 'ytdlp_formats',
+        requestId,
+        url: payload.url,
+        tabId: tabIdForJob ?? undefined,
+        cookie: cookie || undefined,
+        userAgent: payload.userAgent,
+        capturedHeaders: payload.capturedHeaders,
+        authorization: payload.authorization,
+        referer: payload.referer,
+        pageUrl: payload.pageUrl,
+        origin: payload.origin,
+      };
+      if (!base.userAgent) {
+        try {
+          base.userAgent = (typeof navigator !== 'undefined' && navigator.userAgent) || undefined;
+        } catch (_) {
+          // ignore
+        }
+      }
+      if (!base.referer && tabUrl && /^https?:/i.test(tabUrl)) {
+        base.referer = tabUrl;
+        try {
+          base.origin = new URL(tabUrl).origin;
+        } catch (_) {
+          // ignore
+        }
+      }
+      if (tabUrl && /^https?:/i.test(tabUrl)) {
+        base.pageUrl = tabUrl;
+      }
+      try {
+        const mhStore = await chrome.storage.local.get(YTDLP_MAX_HEIGHT_KEY);
+        const mhRaw = mhStore[YTDLP_MAX_HEIGHT_KEY];
+        if (mhRaw !== undefined && mhRaw !== null && String(mhRaw).trim() !== '') {
+          const n = parseInt(String(mhRaw), 10);
+          if (!Number.isNaN(n)) base.ytDlpMaxHeight = n;
+        }
+      } catch (_) {
+        // ignore
+      }
+      const timeoutMs = 125000;
+      let settled = false;
+      const port = chrome.runtime.connectNative(NATIVE);
+      const t = setTimeout(() => {
+        finish({ ok: false, error: 'Timed out listing formats', formats: [], requestId });
+      }, timeoutMs);
+      function finish(out) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(t);
+        try {
+          port.disconnect();
+        } catch (_) {
+          // ignore
+        }
+        respond(sendResponse, out);
+      }
+      port.onMessage.addListener((msg) => {
+        if (settled) return;
+        if (msg && msg.type === 'ytdlp_formats_result' && msg.requestId === requestId) {
+          finish({
+            ok: msg.success !== false,
+            requestId: msg.requestId,
+            title: msg.title || '',
+            formats: msg.formats || [],
+            error: msg.error || null,
+          });
+        }
+      });
+      port.onDisconnect.addListener(() => {
+        if (settled) return;
+        const err = chrome.runtime.lastError && chrome.runtime.lastError.message;
+        finish({ ok: false, formats: [], error: err || 'Native host disconnected', requestId });
+      });
+      try {
+        port.postMessage(base);
+      } catch (e) {
+        finish({ ok: false, formats: [], error: String(e), requestId });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === 'START_DOWNLOAD') {
     (async () => {
       const payload = message.payload;
@@ -708,6 +879,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         } catch (_) {
           // ignore
         }
+      }
+      if (tabUrl && /^https?:/i.test(tabUrl)) {
+        base.pageUrl = tabUrl;
+      }
+      try {
+        const mhStore = await chrome.storage.local.get(YTDLP_MAX_HEIGHT_KEY);
+        const mhRaw = mhStore[YTDLP_MAX_HEIGHT_KEY];
+        if (base.ytDlpMaxHeight == null && mhRaw !== undefined && mhRaw !== null && String(mhRaw).trim() !== '') {
+          const n = parseInt(String(mhRaw), 10);
+          if (!Number.isNaN(n)) base.ytDlpMaxHeight = n;
+        }
+      } catch (_) {
+        // ignore
       }
       const jobId = payload.jobId || genJobId();
       const label = (payload.filename || 'video').toString() || 'video';

@@ -39,7 +39,7 @@
     "content_scripts": [
       {
         "matches": ["http://*/*", "https://*/*"],
-        "js": ["fab.js"],
+        "js": ["yt-page-helpers.js", "fab.js"],
         "run_at": "document_idle"
       }
     ],

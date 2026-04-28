@@ -60,6 +60,121 @@
     return `j_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
   }
 
+  function ytdlpFormatSelection(row) {
+    if (!row) return '';
+    if (row.has_video && row.has_audio) return String(row.format_id);
+    if (row.has_video) return `${row.format_id}+bestaudio/best`;
+    return '';
+  }
+
+  /** @param {(row: object | null | undefined) => void} callback */
+  function showYtdlpFormatPicker(title, rows, callback) {
+    const overlay = document.createElement('div');
+    overlay.style.cssText =
+      'position:fixed;inset:0;background:rgba(0,0,0,.42);z-index:2147483646;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box;';
+    const box = document.createElement('div');
+    box.style.cssText =
+      'background:#fff;border-radius:12px;padding:14px 16px;max-width:380px;width:100%;max-height:78vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);';
+    const h = document.createElement('div');
+    h.style.cssText = 'font-weight:600;font-size:14px;margin-bottom:6px;color:#1c1917;';
+    h.textContent = 'Choose quality';
+    const sub = document.createElement('div');
+    sub.style.cssText = 'font-size:12px;color:#57534e;margin-bottom:12px;line-height:1.4;';
+    sub.textContent = (title && title.trim()) || 'Several formats are available.';
+    const form = document.createElement('div');
+    form.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
+    const mkBtn = (label, onClick) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = label;
+      b.style.cssText =
+        'text-align:left;padding:10px 12px;border:1px solid #e7e2dc;border-radius:8px;background:#faf8f5;font-size:13px;cursor:pointer;font-family:inherit;';
+      b.addEventListener('mouseenter', () => {
+        b.style.background = '#fff7ed';
+      });
+      b.addEventListener('mouseleave', () => {
+        b.style.background = '#faf8f5';
+      });
+      b.addEventListener('click', onClick);
+      return b;
+    };
+    form.appendChild(
+      mkBtn('Best available (auto merge)', () => {
+        document.body.removeChild(overlay);
+        callback(null);
+      })
+    );
+    for (const r of rows) {
+      const rowRef = r;
+      form.appendChild(
+        mkBtn(rowRef.label || rowRef.format_id, () => {
+          document.body.removeChild(overlay);
+          callback(rowRef);
+        })
+      );
+    }
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.textContent = 'Cancel';
+    cancel.style.cssText =
+      'margin-top:10px;padding:8px 12px;border:none;background:transparent;color:#78716c;font-size:12px;cursor:pointer;font-family:inherit;width:100%;';
+    cancel.addEventListener('click', () => {
+      document.body.removeChild(overlay);
+      callback(undefined);
+    });
+    box.appendChild(h);
+    box.appendChild(sub);
+    box.appendChild(form);
+    box.appendChild(cancel);
+    overlay.appendChild(box);
+    overlay.addEventListener('click', (ev) => {
+      if (ev.target === overlay) {
+        document.body.removeChild(overlay);
+        callback(undefined);
+      }
+    });
+    document.body.appendChild(overlay);
+  }
+
+  function maybeAskYtdlpFormat(kind, probePayload, onPick, onCancel) {
+    chrome.storage.local.get(['ytDlpQualityMode'], (opt) => {
+      if (chrome.runtime.lastError) {
+        onPick(null);
+        return;
+      }
+      const ask = opt && opt.ytDlpQualityMode === 'ask';
+      const ytdlp = kind === 'social' || kind === 'yt';
+      if (!ask || !ytdlp) {
+        onPick(null);
+        return;
+      }
+      chrome.runtime.sendMessage({ type: 'GET_YTDLP_FORMATS', payload: probePayload }, (res) => {
+        if (chrome.runtime.lastError) {
+          onPick(null);
+          return;
+        }
+        const formats = (res && res.formats) || [];
+        const videoRows = formats.filter((f) => f.has_video);
+        const pickable = videoRows.length ? videoRows : formats;
+        if (!res || !res.ok || pickable.length < 2) {
+          onPick(null);
+          return;
+        }
+        showYtdlpFormatPicker((res.title || '').trim(), pickable, (sel) => {
+          if (sel === undefined) {
+            onCancel();
+            return;
+          }
+          if (sel === null) {
+            onPick(null);
+            return;
+          }
+          onPick(ytdlpFormatSelection(sel));
+        });
+      });
+    });
+  }
+
   function slugify(url) {
     try {
       const u = new URL(url);
@@ -293,6 +408,18 @@
   .stream-card .kind { font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: #a8a29e; font-weight: 600; margin-bottom: 6px; }
   .stream-card .url { font-size: 10px; color: #57534e; word-break: break-all; line-height: 1.4; font-family: ui-monospace, monospace; }
   .stream-card .fn-row { display: flex; gap: 6px; margin-top: 8px; }
+  .stream-card .thumb-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-top: 8px;
+    font-size: 11px;
+    color: #44403c;
+    cursor: pointer;
+    user-select: none;
+    line-height: 1.35;
+  }
+  .stream-card .thumb-row input { width: auto; margin: 2px 0 0 0; flex: 0 0 auto; }
   .stream-card input {
     flex: 1;
     min-width: 0;
@@ -637,12 +764,22 @@
           fabPath.textContent = `Saves to: ${short}`;
           fabPath.classList.remove('bad');
         } else {
-          fabPath.textContent = 'No save folder — use extension Options.';
+          fabPath.textContent = 'No save folder. Use extension Options.';
           fabPath.classList.add('bad');
         }
       }
       renderJobs(response.jobs || [], response);
       renderStreams(response.streams || [], response.pageTitle || '', hasPath);
+      updateQueueBadge(response);
+      if (panel.classList.contains('open')) positionPanel();
+    });
+  }
+
+  /** Frequent job progress writes; avoid re-building stream inputs (focus + edited titles). */
+  function refreshPanelJobsOnly() {
+    chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
+      if (chrome.runtime.lastError || !response) return;
+      renderJobs(response.jobs || [], response);
       updateQueueBadge(response);
       if (panel.classList.contains('open')) positionPanel();
     });
@@ -688,7 +825,7 @@
         b.className = 'btn btn-dan';
         b.textContent = 'Cancel';
         b.addEventListener('click', () =>
-          chrome.runtime.sendMessage({ type: 'CANCEL_DOWNLOAD', jobId: job.id }, refreshAll)
+          chrome.runtime.sendMessage({ type: 'CANCEL_DOWNLOAD', jobId: job.id }, refreshPanelJobsOnly)
         );
         row.appendChild(b);
       } else if (['completed', 'canceled', 'error'].includes(job.status)) {
@@ -697,7 +834,7 @@
         b.className = 'btn btn-ghost';
         b.textContent = 'Dismiss';
         b.addEventListener('click', () =>
-          chrome.runtime.sendMessage({ type: 'DISMISS_JOB', jobId: job.id }, refreshAll)
+          chrome.runtime.sendMessage({ type: 'DISMISS_JOB', jobId: job.id }, refreshPanelJobsOnly)
         );
         row.appendChild(b);
       }
@@ -711,7 +848,9 @@
     cbtn.type = 'button';
     cbtn.className = 'btn btn-ghost';
     cbtn.textContent = 'Clear finished';
-    cbtn.addEventListener('click', () => chrome.runtime.sendMessage({ type: 'DISMISS_DONE' }, refreshAll));
+    cbtn.addEventListener('click', () =>
+      chrome.runtime.sendMessage({ type: 'DISMISS_DONE' }, refreshPanelJobsOnly)
+    );
     clr.appendChild(cbtn);
     fabJobs.appendChild(clr);
   }
@@ -730,16 +869,34 @@
       const stream = typeof raw === 'string' ? { url: raw, capturedHeaders: {} } : raw;
       const url = stream.url || '';
       const kind = stream.streamKind ? String(stream.streamKind) : '';
+      const pageOnly = stream.pageDownload === true;
       const defaultName = defaultFileName(i, n, pageTitle, url);
 
       const card = document.createElement('div');
       card.className = 'stream-card';
       const h = document.createElement('div');
       h.className = 'kind';
-      h.textContent = n > 1 ? `Stream ${i + 1} of ${n}${kind ? ` · ${kind}` : ''}` : kind || 'Stream';
+      h.textContent = pageOnly
+        ? 'Download this video'
+        : n > 1
+          ? `Stream ${i + 1} of ${n}${kind ? ` (${kind})` : ''}`
+          : kind || 'Stream';
       const u = document.createElement('div');
       u.className = 'url';
-      u.textContent = url;
+      if (pageOnly) {
+        const intro = document.createElement('div');
+        intro.style.cssText = 'font-size:10px;color:#57534e;line-height:1.35;margin-bottom:6px;';
+        intro.textContent =
+          'Social media: yt-dlp uses the page URL below (not a separate stream link).';
+        const link = document.createElement('div');
+        link.style.cssText =
+          'word-break:break-all;font-family:ui-monospace,Consolas,monospace;font-size:10px;';
+        link.textContent = url;
+        u.appendChild(intro);
+        u.appendChild(link);
+      } else {
+        u.textContent = url;
+      }
       const row = document.createElement('div');
       row.className = 'fn-row';
       const input = document.createElement('input');
@@ -749,8 +906,8 @@
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'dl';
-      btn.textContent = 'Download';
       if (!hasPath) btn.disabled = true;
+      btn.textContent = pageOnly ? 'Download this' : 'Download';
       btn.addEventListener('click', () => {
         if (!hasPath) {
           chrome.runtime.openOptionsPage();
@@ -759,35 +916,124 @@
         const filename = input.value.trim() || defaultName;
         const jobId = genJobId();
         btn.disabled = true;
-        const payload = {
-          jobId,
-          url,
-          filename,
-          streamKind: kind || undefined,
-          capturedHeaders: stream.capturedHeaders || {},
-        };
-        if (typeof navigator !== 'undefined' && navigator.userAgent) {
-          payload.userAgent = navigator.userAgent;
-        }
+        const YT = typeof window !== 'undefined' ? window.HLS_YT : null;
         const tabUrl = window.location.href || '';
-        if (/^https?:/i.test(tabUrl)) {
-          payload.referer = tabUrl;
-          try {
-            payload.origin = new URL(tabUrl).origin;
-          } catch (_) {}
-        }
-        chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload }, (r) => {
+        const isHttpUrl = (x) => x && (x.startsWith('http:') || x.startsWith('https:'));
+
+        const resetFabDlBtn = () => {
           btn.disabled = false;
-          refreshAll();
-          if (chrome.runtime.lastError || !r?.ok) {
-            console.warn('HLS Grabber fab:', chrome.runtime.lastError || r?.error);
+          btn.textContent = pageOnly ? 'Download this' : 'Download';
+        };
+
+        const startCookieAndDl = (plPick) => {
+          let effUrl = url;
+          let effPage = '';
+          let effRef = '';
+          let effOrigin = '';
+          let plDl = false;
+          if (isHttpUrl(tabUrl)) {
+            effPage = tabUrl;
+            effRef = tabUrl;
+            try {
+              effOrigin = new URL(tabUrl).origin;
+            } catch (_) {}
           }
-        });
+          if (pageOnly && kind === 'yt' && YT && YT.isYoutubePage(tabUrl)) {
+            const yChoice = plPick === 'playlist' ? 'playlist' : 'single';
+            const a = YT.applyYoutubeChoice(tabUrl, yChoice);
+            effUrl = a.targetUrl;
+            effPage = a.pageUrl;
+            effRef = a.referer;
+            effOrigin = a.origin || effOrigin;
+            plDl = !!a.ytDlpDownloadPlaylist;
+          } else if (!isHttpUrl(tabUrl)) {
+            effPage = effUrl;
+            effRef = effUrl;
+            try {
+              effOrigin = new URL(effUrl).origin;
+            } catch (_) {}
+          }
+
+          const payload = {
+            jobId,
+            url: effUrl,
+            filename,
+            streamKind: kind || undefined,
+            capturedHeaders: stream.capturedHeaders || {},
+          };
+          if (typeof navigator !== 'undefined' && navigator.userAgent) {
+            payload.userAgent = navigator.userAgent;
+          }
+          if (effPage && isHttpUrl(effPage)) {
+            payload.pageUrl = effPage;
+            payload.referer = effRef || effPage;
+            if (effOrigin) payload.origin = effOrigin;
+          }
+          if (plDl) payload.ytDlpDownloadPlaylist = true;
+
+          const probePayload = {
+            url: payload.url,
+            cookie: payload.cookie,
+            userAgent: payload.userAgent,
+            capturedHeaders: payload.capturedHeaders,
+            pageUrl: payload.pageUrl,
+            referer: payload.referer,
+            origin: payload.origin,
+          };
+
+          const finishDl = (ytFmt) => {
+            const finalPayload = { ...payload };
+            if (ytFmt) finalPayload.ytDlpFormat = ytFmt;
+            if (pageOnly) {
+              const tel = shadow.getElementById(`fab-thumb-${i}`);
+              if (tel && tel.checked) finalPayload.ytDlpWriteThumbnail = true;
+            }
+            chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload: finalPayload }, (r) => {
+              resetFabDlBtn();
+              refreshPanelJobsOnly();
+              if (chrome.runtime.lastError || !r?.ok) {
+                console.warn('HLS Grabber fab:', chrome.runtime.lastError || r?.error);
+              }
+            });
+          };
+
+          maybeAskYtdlpFormat(kind, probePayload, finishDl, () => {
+            resetFabDlBtn();
+            refreshPanelJobsOnly();
+          });
+        };
+
+        if (pageOnly && kind === 'yt' && YT && YT.isYoutubePage(tabUrl)) {
+          const hints = YT.playlistHints(tabUrl);
+          if (hints.shouldAskPlaylist) {
+            YT.showPlaylistPrompt(tabUrl, hints, (pick) => {
+              if (pick === null) {
+                resetFabDlBtn();
+                return;
+              }
+              startCookieAndDl(pick);
+            });
+            return;
+          }
+        }
+        startCookieAndDl('single');
       });
       row.appendChild(input);
       row.appendChild(btn);
       card.appendChild(h);
       card.appendChild(u);
+      if (pageOnly) {
+        const thumbRow = document.createElement('label');
+        thumbRow.className = 'thumb-row';
+        const tcb = document.createElement('input');
+        tcb.type = 'checkbox';
+        tcb.id = `fab-thumb-${i}`;
+        thumbRow.appendChild(tcb);
+        const tspan = document.createElement('span');
+        tspan.textContent = 'Also save thumbnail (jpg next to the video)';
+        thumbRow.appendChild(tspan);
+        card.appendChild(thumbRow);
+      }
       card.appendChild(row);
       fabStreams.appendChild(card);
     });
@@ -800,7 +1046,7 @@
       return;
     }
     if (area === 'session' && changes[JOBS_KEY]) {
-      if (panel.classList.contains('open')) refreshAll();
+      if (panel.classList.contains('open')) refreshPanelJobsOnly();
       else refreshBadgeOnly();
     }
   }
@@ -809,7 +1055,7 @@
   fabCtl.closePanel = () => setPanelOpen(false);
   fabCtl.liveRefresh = () => {
     refreshBadgeOnly();
-    if (panel.classList.contains('open')) refreshAll();
+    if (panel.classList.contains('open')) refreshPanelJobsOnly();
   };
 
   host._hlsFabCleanup = () => {

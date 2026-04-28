@@ -104,8 +104,35 @@ def install_native_windows(ext_id):
     bat_path = os.path.join(SCRIPT_DIR, "host_wrapper.bat")
     with open(bat_path, "w", newline="\r\n") as f:
         f.write("@echo off\r\n")
+        f.write("setlocal\r\n")
+        f.write(
+            "REM Optional: set User env var HLS_GRABBER_PYTHON to a full python.exe path "
+            "(e.g. from python.org) if Store Python fails for Chrome.\r\n"
+        )
+        f.write('if not "%HLS_GRABBER_PYTHON%"=="" (\r\n')
+        f.write(f'  "%HLS_GRABBER_PYTHON%" -u "{host_script}"\r\n')
+        f.write("  exit /b %ERRORLEVEL%\r\n")
+        f.write(")\r\n")
         # -u: unbuffered stdio (required for native messaging over pipes)
         f.write(f'"{python_exe}" -u "{host_script}"\r\n')
+
+    low = python_exe.lower()
+    if "windowsapps" in low:
+        print(
+            "\n*** NOTE: This installer is using Microsoft Store Python under WindowsApps."
+        )
+        print(
+            "    Chrome often cannot run yt-dlp reliably with that build, or yt-dlp is missing."
+        )
+        print("    Fix A (same Python): open cmd and run:")
+        print(f'        "{python_exe}" -m pip install -U "yt-dlp[default]"')
+        print(
+            "    Fix B (recommended): install Python from https://www.python.org/downloads/ ,"
+        )
+        print("        then in this folder run:  py -3.12 install.py   (or your version)")
+        print(
+            "        so host_wrapper.bat uses that python.exe instead of the Store shim.\n"
+        )
 
     manifest_dir = os.path.join(
         local_app_data, "Google", "Chrome", "User Data", "NativeMessagingHosts"
@@ -132,6 +159,14 @@ def install_native_windows(ext_id):
     print(f"✓ Manifest written to: {manifest_path}")
     print(f"✓ Registry: HKCU\\{reg_subkey}")
     print("\nRestart Chrome and test the extension!")
+    print(
+        "\n--- YouTube (yt-dlp) ---\n"
+        "Music videos need JavaScript challenge solving (EJS). Install:\n"
+        f'  {sys.executable} -m pip install -U "yt-dlp[default]"\n'
+        "Plus one JS runtime on your PATH (pick one):\n"
+        "  Node.js  https://nodejs.org   or   Deno  https://docs.deno.com/runtime/getting_started/installation/\n"
+        "More info: https://github.com/yt-dlp/yt-dlp/wiki/EJS\n"
+    )
 
 
 def install_linux(ext_id):
@@ -185,6 +220,15 @@ def main():
     else:
         print("\nInstalling for Linux Chrome...")
         install_linux(ext_id)
+
+    print(
+        "\n--- YouTube (yt-dlp) ---\n"
+        "Music videos need JavaScript challenge solving (EJS). Install:\n"
+        f'  "{sys.executable}" -m pip install -U "yt-dlp[default]"\n'
+        "Plus one JS runtime on your PATH (pick one):\n"
+        "  Node.js  https://nodejs.org   or   Deno  https://docs.deno.com/runtime/getting_started/installation/\n"
+        "More info: https://github.com/yt-dlp/yt-dlp/wiki/EJS\n"
+    )
 
 
 if __name__ == "__main__":

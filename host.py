@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 HLS Grabber - Native Messaging Host
-Receives m3u8 URLs from the Chrome extension and runs ffmpeg.
+Receives stream URLs from the Chrome extension. Resolves social/platform URLs with yt-dlp;
+otherwise runs ffmpeg (HLS, DASH, direct) when possible.
 Supports multiple JSON messages per connection (use connectNative in the extension).
 """
 
@@ -16,9 +17,10 @@ import time
 import hashlib
 import tempfile
 import shutil
+import glob
 import urllib.error
 import urllib.request
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 from typing import Optional, Set, Any, Dict, List, Tuple
 
 DEFAULT_DOWNLOAD_DIR = os.path.abspath(
@@ -207,6 +209,15 @@ def _safe_output_path(download_dir, filename, ext=".mp4"):
     return os.path.join(download_dir, f"{stem}{ext}")
 
 
+def _yt_dlp_output_target(message: dict, out_dir: str, filename: str) -> str:
+    """Single file path, or yt-dlp template for playlist downloads."""
+    single = _safe_output_path(out_dir, filename, ".mp4")
+    if not message.get("ytDlpDownloadPlaylist"):
+        return single
+    stem = os.path.splitext(os.path.basename(single))[0]
+    return os.path.join(out_dir, f"{stem} %(playlist_index)03d-%(title)s.%(ext)s")
+
+
 def _clear_active_if(p: Optional[subprocess.Popen]) -> None:
     global _active_ffmpeg
     if p is None:
@@ -304,6 +315,624 @@ def _use_hls_aac_bsf(url: str, message) -> bool:
     if sk in ("direct", "dash", "mpd", "mp4", "webm", "yt", "social", "by_header", "other"):
         return False
     return False
+
+
+# --- Social / streaming platforms → yt-dlp ---------------------------------
+
+# Cached argv prefix to invoke yt-dlp (e.g. ["yt-dlp"] or [sys.executable, "-m", "yt_dlp"]).
+_YTDLP_CMD_PREFIX: Optional[List[str]] = None
+_YTDLP_PREFIX_PROBED: bool = False
+
+
+def _ensure_user_site_packages_on_path() -> None:
+    """pip --user (especially Microsoft Store Python) installs here; add if missing."""
+    try:
+        import site as _site
+
+        u = _site.getusersitepackages()
+        if isinstance(u, str) and u and os.path.isdir(u) and u not in sys.path:
+            sys.path.insert(0, u)
+    except Exception:
+        pass
+
+
+def _yt_dlp_importable_in_process() -> bool:
+    """Whether yt_dlp is visible to this process (same interpreter as host.py)."""
+    _ensure_user_site_packages_on_path()
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("yt_dlp") is not None
+    except Exception:
+        return False
+
+
+_TIKTOK_CDN_STREAM_HOSTS = ("tiktokcdn.com", "musical.ly", "tiktokv.com")
+
+_SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
+    ("YouTube", ("googlevideo.com", "youtube.com", "youtu.be", "ytimg.com")),
+    (
+        "Facebook / Meta",
+        (
+            "facebook.com",
+            "fb.watch",
+            "fbcdn.net",
+            "fbvideo.com",
+            "instagram.com",
+            "cdninstagram.com",
+            "threads.net",
+        ),
+    ),
+    ("TikTok", ("tiktok.com", "tiktokcdn.com", "musical.ly", "tiktokv.com")),
+    ("Twitter / X", ("twitter.com", "x.com", "twimg.com", "video.twimg.com")),
+    ("Reddit", ("reddit.com", "redd.it", "redditstatic.com", "redditmedia.com")),
+    ("Twitch", ("twitch.tv", "twitchcdn.net", "jtvnw.net")),
+    ("Vimeo", ("vimeo.com", "vimeocdn.com", "player.vimeo.com")),
+    ("Dailymotion", ("dailymotion.com", "dm-event.net", "dmcdn.net")),
+    ("Snapchat", ("snapchat.com", "snap.com", "sc-cdn.net")),
+    ("Pinterest", ("pinterest.com", "pinimg.com")),
+    ("LinkedIn", ("linkedin.com", "licdn.com")),
+    ("Bilibili", ("bilibili.com", "bilivideo.com", "bilibiliapi.net")),
+    ("SoundCloud", ("soundcloud.com",)),
+    ("Bandcamp", ("bandcamp.com",)),
+    ("Crunchyroll", ("crunchyroll.com", "vrv.co")),
+    ("Rumble", ("rumble.com",)),
+    ("Kick", ("kick.com",)),
+]
+
+
+def _netloc_host(url: str) -> str:
+    try:
+        u = (url or "").strip()
+        if not u:
+            return ""
+        p = urlparse(u if "://" in u else "https://" + u)
+        h = (p.netloc or "").split("@")[-1].split(":")[0].lower()
+        if h.startswith("www."):
+            h = h[4:]
+        return h
+    except Exception:
+        return ""
+
+
+def _url_is_youtube_page(url: str) -> bool:
+    h = _netloc_host(url).lower()
+    if not h:
+        return False
+    if h in ("youtube.com", "youtu.be", "youtube-nocookie.com"):
+        return True
+    return h.endswith(".youtube.com")
+
+
+def _yt_dlp_youtube_cli_extras(message: dict, target_url: str) -> List[str]:
+    """
+    YouTube needs n/sig challenge solving (EJS). Plain `pip install yt-dlp` omits solver assets;
+    use --remote-components ejs:github plus a JS runtime (Deno or Node on PATH).
+    See https://github.com/yt-dlp/yt-dlp/wiki/EJS
+
+    Omit `mweb` by default: it often needs a GVS PO token (--extractor-args youtube:po_token=...),
+    which we do not pass, so mweb would skip all https formats and leave only storyboards.
+
+    Do not pass `--js-runtimes deno,node` (one arg): yt-dlp treats that as an invalid name. Use
+    repeated `--js-runtimes deno` and `--js-runtimes node`.
+
+    Prefer web clients first on music/VEVO URLs: android/ios https often require PO tokens; web
+    may still expose a combined progressive format (e.g. 360p) without them.
+    """
+    if not _url_is_youtube_page(target_url):
+        return []
+    override = (message.get("ytDlpYoutubeExtractorArgs") or "").strip()
+    if override:
+        ex = ["--extractor-args", override]
+    else:
+        ex = [
+            "--extractor-args",
+            "youtube:player_client=web,web_embedded,android,ios",
+        ]
+    if message.get("ytDlpSkipEjsBootstrap"):
+        return ex
+    ex.extend(
+        [
+            "--remote-components",
+            "ejs:github",
+            "--js-runtimes",
+            "deno",
+            "--js-runtimes",
+            "node",
+        ]
+    )
+    return ex
+
+
+def _host_endswith_domain(host: str, domain: str) -> bool:
+    host = (host or "").lower().rstrip(".")
+    domain = (domain or "").lower().lstrip(".")
+    if not host or not domain:
+        return False
+    return host == domain or host.endswith("." + domain)
+
+
+def _host_matches_any(host: str, domains: Tuple[str, ...]) -> bool:
+    return any(_host_endswith_domain(host, d) for d in domains)
+
+
+def _page_is_tiktok(page_url: str) -> bool:
+    h = _netloc_host(page_url)
+    return _host_matches_any(h, ("tiktok.com", "musical.ly", "tiktokv.com"))
+
+
+def _social_platform_for_yt_dlp(stream_url: str, page_url: str, message: Any) -> Optional[str]:
+    """
+    Host matched a known social / streaming CDN → use yt-dlp.
+    Exception: HLS from TikTok-like CDNs when the tab is not a TikTok page (obfuscated HLS, etc.).
+    """
+    sh = _netloc_host(stream_url)
+    ph = _netloc_host(page_url)
+    if _is_hls_input(stream_url, message) and not _page_is_tiktok(page_url):
+        if _host_matches_any(sh, _TIKTOK_CDN_STREAM_HOSTS):
+            return None
+    for label, domains in _SOCIAL_PLATFORM_RULES:
+        if _host_matches_any(sh, domains) or _host_matches_any(ph, domains):
+            return label
+    return None
+
+
+def _yt_dlp_version_probe_candidates() -> List[List[str]]:
+    """Ways to run `yt_dlp --version`; host may use a different Python than your terminal."""
+    out: List[List[str]] = [["yt-dlp"]]
+    exe_seen: Set[str] = set()
+
+    def add_py_m(pyexe: Optional[str]) -> None:
+        if not pyexe:
+            return
+        try:
+            key = os.path.normcase(os.path.realpath(pyexe))
+        except OSError:
+            key = os.path.normcase(pyexe)
+        if key in exe_seen:
+            return
+        exe_seen.add(key)
+        out.append([pyexe, "-m", "yt_dlp"])
+
+    add_py_m(sys.executable)
+    add_py_m(shutil.which("python"))
+    add_py_m(shutil.which("python3"))
+    if os.name == "nt":
+        out.extend((["py", "-3", "-m", "yt_dlp"], ["py", "-m", "yt_dlp"]))
+    return out
+
+
+def _yt_dlp_invocation_prefix() -> Optional[List[str]]:
+    """
+    How to start yt-dlp on this machine. pip often installs the module but not yt-dlp.exe on PATH
+    (e.g. Microsoft Store Python) then `python -m yt_dlp` works.
+
+    Chrome-spawned Store Python often fails subprocess `[sys.executable, "-m", "yt_dlp", "--version"]`
+    even when yt-dlp is installed; prefer in-process importability first.
+    """
+    global _YTDLP_CMD_PREFIX, _YTDLP_PREFIX_PROBED
+    if _YTDLP_PREFIX_PROBED:
+        return _YTDLP_CMD_PREFIX
+    _YTDLP_PREFIX_PROBED = True
+    if _yt_dlp_importable_in_process():
+        _YTDLP_CMD_PREFIX = [sys.executable, "-m", "yt_dlp"]
+        return _YTDLP_CMD_PREFIX
+    # Do not use CREATE_NO_WINDOW here: Store Python shims under WindowsApps often fail with it
+    # when the host is spawned from Chrome, even though `python -m yt_dlp` works in a terminal.
+    run_kw: Dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 40,
+    }
+    for prefix in _yt_dlp_version_probe_candidates():
+        try:
+            r = subprocess.run(prefix + ["--version"], **run_kw)
+            if r.returncode == 0:
+                _YTDLP_CMD_PREFIX = prefix
+                return prefix
+        except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
+            continue
+        except Exception:
+            continue
+    _YTDLP_CMD_PREFIX = None
+    return None
+
+
+def _yt_dlp_available() -> bool:
+    return _yt_dlp_invocation_prefix() is not None
+
+
+_RE_YTDLP_PROGRESS = re.compile(
+    r"\[download\]\s+(?P<pct>[\d.]+)%\s+of\s+~?\s*(?P<size>\S+)(?:\s+at\s+(?P<rate>\S+))?(?:\s+ETA\s+(?P<eta>\S+))?",
+    re.I,
+)
+
+
+def _parse_yt_dlp_progress(line: str) -> Dict[str, Any]:
+    m = _RE_YTDLP_PROGRESS.search(line)
+    if not m:
+        return {}
+    parts = [f"{m.group('pct').strip()}%"]
+    if m.group("rate"):
+        parts.append(m.group("rate").strip())
+    if m.group("eta"):
+        parts.append(f"ETA {m.group('eta').strip()}")
+    return {"detail": " · ".join(parts)}
+
+
+def _yt_dlp_header_args(message: dict) -> List[str]:
+    """Extra yt-dlp CLI args: --add-header for Referer, UA, Cookie, Authorization."""
+    referer = (message.get("pageUrl") or message.get("referer") or "").strip()
+    ua = (message.get("userAgent") or "").strip() or USER_AGENT
+    cookie = (message.get("cookie") or "").strip()
+    cap = _cap_headers(message.get("capturedHeaders"))
+    if not referer and cap.get("referer"):
+        referer = cap["referer"].strip()
+    args: List[str] = []
+    if referer:
+        args.extend(["--add-header", f"Referer:{referer}"])
+    args.extend(["--add-header", f"User-Agent:{ua}"])
+    if cookie:
+        args.extend(["--add-header", f"Cookie:{cookie}"])
+    auth = cap.get("authorization") or (message.get("authorization") or "").strip()
+    if auth:
+        args.extend(["--add-header", f"Authorization:{auth}"])
+    return args
+
+
+def _yt_dlp_format_string(message: dict) -> str:
+    """
+    Prefer best video + best audio (merged with ffmpeg). Use bestvideo* (asterisk) first so yt-dlp
+    can pick a combined progressive stream (e.g. single 360p mp4) when split DASH/https formats
+    are missing or blocked (PO tokens).
+    """
+    custom = (message.get("ytDlpFormat") or "").strip()
+    if custom:
+        return custom
+    try:
+        cap_h = int(message.get("ytDlpMaxHeight") if message.get("ytDlpMaxHeight") is not None else 4320)
+    except (TypeError, ValueError):
+        cap_h = 4320
+    if cap_h <= 0:
+        return "bestvideo*+bestaudio/best"
+    return f"bestvideo*[height<={cap_h}]+bestaudio/best[height<={cap_h}]/best"
+
+
+def _yt_dlp_build_cmd(prefix: List[str], message: dict, output_path: str, target_url: str) -> List[str]:
+    cmd: List[str] = list(prefix) + [
+        "-f",
+        _yt_dlp_format_string(message),
+        "--merge-output-format",
+        "mp4",
+        "--prefer-ffmpeg",
+    ]
+    if not message.get("ytDlpDownloadPlaylist"):
+        cmd.append("--no-playlist")
+    cmd.extend(
+        [
+            "--no-mtime",
+            "-o",
+            output_path,
+        ]
+    )
+    thumbs = message.get("ytDlpWriteThumbnail") or message.get("includeThumbnail")
+    if thumbs:
+        cmd.extend(["--write-thumbnail", "--convert-thumbnails", "jpg"])
+    cmd.extend(_yt_dlp_youtube_cli_extras(message, target_url))
+    cmd.extend(_yt_dlp_header_args(message))
+    cmd.append(target_url)
+    return cmd
+
+
+def _yt_dlp_primary_input_url(page_url: str, stream_url: str) -> str:
+    """yt-dlp extractors need the watch page URL when available, not only the CDN."""
+    p = (page_url or "").strip()
+    if p.startswith("http://") or p.startswith("https://"):
+        return p
+    return (stream_url or "").strip()
+
+
+def _handle_ytdlp_formats(message: dict) -> None:
+    """Synchronous JSON probe for UI quality picker (Chrome sends dedicated native port)."""
+    req_id = (message.get("requestId") or "").strip()
+    page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
+    stream_url = (message.get("url") or "").strip()
+    target = _yt_dlp_primary_input_url(page_url, stream_url)
+    if not target:
+        send_message(
+            {
+                "type": "ytdlp_formats_result",
+                "requestId": req_id,
+                "success": False,
+                "error": "No page URL for yt-dlp",
+                "formats": [],
+            }
+        )
+        return
+    prefix = _yt_dlp_invocation_prefix()
+    if not prefix:
+        send_message(
+            {
+                "type": "ytdlp_formats_result",
+                "requestId": req_id,
+                "success": False,
+                "error": "yt-dlp not available",
+                "formats": [],
+            }
+        )
+        return
+    cmd: List[str] = list(prefix) + [
+        "--dump-single-json",
+        "--no-download",
+        "--skip-download",
+    ]
+    cmd.extend(_yt_dlp_youtube_cli_extras(message, target))
+    cmd.extend(_yt_dlp_header_args(message))
+    cmd.append(target)
+    run_kw: Dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "timeout": 120,
+        "encoding": "utf-8",
+        "errors": "replace",
+    }
+    try:
+        r = subprocess.run(cmd, **run_kw)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
+        send_message(
+            {
+                "type": "ytdlp_formats_result",
+                "requestId": req_id,
+                "success": False,
+                "error": str(e),
+                "formats": [],
+            }
+        )
+        return
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        tail = ((r.stderr or "") + (r.stdout or ""))[-800:]
+        send_message(
+            {
+                "type": "ytdlp_formats_result",
+                "requestId": req_id,
+                "success": False,
+                "error": tail or f"yt-dlp exit {r.returncode}",
+                "formats": [],
+            }
+        )
+        return
+    try:
+        info = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        send_message(
+            {
+                "type": "ytdlp_formats_result",
+                "requestId": req_id,
+                "success": False,
+                "error": f"Bad JSON from yt-dlp: {e}",
+                "formats": [],
+            }
+        )
+        return
+
+    formats_raw = info.get("formats") or []
+    rows: List[Dict[str, Any]] = []
+    for fmt in formats_raw:
+        fid = fmt.get("format_id")
+        if fid is None:
+            continue
+        vcodec = fmt.get("vcodec") or "none"
+        acodec = fmt.get("acodec") or "none"
+        if vcodec == "none" and acodec == "none":
+            continue
+        height = fmt.get("height")
+        ext = fmt.get("ext") or ""
+        fps = fmt.get("fps")
+        fs = fmt.get("filesize") or fmt.get("filesize_approx")
+        has_video = vcodec not in ("none", None)
+        has_audio = acodec not in ("none", None)
+        parts = [str(fid)]
+        if has_video and height:
+            parts.append(f"{height}p")
+        if has_video and ext:
+            parts.append(ext)
+        if has_video and fps:
+            parts.append(f"{fps}fps")
+        if has_audio and not has_video:
+            parts.append("audio only")
+        elif has_audio:
+            parts.append("+audio")
+        if fs and str(fs).isdigit():
+            parts.append(f"~{int(fs) // 1_000_000}MB" if int(fs) > 1_000_000 else f"~{int(fs) // 1024}KB")
+        label = " ".join(parts)
+        rows.append(
+            {
+                "format_id": str(fid),
+                "label": label,
+                "ext": ext,
+                "height": height,
+                "vcodec": vcodec,
+                "acodec": acodec,
+                "has_video": has_video,
+                "has_audio": has_audio,
+            }
+        )
+
+    def sort_key(row: Dict[str, Any]) -> Tuple[int, int, str]:
+        hv = 2 if row.get("has_video") else 0
+        ha = 1 if row.get("has_audio") else 0
+        h = int(row.get("height") or 0)
+        return (hv + ha, h, row.get("label") or "")
+
+    rows.sort(key=sort_key, reverse=True)
+    rows = rows[:28]
+
+    send_message(
+        {
+            "type": "ytdlp_formats_result",
+            "requestId": req_id,
+            "success": True,
+            "title": (info.get("title") or "")[:200],
+            "formats": rows,
+        }
+    )
+
+
+def run_yt_dlp_with_updates(
+    stream_url: str,
+    message: dict,
+    output_path: str,
+    job_id: str,
+    platform_label: str,
+) -> None:
+    """Download with yt-dlp using page URL first, then stream URL on failure."""
+    page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
+
+    def run_one(target: str) -> Tuple[int, List[str]]:
+        global _active_ffmpeg
+        stderr_lines: List[str] = []
+        prefix = _yt_dlp_invocation_prefix()
+        if not prefix:
+            return 127, ["yt-dlp not found (tried PATH, python -m yt_dlp, py -m yt_dlp)"]
+        cmd = _yt_dlp_build_cmd(prefix, message, output_path, target)
+        popen_kw: Dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+        }
+        # Same as version probe: avoid CREATE_NO_WINDOW with WindowsApps Python (Chrome-spawned host).
+        try:
+            proc = subprocess.Popen(cmd, **popen_kw)
+        except FileNotFoundError:
+            return 127, ["yt-dlp invocation failed (executable missing)"]
+        except Exception as e:
+            return 1, [str(e)]
+
+        with _PROC_LOCK:
+            _active_ffmpeg = proc
+
+        last_send = 0.0
+        throttle_s = 0.35
+
+        def read_stderr() -> None:
+            nonlocal last_send
+            try:
+                for raw in iter(proc.stderr.readline, b""):
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="replace")
+                    stderr_lines.append(line)
+                    if len(stderr_lines) > 250:
+                        stderr_lines.pop(0)
+                    if "[download]" not in line:
+                        continue
+                    pr = _parse_yt_dlp_progress(line)
+                    det = pr.get("detail") or line.strip()[:140]
+                    now = time.monotonic()
+                    if now - last_send < throttle_s:
+                        continue
+                    last_send = now
+                    send_message(
+                        with_job_id(
+                            {
+                                "type": "progress",
+                                "phase": "downloading",
+                                "detail": det,
+                                "output": output_path,
+                            },
+                            job_id,
+                        )
+                    )
+            finally:
+                try:
+                    proc.stderr.close()
+                except Exception:
+                    pass
+
+        t_sd = threading.Thread(target=read_stderr, daemon=True)
+        t_sd.start()
+        code = proc.wait()
+        t_sd.join(timeout=2.0)
+        _clear_active_if(proc)
+        return code, stderr_lines
+
+    primary = _yt_dlp_primary_input_url(page_url, stream_url)
+    send_message(
+        with_job_id(
+            {
+                "type": "progress",
+                "phase": "starting",
+                "detail": f"yt-dlp - {platform_label}",
+                "output": output_path,
+            },
+            job_id,
+        )
+    )
+    code, err_lines = run_one(primary)
+    if (
+        code != 0
+        and stream_url
+        and primary != stream_url
+    ):
+        send_message(
+            with_job_id(
+                {
+                    "type": "progress",
+                    "phase": "downloading",
+                    "detail": "yt-dlp: retrying with stream URL…",
+                    "output": output_path,
+                },
+                job_id,
+            )
+        )
+        code, err_lines = run_one(stream_url)
+
+    if _CANCEL_EVENT.is_set():
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "canceled": True,
+                    "error": "Canceled",
+                },
+                job_id,
+            )
+        )
+        return
+
+    tail = "".join(err_lines[-35:]).strip()
+    if code == 0:
+        ok_v, verr = _verify_yt_dlp_output(output_path)
+        if not ok_v:
+            err = verr or "Download validation failed"
+            if tail:
+                err = err + " | " + tail[-600:]
+            send_message(
+                with_job_id({"type": "done", "success": False, "error": err}, job_id)
+            )
+            return
+        out_report = output_path
+        detail_done = "Finished"
+        if message.get("ytDlpDownloadPlaylist"):
+            out_report = os.path.normpath(os.path.dirname(output_path))
+            detail_done = "Playlist finished (multiple files in folder)"
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": True,
+                    "output": out_report,
+                    "detail": detail_done,
+                },
+                job_id,
+            )
+        )
+    else:
+        err = f"yt-dlp exited with code {code}"
+        if tail:
+            err = err + ": " + tail[-600:]
+        send_message(with_job_id({"type": "done", "success": False, "error": err}, job_id))
 
 
 # --- Obfuscated HLS (image-wrapped .ts segments) ---
@@ -1576,6 +2205,125 @@ def _ffprobe_duration_seconds(path: str) -> float:
         return 0.0
 
 
+def _ffprobe_video_validation(path: str) -> Tuple[float, bool]:
+    """Return (duration_sec, has_video_stream). (0.0, False) if unusable or ffprobe fails."""
+    if not path or not os.path.isfile(path):
+        return 0.0, False
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "json",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if r.returncode != 0:
+            return 0.0, False
+        data = json.loads(r.stdout or "{}")
+        dur = 0.0
+        fmt = data.get("format") or {}
+        raw_d = fmt.get("duration")
+        if raw_d is not None:
+            try:
+                dur = max(0.0, float(raw_d))
+            except (TypeError, ValueError):
+                pass
+        streams = data.get("streams") or []
+        has_video = any(
+            (s.get("codec_type") or "").lower() == "video" for s in streams
+        )
+        return dur, has_video
+    except (
+        FileNotFoundError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+        OSError,
+    ):
+        return 0.0, False
+
+
+def _yt_dlp_output_is_playlist_template(output_path: str) -> bool:
+    return " %(playlist_index)" in os.path.basename(output_path)
+
+
+def _yt_dlp_playlist_mp4_paths(output_path: str) -> List[str]:
+    d = os.path.dirname(os.path.abspath(output_path))
+    base = os.path.basename(output_path)
+    stem_prefix = base.split(" %(playlist_index)", 1)[0]
+    return sorted(glob.glob(os.path.join(d, glob.escape(stem_prefix) + "*.mp4")))
+
+
+def _verify_yt_dlp_media_file(path: str) -> Tuple[bool, str]:
+    """Ensure path is a non-trivial playable video file."""
+    if not path:
+        return False, "Missing output path"
+    if not os.path.isfile(path):
+        part = path + ".part"
+        if os.path.isfile(part):
+            return False, "Download incomplete (.part file still present)"
+        return False, f"Output file missing: {path}"
+    try:
+        sz = os.path.getsize(path)
+    except OSError as e:
+        return False, str(e)
+    if sz < 4096:
+        return (
+            False,
+            f"File too small ({sz} bytes) - likely not a real video",
+        )
+    if not shutil.which("ffprobe"):
+        if sz < 65536:
+            return (
+                False,
+                "ffprobe not found; file is very small - install ffmpeg to verify downloads",
+            )
+        return True, ""
+    dur, has_video = _ffprobe_video_validation(path)
+    if dur < 0.12:
+        return (
+            False,
+            "File is not a playable video (ffprobe reports no usable duration) - "
+            "may be corrupt, HTML, or an image-only artifact",
+        )
+    if not has_video:
+        return False, "Download has no video stream (audio-only or unsupported container)"
+    return True, ""
+
+
+def _verify_yt_dlp_output(output_path: str) -> Tuple[bool, str]:
+    """Validate yt-dlp result: single .mp4 path or playlist template path."""
+    if _yt_dlp_output_is_playlist_template(output_path):
+        paths = _yt_dlp_playlist_mp4_paths(output_path)
+        if not paths:
+            return (
+                False,
+                "Playlist download reported success but no .mp4 files were found in the output folder.",
+            )
+        errors: List[str] = []
+        for p in paths:
+            ok, err = _verify_yt_dlp_media_file(p)
+            if not ok:
+                errors.append(f"{os.path.basename(p)}: {err}")
+        if errors:
+            tail = "; ".join(errors[:5])
+            if len(errors) > 5:
+                tail += "…"
+            return False, "Playlist validation failed: " + tail
+        return True, ""
+    return _verify_yt_dlp_media_file(output_path)
+
+
 def _ffmpeg_concat_two_mp4_to_one(part_a: str, part_b: str, out_final: str) -> bool:
     d = os.path.dirname(os.path.abspath(out_final)) or "."
     fd, t1 = tempfile.mkstemp(suffix=".ts", dir=d, prefix="hgr_")
@@ -1913,11 +2661,47 @@ def run_ffmpeg_with_updates(url, filename, message):
         return
     _CURRENT_JOB_ID = job_id
     output_path = _safe_output_path(out_dir, filename, ".mp4")
-    header_block = build_ffmpeg_header_block(message, url)
-    cmd = _build_ffmpeg_cmd_list(url, message, output_path, header_block, resume_from_sec=0.0)
 
     proc: Optional[subprocess.Popen] = None
     try:
+        page_for_social = (message.get("pageUrl") or message.get("referer") or "").strip()
+        platform_label = _social_platform_for_yt_dlp(url, page_for_social, message)
+        if platform_label:
+            if not _yt_dlp_available():
+                extra = ""
+                ex = (sys.executable or "").lower()
+                if "windowsapps" in ex:
+                    extra = (
+                        " Microsoft Store Python often fails here even after pip install; "
+                        "install Python from python.org, run native-host/install.py with that Python, "
+                        "or set User env var HLS_GRABBER_PYTHON to a working python.exe "
+                        "(see host_wrapper.bat)."
+                    )
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "error": (
+                                f"This looks like a {platform_label} video. yt-dlp was not found from this "
+                                f"native host (Python: {sys.executable}). "
+                                f'Install with: "{sys.executable}" -m pip install -U yt-dlp '
+                                f"(same interpreter Chrome uses). "
+                                f"Or re-run native-host/install.py with the Python where yt-dlp works.{extra}"
+                            ),
+                        },
+                        job_id,
+                    )
+                )
+                return
+            ytdlp_out = _yt_dlp_output_target(message, out_dir, filename)
+            _JOB_LIVE[job_id] = {"output": ytdlp_out, "tsec": 0.0, "url": url}
+            run_yt_dlp_with_updates(url, message, ytdlp_out, job_id, platform_label)
+            return
+
+        header_block = build_ffmpeg_header_block(message, url)
+        cmd = _build_ffmpeg_cmd_list(url, message, output_path, header_block, resume_from_sec=0.0)
+
         if _is_hls_input(url, message):
             send_message(
                 with_job_id(
@@ -2131,6 +2915,13 @@ def main():
         if mtype == "refresh":
             threading.Thread(
                 target=_handle_hls_auth_refresh, args=(message,),
+                daemon=True,
+            ).start()
+            continue
+        if mtype == "ytdlp_formats":
+            threading.Thread(
+                target=_handle_ytdlp_formats,
+                args=(message,),
                 daemon=True,
             ).start()
             continue

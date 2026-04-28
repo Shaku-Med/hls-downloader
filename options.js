@@ -1,5 +1,7 @@
 const KEY = 'userDownloadPath';
 const FLOAT_KEY = 'floatGrabberEnabled';
+const YTDLP_MODE_KEY = 'ytDlpQualityMode';
+const YTDLP_MAX_H_KEY = 'ytDlpMaxHeight';
 
 function showStatus(msg, kind) {
   const el = document.getElementById('status');
@@ -9,7 +11,7 @@ function showStatus(msg, kind) {
 }
 
 function load() {
-  chrome.storage.local.get([KEY, FLOAT_KEY], (data) => {
+  chrome.storage.local.get([KEY, FLOAT_KEY, YTDLP_MODE_KEY, YTDLP_MAX_H_KEY], (data) => {
     const err = chrome.runtime.lastError;
     if (err) {
       showStatus(String(err), 'err');
@@ -18,6 +20,13 @@ function load() {
     document.getElementById('path').value = (data && data[KEY]) || '';
     const floatEl = document.getElementById('float-on');
     if (floatEl) floatEl.checked = data[FLOAT_KEY] !== false;
+    const qEl = document.getElementById('ytdlp-quality');
+    if (qEl) qEl.value = data[YTDLP_MODE_KEY] === 'ask' ? 'ask' : 'auto';
+    const hEl = document.getElementById('ytdlp-max-h');
+    if (hEl) {
+      const v = data[YTDLP_MAX_H_KEY];
+      hEl.value = v != null && String(v).trim() !== '' ? String(v) : '';
+    }
   });
 }
 
@@ -68,6 +77,29 @@ if (floatOn) {
   floatOn.addEventListener('change', () => {
     chrome.storage.local.set({ [FLOAT_KEY]: !!floatOn.checked });
   });
+}
+
+const ytdlpQuality = document.getElementById('ytdlp-quality');
+if (ytdlpQuality) {
+  ytdlpQuality.addEventListener('change', () => {
+    const v = ytdlpQuality.value === 'ask' ? 'ask' : 'auto';
+    chrome.storage.local.set({ [YTDLP_MODE_KEY]: v });
+  });
+}
+
+const ytdlpMaxH = document.getElementById('ytdlp-max-h');
+if (ytdlpMaxH) {
+  const persistMaxH = () => {
+    const raw = ytdlpMaxH.value.trim();
+    if (!raw) {
+      chrome.storage.local.remove(YTDLP_MAX_H_KEY);
+      return;
+    }
+    const n = parseInt(raw, 10);
+    if (!Number.isNaN(n)) chrome.storage.local.set({ [YTDLP_MAX_H_KEY]: n });
+  };
+  ytdlpMaxH.addEventListener('change', persistMaxH);
+  ytdlpMaxH.addEventListener('blur', persistMaxH);
 }
 
 window.addEventListener('pageshow', (e) => {

@@ -39,6 +39,121 @@ function genJobId() {
   return `j_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 }
 
+function ytdlpFormatSelection(row) {
+  if (!row) return '';
+  if (row.has_video && row.has_audio) return String(row.format_id);
+  if (row.has_video) return `${row.format_id}+bestaudio/best`;
+  return '';
+}
+
+/** @param {(row: object | null | undefined) => void} callback - null = best auto, undefined = canceled */
+function showYtdlpFormatPicker(title, rows, callback) {
+  const overlay = document.createElement('div');
+  overlay.style.cssText =
+    'position:fixed;inset:0;background:rgba(0,0,0,.42);z-index:100000;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box;';
+  const box = document.createElement('div');
+  box.style.cssText =
+    'background:#fff;border-radius:12px;padding:14px 16px;max-width:380px;width:100%;max-height:78vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);';
+  const h = document.createElement('div');
+  h.style.cssText = 'font-weight:600;font-size:14px;margin-bottom:6px;color:#1c1917;';
+  h.textContent = 'Choose quality';
+  const sub = document.createElement('div');
+  sub.style.cssText = 'font-size:12px;color:#57534e;margin-bottom:12px;line-height:1.4;';
+  sub.textContent = (title && title.trim()) || 'Several formats are available.';
+  const form = document.createElement('div');
+  form.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
+  const mkBtn = (label, onClick) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.style.cssText =
+      'text-align:left;padding:10px 12px;border:1px solid #e7e2dc;border-radius:8px;background:#faf8f5;font-size:13px;cursor:pointer;font-family:inherit;';
+    b.addEventListener('mouseenter', () => {
+      b.style.background = '#fff7ed';
+    });
+    b.addEventListener('mouseleave', () => {
+      b.style.background = '#faf8f5';
+    });
+    b.addEventListener('click', onClick);
+    return b;
+  };
+  form.appendChild(
+    mkBtn('Best available (auto merge)', () => {
+      document.body.removeChild(overlay);
+      callback(null);
+    })
+  );
+  for (const r of rows) {
+    const rowRef = r;
+    form.appendChild(
+      mkBtn(rowRef.label || rowRef.format_id, () => {
+        document.body.removeChild(overlay);
+        callback(rowRef);
+      })
+    );
+  }
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.textContent = 'Cancel';
+  cancel.style.cssText =
+    'margin-top:10px;padding:8px 12px;border:none;background:transparent;color:#78716c;font-size:12px;cursor:pointer;font-family:inherit;width:100%;';
+  cancel.addEventListener('click', () => {
+    document.body.removeChild(overlay);
+    callback(undefined);
+  });
+  box.appendChild(h);
+  box.appendChild(sub);
+  box.appendChild(form);
+  box.appendChild(cancel);
+  overlay.appendChild(box);
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay) {
+      document.body.removeChild(overlay);
+      callback(undefined);
+    }
+  });
+  document.body.appendChild(overlay);
+}
+
+function maybeAskYtdlpFormat(kind, probePayload, onPick, onCancel) {
+  chrome.storage.local.get(['ytDlpQualityMode'], (opt) => {
+    if (chrome.runtime.lastError) {
+      onPick(null);
+      return;
+    }
+    const ask = opt && opt.ytDlpQualityMode === 'ask';
+    const ytdlp = kind === 'social' || kind === 'yt';
+    if (!ask || !ytdlp) {
+      onPick(null);
+      return;
+    }
+    chrome.runtime.sendMessage({ type: 'GET_YTDLP_FORMATS', payload: probePayload }, (res) => {
+      if (chrome.runtime.lastError) {
+        onPick(null);
+        return;
+      }
+      const formats = (res && res.formats) || [];
+      const videoRows = formats.filter((f) => f.has_video);
+      const pickable = videoRows.length ? videoRows : formats;
+      if (!res || !res.ok || pickable.length < 2) {
+        onPick(null);
+        return;
+      }
+      showYtdlpFormatPicker((res.title || '').trim(), pickable, (sel) => {
+        if (sel === undefined) {
+          onCancel();
+          return;
+        }
+        if (sel === null) {
+          onPick(null);
+          return;
+        }
+        onPick(ytdlpFormatSelection(sel));
+      });
+    });
+  });
+}
+
 function setPathBar(userDownloadPath) {
   const el = document.getElementById('path-line');
   if (!el) return;
@@ -219,16 +334,33 @@ function renderStreams(streams, pageTitle, hasPath) {
     item.className = 'stream-item';
 
     const kind = stream.streamKind ? String(stream.streamKind) : '';
+    const pageOnly = stream.pageDownload === true;
     const h = document.createElement('div');
     h.className = 'stream-label';
-    h.textContent =
-      n > 1
-        ? `Stream ${i + 1} of ${n}` + (kind ? ` — ${kind}` : '')
-        : (kind ? `Stream — ${kind}` : 'Stream');
+    h.textContent = pageOnly
+      ? 'Download this video'
+      : n > 1
+        ? `Stream ${i + 1} of ${n}` + (kind ? ` (${kind})` : '')
+        : kind
+          ? `Stream (${kind})`
+          : 'Stream';
 
     const urlEl = document.createElement('div');
     urlEl.className = 'stream-url';
-    urlEl.textContent = url;
+    if (pageOnly) {
+      const intro = document.createElement('div');
+      intro.style.cssText = 'font-size:11px;color:#57534e;line-height:1.4;margin-bottom:6px;';
+      intro.textContent =
+        'Social media: yt-dlp downloads from the page URL below (not a separate stream link).';
+      const link = document.createElement('div');
+      link.style.cssText =
+        'word-break:break-all;font-family:ui-monospace,Cascadia Code,Consolas,monospace;font-size:11px;';
+      link.textContent = url;
+      urlEl.appendChild(intro);
+      urlEl.appendChild(link);
+    } else {
+      urlEl.textContent = url;
+    }
 
     const field = document.createElement('div');
     field.className = 'field';
@@ -248,15 +380,29 @@ function renderStreams(streams, pageTitle, hasPath) {
     btn.className = 'dl-btn';
     btn.type = 'button';
     btn.id = `btn-${i}`;
-    btn.textContent = 'Download';
     if (!hasPath) {
       btn.disabled = true;
       btn.title = 'Add a save folder in Options first';
     }
+    btn.textContent = pageOnly ? 'Download this' : 'Download';
     row.appendChild(input);
     row.appendChild(btn);
     field.appendChild(lab);
     field.appendChild(row);
+    if (pageOnly) {
+      const thumbLab = document.createElement('label');
+      thumbLab.style.cssText =
+        'display:flex;align-items:flex-start;gap:8px;margin-top:10px;font-size:12px;color:#44403c;cursor:pointer;font-weight:500;';
+      const tcb = document.createElement('input');
+      tcb.type = 'checkbox';
+      tcb.id = `thumb-${i}`;
+      tcb.style.cssText = 'width:auto;margin-top:2px;flex-shrink:0;';
+      thumbLab.appendChild(tcb);
+      const tsp = document.createElement('span');
+      tsp.textContent = 'Also save thumbnail (jpg next to the video)';
+      thumbLab.appendChild(tsp);
+      field.appendChild(thumbLab);
+    }
 
     const statusEl = document.createElement('div');
     statusEl.className = 'status';
@@ -280,49 +426,125 @@ function renderStreams(streams, pageTitle, hasPath) {
       btn.textContent = 'Queueing…';
       setStatusRunInBackground(statusEl);
 
+      const YT = typeof window !== 'undefined' ? window.HLS_YT : null;
+
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         const tab = tabs[0];
         const tabUrl = tab?.url || '';
         const tabId = tab?.id;
         const capturedHeaders = stream.capturedHeaders || {};
-        buildCookieHeader(url, tabUrl, (cookie) => {
-          const payload = {
-            jobId,
-            url,
-            filename,
-            tabId: tabId != null ? tabId : undefined,
-            streamKind: kind || undefined,
-            cookie: cookie || undefined,
-            userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : undefined,
-            capturedHeaders,
-          };
+
+        const resetDlUi = () => {
+          btn.disabled = false;
+          btn.textContent = pageOnly ? 'Download this' : 'Download';
+          statusEl.removeAttribute('data-bg-run');
+        };
+
+        const startCookieAndDl = (plPick) => {
+          let effUrl = url;
+          let effPage = '';
+          let effRef = '';
+          let effOrigin = '';
+          let plDl = false;
           if (isHttpUrl(tabUrl)) {
-            payload.referer = tabUrl;
+            effPage = tabUrl;
+            effRef = tabUrl;
             try {
-              payload.origin = new URL(tabUrl).origin;
+              effOrigin = new URL(tabUrl).origin;
             } catch (_) {}
           }
-          chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload }, (r) => {
-            if (chrome.runtime.lastError) {
-              btn.disabled = false;
-              btn.textContent = 'Download';
-              statusEl.removeAttribute('data-bg-run');
-              statusEl.className = 'status err';
-              statusEl.textContent = chrome.runtime.lastError.message;
-              return;
+          if (pageOnly && kind === 'yt' && YT && YT.isYoutubePage(tabUrl)) {
+            const yChoice = plPick === 'playlist' ? 'playlist' : 'single';
+            const a = YT.applyYoutubeChoice(tabUrl, yChoice);
+            effUrl = a.targetUrl;
+            effPage = a.pageUrl;
+            effRef = a.referer;
+            effOrigin = a.origin || effOrigin;
+            plDl = !!a.ytDlpDownloadPlaylist;
+          } else if (!isHttpUrl(tabUrl)) {
+            effPage = effUrl;
+            effRef = effUrl;
+            try {
+              effOrigin = new URL(effUrl).origin;
+            } catch (_) {}
+          }
+
+          buildCookieHeader(effUrl, effPage || tabUrl, (cookie) => {
+            const payload = {
+              jobId,
+              url: effUrl,
+              filename,
+              tabId: tabId != null ? tabId : undefined,
+              streamKind: kind || undefined,
+              cookie: cookie || undefined,
+              userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : undefined,
+              capturedHeaders,
+            };
+            if (effPage && isHttpUrl(effPage)) {
+              payload.pageUrl = effPage;
+              payload.referer = effRef || effPage;
+              if (effOrigin) payload.origin = effOrigin;
             }
-            if (!r?.ok) {
-              btn.disabled = false;
-              btn.textContent = 'Download';
-              statusEl.removeAttribute('data-bg-run');
+            if (plDl) payload.ytDlpDownloadPlaylist = true;
+
+            const probePayload = {
+              url: payload.url,
+              tabId: tabId != null ? tabId : undefined,
+              cookie: payload.cookie,
+              userAgent: payload.userAgent,
+              capturedHeaders: payload.capturedHeaders,
+              pageUrl: payload.pageUrl,
+              referer: payload.referer,
+              origin: payload.origin,
+            };
+
+            const startDl = (ytFmt) => {
+              const finalPayload = { ...payload };
+              if (ytFmt) finalPayload.ytDlpFormat = ytFmt;
+              const th = document.getElementById(`thumb-${i}`);
+              if (pageOnly && th && th.checked) finalPayload.ytDlpWriteThumbnail = true;
+              chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload: finalPayload }, (r) => {
+                if (chrome.runtime.lastError) {
+                  resetDlUi();
+                  statusEl.style.display = 'block';
+                  statusEl.className = 'status err';
+                  statusEl.textContent = chrome.runtime.lastError.message;
+                  return;
+                }
+                if (!r?.ok) {
+                  resetDlUi();
+                  statusEl.style.display = 'block';
+                  statusEl.className = 'status err';
+                  statusEl.textContent = r?.error || 'Could not start';
+                  return;
+                }
+                resetDlUi();
+              });
+            };
+
+            maybeAskYtdlpFormat(kind, probePayload, startDl, () => {
+              resetDlUi();
+              statusEl.style.display = 'block';
               statusEl.className = 'status err';
-              statusEl.textContent = r?.error || 'Could not start';
-              return;
-            }
-            btn.disabled = false;
-            btn.textContent = 'Download';
+              statusEl.textContent = 'Canceled';
+            });
           });
-        });
+        };
+
+        if (pageOnly && kind === 'yt' && YT && YT.isYoutubePage(tabUrl)) {
+          const hints = YT.playlistHints(tabUrl);
+          if (hints.shouldAskPlaylist) {
+            YT.showPlaylistPrompt(tabUrl, hints, (pick) => {
+              if (pick === null) {
+                resetDlUi();
+                return;
+              }
+              startCookieAndDl(pick);
+            });
+            return;
+          }
+        }
+        startCookieAndDl('single');
       });
     });
   });
@@ -349,6 +571,18 @@ function loadUi() {
   });
 }
 
+/** Job progress updates session storage often; only patch the banner so filename inputs keep focus. */
+function refreshJobsBannerOnly() {
+  chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
+    if (chrome.runtime.lastError || !response) return;
+    renderJobsBanner(response?.jobs || [], {
+      running: response?.running,
+      queueLength: response?.queueLength,
+      max: response?.maxParallel,
+    });
+  });
+}
+
 loadUi();
 
 document.getElementById('open-options')?.addEventListener('click', (e) => {
@@ -362,6 +596,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
     return;
   }
   if (area === 'session' && changes[JOBS_KEY]) {
-    loadUi();
+    refreshJobsBannerOnly();
   }
 });
