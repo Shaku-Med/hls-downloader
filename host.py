@@ -178,13 +178,21 @@ _WIN_RESERVED = (
 
 
 def _sanitize_filename_stem(name):
+    # Keep the user's name as-is (including spaces). Only replace characters that
+    # are invalid on Windows/macOS filesystems or unsafe for paths.
     s = (name or "stream").strip()
-    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", s)
-    s = re.sub(r"\s+", "_", s)
-    s = s.strip(" ._") or "stream"
+    # Windows invalid chars + ASCII control chars. Replace with a space to preserve readability.
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", s)
+    # Windows forbids trailing spaces and trailing dots. Leading dots are allowed but can be confusing.
+    s = s.strip()
+    s = s.lstrip(".")
+    s = s.rstrip(" .")
+    # Collapse nothing: preserve internal whitespace. If we blanked out the name, fall back.
+    s = s or "stream"
     root = s.split(".")[0].lower()
     if root in _WIN_RESERVED:
-        s = "_" + s
+        # Avoid reserved device names on Windows (CON, PRN, ...). Only adjust when required.
+        s = f"{s} file"
     return s
 
 
@@ -200,7 +208,8 @@ def _shorten_stem_for_windows(stem, download_dir, ext=".mp4"):
         return stem
     digest = hashlib.sha1(stem.encode("utf-8", errors="replace")).hexdigest()[:12]
     keep = max(1, room - len(digest) - 1)
-    return f"{stem[:keep]}_{digest}"
+    # Avoid forcing underscores; keep it human-readable while staying under MAX_PATH.
+    return f"{stem[:keep]} {digest}"
 
 
 def _safe_output_path(download_dir, filename, ext=".mp4"):
