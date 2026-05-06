@@ -291,9 +291,15 @@ def _is_hls_input(url: str, message) -> bool:
     u = (url or "").lower()
     if ".m3u8" in u or u.endswith(".m3u") or re.search(r"\.m3u8[?#]", u):
         return True
-    # CDN playlists disguised as .txt (still contain #EXTM3U)
-    if re.search(r"\.txt(?:[?#]|$)", u) and (
-        "index-" in u or "playlist" in u or "/hls/" in u or "/pts" in u or "/v4/" in u
+    # CDN playlists disguised as .txt / .php / .asp / … (still contain #EXTM3U)
+    if re.search(r"\.(?:txt|php|asp|aspx|ashx|jsp)(?:[?#]|$)", u) and (
+        "index-" in u
+        or "playlist" in u
+        or "/hls/" in u
+        or "/pts" in u
+        or "/v4/" in u
+        or "m3u" in u
+        or "hls" in u
     ):
         return True
     sk = (message.get("streamKind") or message.get("stream_kind") or "").strip().lower()
@@ -305,8 +311,14 @@ def _use_hls_aac_bsf(url: str, message) -> bool:
     u = (url or "").lower()
     if ".m3u8" in u or u.endswith(".m3u") or re.search(r"\.m3u8[?#]", u):
         return True
-    if re.search(r"\.txt(?:[?#]|$)", u) and (
-        "index-" in u or "playlist" in u or "/hls/" in u or "/pts" in u or "/v4/" in u
+    if re.search(r"\.(?:txt|php|asp|aspx|ashx|jsp)(?:[?#]|$)", u) and (
+        "index-" in u
+        or "playlist" in u
+        or "/hls/" in u
+        or "/pts" in u
+        or "/v4/" in u
+        or "m3u" in u
+        or "hls" in u
     ):
         return True
     sk = (message.get("streamKind") or message.get("stream_kind") or "").strip().lower()
@@ -983,6 +995,15 @@ def _looks_like_ts_at(data: bytes, idx: int) -> bool:
     return _ts_sync_count(data, idx) >= 3
 
 
+def _is_mpegts_packet_sync_at(data: bytes, offset: int = 0) -> bool:
+    """True if raw MPEG-TS packets start at offset (0x47 every 188 bytes)."""
+    if offset < 0:
+        return False
+    if len(data) < offset + 189:
+        return False
+    return data[offset] == 0x47 and data[offset + 188] == 0x47
+
+
 def _find_best_mpegts_start(data: bytes, start: int = 0) -> int:
     """Strongest sync-aligned run of TS packets; avoids accidental 0x47 in MP4/binary noise."""
     n = len(data)
@@ -1304,7 +1325,13 @@ def _strip_webp_prefix(data: bytes) -> Optional[bytes]:
 
 
 def _obfuscation_kind_from_magic(data: bytes) -> Optional[str]:
+    """Wrapper kind from magic bytes. Raw MPEG-TS at 0 is not a wrapper — return None."""
     s = _strip_leading_garbage(data)
+    if not s:
+        return None
+    # Before PNG/JPEG/GIF: GIF89a also begins with 0x47; packet-aligned TS uses 188-byte sync.
+    if _is_mpegts_packet_sync_at(s, 0):
+        return None
     if len(s) >= 8 and s.startswith(_PNG_SIG):
         return "png"
     if len(s) >= 3 and s.startswith(_JPEG_SIG):
@@ -1399,7 +1426,8 @@ def _detect_obfuscated_segments(
 ) -> Tuple[Optional[str], int]:
     """
     Download variant playlist and sample first segment.
-    Returns (obfuscation_kind, unused). kind None => use normal ffmpeg.
+    Returns (obfuscation_kind, unused). kind None => use normal ffmpeg with HLS flags
+    (raw MPEG-TS segments under fake .jpg/.gif names need -allowed_extensions ALL only).
     """
     try:
         if variant is not None:
@@ -1425,16 +1453,26 @@ def _detect_obfuscated_segments(
         return None, 0
 
     s0 = _strip_leading_garbage(head)
-    if _ts_sync_count(s0, 0) >= 4:
+
+    # 1) Raw MPEG-TS at byte 0 (188-byte sync). Disambiguates TS from GIF89a (also 0x47…).
+    if _is_mpegts_packet_sync_at(s0, 0):
         return None, 0
 
+    # 2–5) Wrapper / fMP4 via magic; 6) scan first 64KB for TS after leading junk.
     img = _obfuscation_kind_from_magic(head)
     if img:
         hint = img
     elif _find_first_mp4_box(s0) >= 0:
         hint = "fmp4"
     else:
-        hint = "generic"
+        win = s0[:65536]
+        off = _find_best_mpegts_start(win, 0)
+        if off > 0 and _looks_like_ts_at(win, off):
+            hint = "generic"
+        elif _ts_sync_count(s0, 0) >= 4:
+            return None, 0
+        else:
+            hint = "generic"
 
     def _classify_sample(sample: bytes) -> Optional[str]:
         pl = _extract_ts_payload(sample, hint)
@@ -1622,12 +1660,15 @@ def _ffmpeg_remux_combined_to_output(
 
 
 def _hls_uses_misleading_extensions(playlist_url: str, playlist_text: str) -> bool:
-    """CDN uses wrong extensions (.txt playlist, .woff/.woff2 media) while bytes are valid."""
+    """CDN uses wrong extensions (playlist or segments) while bytes are valid media."""
     u = (playlist_url or "").lower()
-    if re.search(r"\.txt(?:[?#]|$)", u):
+    if re.search(r"\.(?:txt|php|asp|aspx|ashx|jsp)(?:[?#]|$)", u):
         return True
     low = (playlist_text or "").lower()
     if re.search(r"\.woff2?(?=[?\s\"'#]|$)", low):
+        return True
+    # Segments named like images but payload may be TS/fMP4 (no wrapper)
+    if re.search(r"\.(?:jpe?g|png|gif|webp|bmp|ico)(?=[?\s\"'#]|$)", low):
         return True
     return False
 
@@ -2141,8 +2182,10 @@ def _build_ffmpeg_cmd_list(
             [
                 "-allowed_extensions",
                 "ALL",
+                "-extension_picky",
+                "0",
                 "-protocol_whitelist",
-                "file,http,https,tcp,tls,crypto",
+                "file,http,https,tcp,tls,crypto,ffurl",
                 "-analyzeduration",
                 "200M",
                 "-probesize",
@@ -2731,7 +2774,7 @@ def run_ffmpeg_with_updates(url, filename, message):
                     )
                 except Exception:
                     clean_kind = None
-                if clean_kind:
+                if clean_kind == "fmp4":
                     _JOB_LIVE[job_id] = {"output": output_path, "tsec": 0.0, "url": url}
                     _download_clean_hls_no_strip(
                         message,
@@ -2743,6 +2786,7 @@ def run_ffmpeg_with_updates(url, filename, message):
                         var_text_r,
                     )
                     return
+                # clean_kind "ts": extension mismatch only — ffmpeg HLS demuxer + ALL suffices.
 
             ob_kind: Optional[str] = None
             try:
