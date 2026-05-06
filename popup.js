@@ -1,4 +1,23 @@
 const JOBS_KEY = 'hlsGrabJobsState';
+const THEME_MODE_KEY = 'uiThemeMode';
+const THEME_ACCENT_KEY = 'uiThemeAccent';
+
+function resolveThemeMode(mode) {
+  if (mode === 'light' || mode === 'dark') return mode;
+  try {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  } catch (_) {
+    return 'dark';
+  }
+}
+
+function applyUiTheme(mode, accent) {
+  const root = document.documentElement;
+  const resolved = resolveThemeMode(mode);
+  root.setAttribute('data-theme', resolved);
+  root.setAttribute('data-theme-mode', mode || 'system');
+  root.setAttribute('data-accent', accent || 'blue');
+}
 
 function isHttpUrl(u) {
   return u && (u.startsWith('http:') || u.startsWith('https:'));
@@ -183,6 +202,12 @@ function renderJobsBanner(jobs, meta) {
   const r = meta?.running ?? 0;
   const q = meta?.queueLength ?? 0;
   const m = meta?.max ?? 4;
+  const pill = document.getElementById('queue-pill');
+  if (pill) {
+    const active = r + q;
+    pill.textContent = active > 0 ? `${active} active` : 'Idle';
+    pill.classList.toggle('is-active', active > 0);
+  }
   let line = `${r} of ${m} slots busy`;
   if (q > 0) line += `. ${q} in queue`;
   sub.textContent = line;
@@ -195,8 +220,14 @@ function renderJobsBanner(jobs, meta) {
     t.textContent = (job.label || 'video') + ' (' + (job.status || '') + ')';
     const d = document.createElement('div');
     d.className = 'job-detail';
+    const spotifyBlocked =
+      typeof job.error === 'string' &&
+      /spotify/i.test(job.error) &&
+      /(drm|unsupported|protected)/i.test(job.error);
     if (job.status === 'error') {
-      d.textContent = job.error || '';
+      d.textContent = spotifyBlocked
+        ? 'Spotify source protected (DRM/unsupported). Try another source URL.'
+        : job.error || '';
     } else if (job.status === 'canceled') {
       d.textContent = job.error || 'Canceled';
     } else {
@@ -254,6 +285,119 @@ function setStatusRunInBackground(statusEl) {
   statusEl.textContent = 'Queued. Close the popup if you need to. Up to 4 at once, then a line forms.';
 }
 
+function isSpotifyLike(url, kind) {
+  const u = String(url || '').toLowerCase();
+  return kind === 'spotify' || u.includes('open.spotify.com') || u.includes('spotify.com/');
+}
+
+function spotifyContextFromTabUrl(tabUrl) {
+  const u = String(tabUrl || '').trim();
+  const low = u.toLowerCase();
+  const isSpotify = low.includes('open.spotify.com') || low.includes('spotify.com/');
+  const autoTrack = /open\.spotify\.com\/(track|episode)\//i.test(u) ? u : '';
+  return { isSpotify, autoTrack, tabUrl: u };
+}
+
+function defaultSpotifyFileName(spotifyUrl) {
+  try {
+    const u = new URL(spotifyUrl);
+    const parts = u.pathname.split('/').filter(Boolean);
+    if (parts.length >= 2) return `spotify ${parts[0]} ${parts[1].slice(0, 8)}`;
+  } catch (_) {}
+  return 'spotify audio';
+}
+
+function buildSpotifyPromptCard(ctx, hasPath) {
+  const item = document.createElement('div');
+  item.className = 'stream-item';
+  const top = document.createElement('div');
+  top.className = 'stream-top';
+  const h = document.createElement('div');
+  h.className = 'stream-label';
+  h.textContent = 'Spotify URL';
+  const badge = document.createElement('span');
+  badge.className = 'stream-kind-badge';
+  badge.textContent = 'spotify';
+  top.appendChild(h);
+  top.appendChild(badge);
+  const info = document.createElement('div');
+  info.className = 'stream-url';
+  info.textContent = 'Paste a Spotify track URL, or use the current page URL if you are already on a track.';
+  const field = document.createElement('div');
+  field.className = 'field';
+  const lab = document.createElement('label');
+  lab.textContent = 'Spotify track URL';
+  const row = document.createElement('div');
+  row.className = 'row';
+  const input = document.createElement('input');
+  input.className = 'filename-input';
+  input.type = 'text';
+  input.value = ctx.autoTrack || '';
+  input.placeholder = 'https://open.spotify.com/track/...';
+  if (!hasPath) input.readOnly = true;
+  const btn = document.createElement('button');
+  btn.className = 'dl-btn';
+  btn.type = 'button';
+  btn.textContent = 'Download';
+  if (!hasPath) btn.disabled = true;
+  const status = document.createElement('div');
+  status.className = 'status';
+  status.style.display = 'none';
+  row.appendChild(input);
+  row.appendChild(btn);
+  field.appendChild(lab);
+  field.appendChild(row);
+  item.appendChild(top);
+  item.appendChild(info);
+  item.appendChild(field);
+  item.appendChild(status);
+
+  btn.addEventListener('click', () => {
+    const spotifyUrl = input.value.trim();
+    if (!/^https?:\/\/(open\.)?spotify\.com\//i.test(spotifyUrl)) {
+      status.style.display = 'block';
+      status.className = 'status err';
+      status.textContent = 'Enter a valid Spotify URL.';
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = 'Queueing…';
+    status.style.display = 'block';
+    status.className = 'status pending';
+    status.textContent = 'Attempting Spotify extraction…';
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs && tabs[0];
+      const tabUrl = tab?.url || ctx.tabUrl || spotifyUrl;
+      const tabId = tab?.id;
+      buildCookieHeader(spotifyUrl, tabUrl, (cookie) => {
+        const payload = {
+          jobId: genJobId(),
+          url: spotifyUrl,
+          filename: defaultSpotifyFileName(spotifyUrl),
+          tabId: tabId != null ? tabId : undefined,
+          streamKind: 'social',
+          cookie: cookie || undefined,
+          userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : undefined,
+          pageUrl: tabUrl,
+          referer: tabUrl,
+        };
+        chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload }, (r) => {
+          btn.disabled = false;
+          btn.textContent = 'Download';
+          if (chrome.runtime.lastError || !r?.ok) {
+            status.className = 'status err';
+            status.textContent = chrome.runtime.lastError?.message || r?.error || 'Could not start';
+            return;
+          }
+          status.className = 'status ok';
+          status.textContent = 'Download queued';
+        });
+      });
+    });
+  });
+  return item;
+}
+
 function slugify(url) {
   try {
     const u = new URL(url);
@@ -308,7 +452,7 @@ function setContextLine(pageTitle) {
   }
 }
 
-function renderStreams(streams, pageTitle, hasPath) {
+function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
   setContextLine(pageTitle);
   const content = document.getElementById('content');
 
@@ -324,6 +468,9 @@ function renderStreams(streams, pageTitle, hasPath) {
   const list = document.createElement('div');
   list.className = 'stream-list';
   const n = streams.length;
+  if (spotifyCtx && spotifyCtx.isSpotify) {
+    list.appendChild(buildSpotifyPromptCard(spotifyCtx, hasPath));
+  }
 
   streams.forEach((raw, i) => {
     const stream = typeof raw === 'string' ? { url: raw, capturedHeaders: {} } : raw;
@@ -335,6 +482,8 @@ function renderStreams(streams, pageTitle, hasPath) {
 
     const kind = stream.streamKind ? String(stream.streamKind) : '';
     const pageOnly = stream.pageDownload === true;
+    const top = document.createElement('div');
+    top.className = 'stream-top';
     const h = document.createElement('div');
     h.className = 'stream-label';
     h.textContent = pageOnly
@@ -344,6 +493,11 @@ function renderStreams(streams, pageTitle, hasPath) {
         : kind
           ? `Stream (${kind})`
           : 'Stream';
+    const badge = document.createElement('span');
+    badge.className = 'stream-kind-badge';
+    badge.textContent = kind || 'stream';
+    top.appendChild(h);
+    top.appendChild(badge);
 
     const urlEl = document.createElement('div');
     urlEl.className = 'stream-url';
@@ -409,7 +563,7 @@ function renderStreams(streams, pageTitle, hasPath) {
     statusEl.id = `status-${i}`;
     statusEl.style.display = 'none';
 
-    item.appendChild(h);
+    item.appendChild(top);
     item.appendChild(urlEl);
     item.appendChild(field);
     item.appendChild(statusEl);
@@ -424,7 +578,13 @@ function renderStreams(streams, pageTitle, hasPath) {
       const jobId = genJobId();
       btn.disabled = true;
       btn.textContent = 'Queueing…';
-      setStatusRunInBackground(statusEl);
+      if (isSpotifyLike(url, kind)) {
+        statusEl.style.display = 'block';
+        statusEl.className = 'status pending';
+        statusEl.textContent = 'Attempting Spotify extraction…';
+      } else {
+        setStatusRunInBackground(statusEl);
+      }
 
       const YT = typeof window !== 'undefined' ? window.HLS_YT : null;
 
@@ -519,6 +679,11 @@ function renderStreams(streams, pageTitle, hasPath) {
                   return;
                 }
                 resetDlUi();
+                if (isSpotifyLike(url, kind)) {
+                  statusEl.style.display = 'block';
+                  statusEl.className = 'status ok';
+                  statusEl.textContent = 'Download complete';
+                }
               });
             };
 
@@ -559,14 +724,26 @@ function loadUi() {
   } catch (_) {
     // ignore
   }
-  chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
-    const hasPath = !!(response && response.userDownloadPath);
-    setPathBar(response && response.userDownloadPath);
-    renderStreams(response?.streams || [], response?.pageTitle || '', hasPath);
-    renderJobsBanner(response?.jobs || [], {
-      running: response?.running,
-      queueLength: response?.queueLength,
-      max: response?.maxParallel,
+  chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
+    applyUiTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
+  });
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const activeUrl = tabs && tabs[0] ? tabs[0].url || '' : '';
+    const spotifyCtx = spotifyContextFromTabUrl(activeUrl);
+    chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
+      const hasPath = !!(response && response.userDownloadPath);
+      setPathBar(response && response.userDownloadPath);
+      renderStreams(response?.streams || [], response?.pageTitle || '', hasPath, spotifyCtx);
+      renderJobsBanner(response?.jobs || [], {
+        running: response?.running,
+        queueLength: response?.queueLength,
+        max: response?.maxParallel,
+      });
+      const pill = document.getElementById('queue-pill');
+      if (pill && (!response?.jobs || response.jobs.length === 0)) {
+        pill.textContent = 'Idle';
+        pill.classList.remove('is-active');
+      }
     });
   });
 }
@@ -591,6 +768,11 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && (changes[THEME_MODE_KEY] || changes[THEME_ACCENT_KEY])) {
+    chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
+      applyUiTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
+    });
+  }
   if (area === 'local' && changes.userDownloadPath) {
     loadUi();
     return;

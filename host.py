@@ -220,7 +220,12 @@ def _safe_output_path(download_dir, filename, ext=".mp4"):
 
 def _yt_dlp_output_target(message: dict, out_dir: str, filename: str) -> str:
     """Single file path, or yt-dlp template for playlist downloads."""
-    single = _safe_output_path(out_dir, filename, ".mp4")
+    if message.get("ytDlpAudioOnly"):
+        stem = _sanitize_filename_stem(filename)
+        stem = _shorten_stem_for_windows(stem, out_dir, ".mp3")
+        single = os.path.join(out_dir, f"{stem}.%(ext)s")
+    else:
+        single = _safe_output_path(out_dir, filename, ".mp4")
     if not message.get("ytDlpDownloadPlaylist"):
         return single
     stem = os.path.splitext(os.path.basename(single))[0]
@@ -395,6 +400,7 @@ _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
     ("LinkedIn", ("linkedin.com", "licdn.com")),
     ("Bilibili", ("bilibili.com", "bilivideo.com", "bilibiliapi.net")),
     ("SoundCloud", ("soundcloud.com",)),
+    ("Spotify", ("spotify.com", "open.spotify.com", "scdn.co")),
     ("Bandcamp", ("bandcamp.com",)),
     ("Crunchyroll", ("crunchyroll.com", "vrv.co")),
     ("Rumble", ("rumble.com",)),
@@ -425,14 +431,19 @@ def _url_is_youtube_page(url: str) -> bool:
     return h.endswith(".youtube.com")
 
 
+def _yt_dlp_target_is_youtube_like(target_url: str) -> bool:
+    t = (target_url or "").strip().lower()
+    return t.startswith("ytsearch") or _url_is_youtube_page(target_url)
+
+
 def _yt_dlp_youtube_cli_extras(message: dict, target_url: str) -> List[str]:
     """
     YouTube needs n/sig challenge solving (EJS). Plain `pip install yt-dlp` omits solver assets;
     use --remote-components ejs:github plus a JS runtime (Deno or Node on PATH).
     See https://github.com/yt-dlp/yt-dlp/wiki/EJS
 
-    Omit `mweb` by default: it often needs a GVS PO token (--extractor-args youtube:po_token=...),
-    which we do not pass, so mweb would skip all https formats and leave only storyboards.
+    Omit token-heavy clients by default: ios/android/mweb often need a GVS PO token
+    (--extractor-args youtube:po_token=...), which we do not pass.
 
     Do not pass `--js-runtimes deno,node` (one arg): yt-dlp treats that as an invalid name. Use
     repeated `--js-runtimes deno` and `--js-runtimes node`.
@@ -440,7 +451,7 @@ def _yt_dlp_youtube_cli_extras(message: dict, target_url: str) -> List[str]:
     Prefer web clients first on music/VEVO URLs: android/ios https often require PO tokens; web
     may still expose a combined progressive format (e.g. 360p) without them.
     """
-    if not _url_is_youtube_page(target_url):
+    if not _yt_dlp_target_is_youtube_like(target_url):
         return []
     override = (message.get("ytDlpYoutubeExtractorArgs") or "").strip()
     if override:
@@ -448,20 +459,19 @@ def _yt_dlp_youtube_cli_extras(message: dict, target_url: str) -> List[str]:
     else:
         ex = [
             "--extractor-args",
-            "youtube:player_client=web,web_embedded,android,ios",
+            "youtube:player_client=web,web_embedded",
         ]
     if message.get("ytDlpSkipEjsBootstrap"):
         return ex
-    ex.extend(
-        [
-            "--remote-components",
-            "ejs:github",
-            "--js-runtimes",
-            "deno",
-            "--js-runtimes",
-            "node",
-        ]
-    )
+    ex.extend(["--remote-components", "ejs:github"])
+    runtimes: List[str] = []
+    if shutil.which("deno"):
+        runtimes.append("deno")
+    if shutil.which("node"):
+        runtimes.append("node")
+    # Keep explicit runtime list when available to avoid deprecated no-runtime extraction paths.
+    for rt in runtimes:
+        ex.extend(["--js-runtimes", rt])
     return ex
 
 
@@ -496,6 +506,74 @@ def _social_platform_for_yt_dlp(stream_url: str, page_url: str, message: Any) ->
         if _host_matches_any(sh, domains) or _host_matches_any(ph, domains):
             return label
     return None
+
+
+def _is_spotify_url(url: str) -> bool:
+    h = _netloc_host(url)
+    return _host_matches_any(h, ("spotify.com", "open.spotify.com", "scdn.co"))
+
+
+def _spotify_filename_hint(stream_url: str, page_url: str, fallback_stem: str) -> str:
+    """
+    Build a readable track-ish name from Spotify URL path when user kept a generic name.
+    Keeps existing sanitization behavior via _safe_output_path callers.
+    """
+    candidate = (page_url or stream_url or "").strip()
+    if not candidate:
+        return fallback_stem
+    try:
+        p = urlparse(candidate if "://" in candidate else "https://" + candidate)
+        parts = [x for x in (p.path or "").split("/") if x]
+    except Exception:
+        return fallback_stem
+    if not parts:
+        return fallback_stem
+    kind = parts[0].lower()
+    if kind not in ("track", "playlist", "album", "episode", "show"):
+        return fallback_stem
+    ident = parts[1] if len(parts) > 1 else ""
+    ident = re.sub(r"[^A-Za-z0-9_-]+", "", ident)[:16]
+    if not ident:
+        ident = "item"
+    return f"spotify {kind} {ident}"
+
+
+def _looks_like_spotify_drm_or_unsupported(err_tail: str) -> bool:
+    t = (err_tail or "").lower()
+    needles = (
+        "drm",
+        "widevine",
+        "license",
+        "encrypted",
+        "unsupported url",
+        "unsupported site",
+        "spotify requires",
+        "cannot download",
+        "login required",
+        "not available",
+    )
+    return any(n in t for n in needles)
+
+
+def _spotify_oembed_query(spotify_url: str) -> Optional[str]:
+    u = (spotify_url or "").strip()
+    if not u:
+        return None
+    api = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(u, safe="")
+    try:
+        req = urllib.request.Request(api, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30.0) as resp:
+            raw = resp.read()
+        obj = json.loads(raw.decode("utf-8", errors="replace"))
+        title = str(obj.get("title") or "").strip()
+        if not title:
+            return None
+        title = re.sub(r"\s*\|\s*Spotify\s*$", "", title, flags=re.I).strip()
+        if not title:
+            return None
+        return f"{title} official audio"
+    except Exception:
+        return None
 
 
 def _yt_dlp_version_probe_candidates() -> List[List[str]]:
@@ -582,10 +660,9 @@ def _parse_yt_dlp_progress(line: str) -> Dict[str, Any]:
 
 
 def _yt_dlp_header_args(message: dict) -> List[str]:
-    """Extra yt-dlp CLI args: --add-header for Referer, UA, Cookie, Authorization."""
+    """Extra yt-dlp CLI args: --add-header for Referer, UA, Authorization."""
     referer = (message.get("pageUrl") or message.get("referer") or "").strip()
     ua = (message.get("userAgent") or "").strip() or USER_AGENT
-    cookie = (message.get("cookie") or "").strip()
     cap = _cap_headers(message.get("capturedHeaders"))
     if not referer and cap.get("referer"):
         referer = cap["referer"].strip()
@@ -593,15 +670,13 @@ def _yt_dlp_header_args(message: dict) -> List[str]:
     if referer:
         args.extend(["--add-header", f"Referer:{referer}"])
     args.extend(["--add-header", f"User-Agent:{ua}"])
-    if cookie:
-        args.extend(["--add-header", f"Cookie:{cookie}"])
     auth = cap.get("authorization") or (message.get("authorization") or "").strip()
     if auth:
         args.extend(["--add-header", f"Authorization:{auth}"])
     return args
 
 
-def _yt_dlp_format_string(message: dict) -> str:
+def _yt_dlp_format_string(message: dict, target_url: str) -> str:
     """
     Prefer best video + best audio (merged with ffmpeg). Use bestvideo* (asterisk) first so yt-dlp
     can pick a combined progressive stream (e.g. single 360p mp4) when split DASH/https formats
@@ -610,6 +685,9 @@ def _yt_dlp_format_string(message: dict) -> str:
     custom = (message.get("ytDlpFormat") or "").strip()
     if custom:
         return custom
+    page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
+    if _is_spotify_url(target_url) or _is_spotify_url(page_url):
+        return "bestaudio/best"
     try:
         cap_h = int(message.get("ytDlpMaxHeight") if message.get("ytDlpMaxHeight") is not None else 4320)
     except (TypeError, ValueError):
@@ -622,11 +700,13 @@ def _yt_dlp_format_string(message: dict) -> str:
 def _yt_dlp_build_cmd(prefix: List[str], message: dict, output_path: str, target_url: str) -> List[str]:
     cmd: List[str] = list(prefix) + [
         "-f",
-        _yt_dlp_format_string(message),
+        _yt_dlp_format_string(message, target_url),
         "--merge-output-format",
         "mp4",
-        "--prefer-ffmpeg",
     ]
+    page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
+    if _is_spotify_url(target_url) or _is_spotify_url(page_url):
+        cmd.extend(["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"])
     if not message.get("ytDlpDownloadPlaylist"):
         cmd.append("--no-playlist")
     cmd.extend(
@@ -808,6 +888,7 @@ def run_yt_dlp_with_updates(
 ) -> None:
     """Download with yt-dlp using page URL first, then stream URL on failure."""
     page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
+    run_message = dict(message or {})
 
     def run_one(target: str) -> Tuple[int, List[str]]:
         global _active_ffmpeg
@@ -815,7 +896,7 @@ def run_yt_dlp_with_updates(
         prefix = _yt_dlp_invocation_prefix()
         if not prefix:
             return 127, ["yt-dlp not found (tried PATH, python -m yt_dlp, py -m yt_dlp)"]
-        cmd = _yt_dlp_build_cmd(prefix, message, output_path, target)
+        cmd = _yt_dlp_build_cmd(prefix, run_message, output_path, target)
         popen_kw: Dict[str, Any] = {
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
@@ -878,12 +959,15 @@ def run_yt_dlp_with_updates(
         return code, stderr_lines
 
     primary = _yt_dlp_primary_input_url(page_url, stream_url)
+    spotify_flow = platform_label.strip().lower() == "spotify"
+    if spotify_flow:
+        run_message["ytDlpAudioOnly"] = True
     send_message(
         with_job_id(
             {
                 "type": "progress",
                 "phase": "starting",
-                "detail": f"yt-dlp - {platform_label}",
+                "detail": "Attempting Spotify extraction…" if spotify_flow else f"yt-dlp - {platform_label}",
                 "output": output_path,
             },
             job_id,
@@ -908,6 +992,24 @@ def run_yt_dlp_with_updates(
         )
         code, err_lines = run_one(stream_url)
 
+    tail = "".join(err_lines[-35:]).strip()
+    if code != 0 and spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
+        q = _spotify_oembed_query(primary) or _spotify_oembed_query(stream_url)
+        if q:
+            send_message(
+                with_job_id(
+                    {
+                        "type": "progress",
+                        "phase": "downloading",
+                        "detail": "Spotify blocked; searching YouTube fallback…",
+                        "output": output_path,
+                    },
+                    job_id,
+                )
+            )
+            yt_target = "ytsearch1:" + q
+            code, err_lines = run_one(yt_target)
+
     if _CANCEL_EVENT.is_set():
         send_message(
             with_job_id(
@@ -924,7 +1026,10 @@ def run_yt_dlp_with_updates(
 
     tail = "".join(err_lines[-35:]).strip()
     if code == 0:
-        ok_v, verr = _verify_yt_dlp_output(output_path)
+        if spotify_flow:
+            ok_v, verr = _verify_yt_dlp_audio_output(output_path)
+        else:
+            ok_v, verr = _verify_yt_dlp_output(output_path)
         if not ok_v:
             err = verr or "Download validation failed"
             if tail:
@@ -953,6 +1058,13 @@ def run_yt_dlp_with_updates(
         err = f"yt-dlp exited with code {code}"
         if tail:
             err = err + ": " + tail[-600:]
+        if spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
+            err = (
+                "Spotify source protected (DRM/unsupported). "
+                "Direct full-audio extraction is blocked for many Spotify URLs. "
+                f"Details: {tail[-420:]}" if tail else
+                "Spotify source protected (DRM/unsupported). Direct full-audio extraction is blocked."
+            )
         send_message(with_job_id({"type": "done", "success": False, "error": err}, job_id))
 
 
@@ -2376,6 +2488,58 @@ def _verify_yt_dlp_output(output_path: str) -> Tuple[bool, str]:
     return _verify_yt_dlp_media_file(output_path)
 
 
+def _verify_yt_dlp_audio_output(output_path: str) -> Tuple[bool, str]:
+    """Validate yt-dlp audio extraction output (mp3/m4a/opus/aac/flac/wav/webm/ogg)."""
+    audio_exts = (".mp3", ".m4a", ".opus", ".aac", ".flac", ".wav", ".webm", ".ogg")
+    if _yt_dlp_output_is_playlist_template(output_path):
+        folder = os.path.dirname(output_path) or "."
+        files: List[str] = []
+        for ext in audio_exts:
+            files.extend(sorted(glob.glob(os.path.join(folder, "*" + ext))))
+        files = [p for p in files if os.path.isfile(p)]
+        if not files:
+            return False, "Playlist reported success but no extracted audio files were found."
+        if max((os.path.getsize(p) for p in files), default=0) < 32 * 1024:
+            return False, "Extracted audio files are too small; source may be blocked."
+        return True, ""
+    if os.path.isfile(output_path):
+        if os.path.getsize(output_path) < 32 * 1024:
+            return False, "Extracted audio file is too small; source may be blocked."
+        return True, ""
+    if "%(ext)s" in output_path:
+        pat = output_path.replace("%(ext)s", "*")
+        matches = [p for p in glob.glob(pat) if os.path.isfile(p)]
+        if not matches:
+            # yt-dlp can still rename/sanitize unexpectedly on some extractors; scan nearby recent audio files.
+            folder = os.path.dirname(output_path) or "."
+            stem = os.path.basename(output_path).replace("%(ext)s", "")
+            recent: List[str] = []
+            now = time.time()
+            for ext in audio_exts:
+                for p in glob.glob(os.path.join(folder, "*" + ext)):
+                    if not os.path.isfile(p):
+                        continue
+                    try:
+                        mt = os.path.getmtime(p)
+                    except OSError:
+                        continue
+                    if abs(now - mt) <= 180 and os.path.basename(p).startswith(stem[:24]):
+                        recent.append(p)
+            matches = recent
+        if not matches:
+            return False, "Audio extraction finished but output file was not found."
+        if max((os.path.getsize(p) for p in matches), default=0) < 32 * 1024:
+            return False, "Extracted audio file is too small; source may be blocked."
+        return True, ""
+    base, _ext = os.path.splitext(output_path)
+    matches = [base + e for e in audio_exts if os.path.isfile(base + e)]
+    if not matches:
+        return False, "Audio extraction finished but output file was not found."
+    if max((os.path.getsize(p) for p in matches), default=0) < 32 * 1024:
+        return False, "Extracted audio file is too small; source may be blocked."
+    return True, ""
+
+
 def _ffmpeg_concat_two_mp4_to_one(part_a: str, part_b: str, out_final: str) -> bool:
     d = os.path.dirname(os.path.abspath(out_final)) or "."
     fd, t1 = tempfile.mkstemp(suffix=".ts", dir=d, prefix="hgr_")
@@ -2712,11 +2876,16 @@ def run_ffmpeg_with_updates(url, filename, message):
         )
         return
     _CURRENT_JOB_ID = job_id
-    output_path = _safe_output_path(out_dir, filename, ".mp4")
+    page_for_social = (message.get("pageUrl") or message.get("referer") or "").strip()
+    effective_filename = filename
+    if _is_spotify_url(url) or _is_spotify_url(page_for_social):
+        low = (filename or "").strip().lower()
+        if low in ("video", "stream", "download", "audio", "track"):
+            effective_filename = _spotify_filename_hint(url, page_for_social, filename)
+    output_path = _safe_output_path(out_dir, effective_filename, ".mp4")
 
     proc: Optional[subprocess.Popen] = None
     try:
-        page_for_social = (message.get("pageUrl") or message.get("referer") or "").strip()
         platform_label = _social_platform_for_yt_dlp(url, page_for_social, message)
         if platform_label:
             if not _yt_dlp_available():
@@ -2746,7 +2915,7 @@ def run_ffmpeg_with_updates(url, filename, message):
                     )
                 )
                 return
-            ytdlp_out = _yt_dlp_output_target(message, out_dir, filename)
+            ytdlp_out = _yt_dlp_output_target(message, out_dir, effective_filename)
             _JOB_LIVE[job_id] = {"output": ytdlp_out, "tsec": 0.0, "url": url}
             run_yt_dlp_with_updates(url, message, ytdlp_out, job_id, platform_label)
             return

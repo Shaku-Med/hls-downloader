@@ -3,6 +3,8 @@
   window.__hlsGrabberFabLoader = true;
 
   const FLOAT_KEY = 'floatGrabberEnabled';
+  const THEME_MODE_KEY = 'uiThemeMode';
+  const THEME_ACCENT_KEY = 'uiThemeAccent';
   const JOBS_KEY = 'hlsGrabJobsState';
   const FAB_POS_KEY = 'hlsGrabFabPos';
   const FAB_SIZE = 52;
@@ -53,6 +55,13 @@
       const on = changes[FLOAT_KEY].newValue !== false;
       if (on) mountGrabberUi();
       else unmountGrabberUi();
+    }
+    if (area === 'local' && (changes[THEME_MODE_KEY] || changes[THEME_ACCENT_KEY])) {
+      const host = document.querySelector('[data-hls-grabber-fab]');
+      if (host) {
+        unmountGrabberUi();
+        mountGrabberUi();
+      }
     }
   });
 
@@ -226,223 +235,6 @@
   const shadow = host.attachShadow({ mode: 'open' });
 
   shadow.innerHTML = `
-<style>
-  :host {
-    position: fixed;
-    inset: 0;
-    width: 100vw;
-    height: 100vh;
-    pointer-events: none;
-    z-index: 2147483647;
-    overflow: visible;
-    isolation: isolate;
-  }
-  * { box-sizing: border-box; font-family: system-ui, "Segoe UI", Roboto, sans-serif; }
-  .fab {
-    position: fixed;
-    width: ${FAB_SIZE}px;
-    height: ${FAB_SIZE}px;
-    border-radius: 50%;
-    border: 2px solid rgba(255,255,255,0.92);
-    cursor: grab;
-    background: linear-gradient(145deg, #fff5f0, #ffedd5);
-    padding: 0;
-    box-shadow: 0 4px 18px rgba(194, 65, 12, 0.45), 0 2px 4px rgba(0,0,0,.2);
-    z-index: 3;
-    pointer-events: auto;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    user-select: none;
-    touch-action: none;
-    overflow: visible;
-    left: var(--fab-left, auto);
-    top: var(--fab-top, auto);
-    right: var(--fab-right, auto);
-    bottom: var(--fab-bottom, auto);
-    transform: var(--fab-transform, none);
-    transition: left 0.52s cubic-bezier(0.34, 1.55, 0.56, 1),
-                top 0.52s cubic-bezier(0.34, 1.55, 0.56, 1),
-                right 0.52s cubic-bezier(0.34, 1.55, 0.56, 1),
-                bottom 0.52s cubic-bezier(0.34, 1.55, 0.56, 1),
-                transform 0.52s cubic-bezier(0.34, 1.55, 0.56, 1),
-                box-shadow 0.25s ease;
-  }
-  .fab-icon {
-    width: 36px;
-    height: 36px;
-    border-radius: 50%;
-    object-fit: cover;
-    pointer-events: none;
-    display: block;
-  }
-  .fab-badge {
-    position: absolute;
-    top: -3px;
-    right: -3px;
-    min-width: 18px;
-    height: 18px;
-    padding: 0 4px;
-    border-radius: 9px;
-    background: #c2410c;
-    color: #fff;
-    font-size: 10px;
-    font-weight: 700;
-    line-height: 18px;
-    text-align: center;
-    border: 2px solid #fff;
-    box-shadow: 0 1px 4px rgba(0,0,0,.3);
-    pointer-events: none;
-    z-index: 4;
-  }
-  .fab-badge[hidden] { display: none !important; }
-  .fab:active { cursor: grabbing; }
-  .fab:hover {
-    box-shadow: 0 6px 22px rgba(194, 65, 12, 0.55), 0 2px 6px rgba(0,0,0,.22);
-    transform: var(--fab-transform, none) scale(1.04);
-  }
-  .fab.dragging {
-    transition: none !important;
-    cursor: grabbing;
-    transform: var(--fab-transform, none) scale(1.08);
-    box-shadow: 0 8px 28px rgba(194, 65, 12, 0.5);
-  }
-  .panel {
-    position: fixed;
-    width: min(360px, calc(100vw - 24px));
-    max-height: min(72vh, 520px);
-    background: #faf8f5;
-    color: #1c1917;
-    border-radius: 14px;
-    border: 1px solid #e7e2dc;
-    box-shadow: 0 12px 40px rgba(0,0,0,.18), 0 4px 12px rgba(0,0,0,.08);
-    z-index: 2;
-    pointer-events: auto;
-    flex-direction: column;
-    overflow: hidden;
-    display: none;
-    opacity: 0;
-    transform: scale(0.94);
-    transform-origin: var(--panel-origin, center center);
-    transition: opacity 0.22s ease, transform 0.32s cubic-bezier(0.34, 1.35, 0.64, 1);
-  }
-  .panel.open {
-    display: flex;
-    opacity: 1;
-    transform: scale(1);
-  }
-  .panel-head {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 14px;
-    background: linear-gradient(180deg, #fff 0%, #faf8f5 100%);
-    border-bottom: 1px solid #e7e2dc;
-  }
-  .panel-title { font-size: 14px; font-weight: 600; }
-  .close-p {
-    border: none;
-    background: transparent;
-    font-size: 22px;
-    line-height: 1;
-    cursor: pointer;
-    color: #78716c;
-    padding: 0 4px;
-    border-radius: 6px;
-  }
-  .close-p:hover { background: #f5f5f4; color: #1c1917; }
-  .panel-scroll {
-    overflow-y: auto;
-    padding: 10px 12px 12px;
-    flex: 1;
-    min-height: 0;
-  }
-  .path-line {
-    font-size: 11px;
-    color: #78716c;
-    margin-bottom: 10px;
-    word-break: break-all;
-    line-height: 1.35;
-  }
-  .path-line.bad { color: #b91c1c; }
-  .jobs-block { margin-bottom: 12px; }
-  .queue-line { font-size: 10px; color: #a8a29e; margin-bottom: 8px; }
-  .job-mini {
-    background: #fff;
-    border: 1px solid #e7e2dc;
-    border-radius: 8px;
-    padding: 8px 10px;
-    margin-bottom: 8px;
-    font-size: 11px;
-  }
-  .job-mini .t { font-weight: 600; color: #44403c; }
-  .job-mini .d { margin-top: 4px; color: #57534e; line-height: 1.35; }
-  .job-mini .d.err { color: #b91c1c; }
-  .row-btns { margin-top: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
-  .btn {
-    border-radius: 8px;
-    padding: 5px 10px;
-    font-size: 11px;
-    font-weight: 500;
-    cursor: pointer;
-    font-family: inherit;
-  }
-  .btn-ghost {
-    background: #fff;
-    border: 1px solid #d6d3d1;
-    color: #44403c;
-  }
-  .btn-ghost:hover { background: #fafaf9; }
-  .btn-dan {
-    background: #fff;
-    border: 1px solid #f87171;
-    color: #b91c1c;
-  }
-  .stream-card {
-    background: #fff;
-    border: 1px solid #e7e2dc;
-    border-radius: 10px;
-    padding: 10px;
-    margin-bottom: 10px;
-  }
-  .stream-card .kind { font-size: 9px; text-transform: uppercase; letter-spacing: 0.06em; color: #a8a29e; font-weight: 600; margin-bottom: 6px; }
-  .stream-card .url { font-size: 10px; color: #57534e; word-break: break-all; line-height: 1.4; font-family: ui-monospace, monospace; }
-  .stream-card .fn-row { display: flex; gap: 6px; margin-top: 8px; }
-  .stream-card .thumb-row {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
-    margin-top: 8px;
-    font-size: 11px;
-    color: #44403c;
-    cursor: pointer;
-    user-select: none;
-    line-height: 1.35;
-  }
-  .stream-card .thumb-row input { width: auto; margin: 2px 0 0 0; flex: 0 0 auto; }
-  .stream-card input {
-    flex: 1;
-    min-width: 0;
-    border: 1px solid #d6d3d1;
-    border-radius: 8px;
-    padding: 6px 8px;
-    font-size: 12px;
-    background: #faf8f5;
-  }
-  .stream-card .dl {
-    background: #c2410c;
-    color: #fff;
-    border: none;
-    border-radius: 8px;
-    padding: 6px 12px;
-    font-size: 11px;
-    font-weight: 600;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .stream-card .dl:disabled { background: #d6d3d1; cursor: not-allowed; }
-  .empty { text-align: center; padding: 20px 8px; font-size: 12px; color: #78716c; line-height: 1.5; }
-</style>
 <button type="button" class="fab" aria-label="Open HLS Grabber" title="HLS Grabber">
   <img class="fab-icon" src="" alt="" draggable="false" />
   <span class="fab-badge" hidden></span>
@@ -460,6 +252,11 @@
 </div>`;
 
   document.documentElement.appendChild(host);
+  host.style.setProperty('--fab-size', `${FAB_SIZE}px`);
+  const link = document.createElement('link');
+  link.rel = 'stylesheet';
+  link.href = chrome.runtime.getURL('style/fab.css');
+  shadow.prepend(link);
 
   const fab = shadow.querySelector('.fab');
   const panel = shadow.querySelector('.panel');
@@ -467,6 +264,37 @@
   const fabJobs = shadow.getElementById('fab-jobs');
   const fabStreams = shadow.getElementById('fab-streams');
   const closeBtn = shadow.querySelector('.close-p');
+
+  function applyFabTheme(mode, accent) {
+    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const resolved = mode === 'light' || mode === 'dark' ? mode : (prefersDark ? 'dark' : 'light');
+    const palette = {
+      blue: ['#2563eb', '#1d4ed8'],
+      violet: ['#8b5cf6', '#7c3aed'],
+      emerald: ['#10b981', '#059669'],
+      rose: ['#f43f5e', '#e11d48'],
+      orange: ['#f97316', '#ea580c'],
+    };
+    const c = palette[accent] || palette.blue;
+    host.style.setProperty('--accent', c[0]);
+    host.style.setProperty('--accent-2', c[1]);
+    if (resolved === 'dark') {
+      host.style.setProperty('--bg', '#0f1117');
+      host.style.setProperty('--surface', '#161b27');
+      host.style.setProperty('--text', '#e6e9ef');
+      host.style.setProperty('--muted', '#95a2bb');
+      host.style.setProperty('--line', '#293043');
+    } else {
+      host.style.setProperty('--bg', '#f4f6fb');
+      host.style.setProperty('--surface', '#ffffff');
+      host.style.setProperty('--text', '#0f172a');
+      host.style.setProperty('--muted', '#475569');
+      host.style.setProperty('--line', '#d8e0ef');
+    }
+  }
+  chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
+    applyFabTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
+  });
 
   try {
     const iconEl = shadow.querySelector('.fab-icon');

@@ -2,6 +2,8 @@ const KEY = 'userDownloadPath';
 const FLOAT_KEY = 'floatGrabberEnabled';
 const YTDLP_MODE_KEY = 'ytDlpQualityMode';
 const YTDLP_MAX_H_KEY = 'ytDlpMaxHeight';
+const THEME_MODE_KEY = 'uiThemeMode';
+const THEME_ACCENT_KEY = 'uiThemeAccent';
 
 function showStatus(msg, kind) {
   const el = document.getElementById('status');
@@ -11,7 +13,7 @@ function showStatus(msg, kind) {
 }
 
 function load() {
-  chrome.storage.local.get([KEY, FLOAT_KEY, YTDLP_MODE_KEY, YTDLP_MAX_H_KEY], (data) => {
+  chrome.storage.local.get([KEY, FLOAT_KEY, YTDLP_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
     const err = chrome.runtime.lastError;
     if (err) {
       showStatus(String(err), 'err');
@@ -27,6 +29,10 @@ function load() {
       const v = data[YTDLP_MAX_H_KEY];
       hEl.value = v != null && String(v).trim() !== '' ? String(v) : '';
     }
+    const tm = document.getElementById('ui-theme-mode');
+    if (tm) tm.value = data[THEME_MODE_KEY] || 'system';
+    const ta = document.getElementById('ui-theme-accent');
+    if (ta) ta.value = data[THEME_ACCENT_KEY] || 'blue';
   });
 }
 
@@ -100,6 +106,20 @@ if (ytdlpMaxH) {
   };
   ytdlpMaxH.addEventListener('change', persistMaxH);
   ytdlpMaxH.addEventListener('blur', persistMaxH);
+}
+
+const themeMode = document.getElementById('ui-theme-mode');
+if (themeMode) {
+  themeMode.addEventListener('change', () => {
+    chrome.storage.local.set({ [THEME_MODE_KEY]: themeMode.value || 'system' });
+  });
+}
+
+const themeAccent = document.getElementById('ui-theme-accent');
+if (themeAccent) {
+  themeAccent.addEventListener('change', () => {
+    chrome.storage.local.set({ [THEME_ACCENT_KEY]: themeAccent.value || 'blue' });
+  });
 }
 
 window.addEventListener('pageshow', (e) => {
