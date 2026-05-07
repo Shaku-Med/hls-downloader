@@ -610,6 +610,23 @@
     setEnabled(changes[ENABLE_KEY].newValue === true);
   });
 
+  chrome.runtime.onMessage.addListener((msg) => {
+    if (!msg || msg.type !== 'CONTEXT_IMAGE_DOWNLOAD_AS') return;
+    const p = msg.payload || {};
+    const url = (p.url || '').toString().trim();
+    const fmt = (p.format || 'png').toString().toLowerCase();
+    if (!url) return;
+    let stem = 'image';
+    try {
+      const u = new URL(url, location.href);
+      const seg = (u.pathname.split('/').filter(Boolean).pop() || 'image').replace(/\.[a-z0-9]{2,5}$/i, '');
+      stem = sanitizeFileStem(seg || 'image');
+    } catch (_) {
+      stem = 'image';
+    }
+    void downloadUrlAs(url, fmt, stem);
+  });
+
   window.HLS_IMAGE_DL = {
     listImages,
     downloadUrlAs,

@@ -10,7 +10,8 @@
       "tabs",
       "cookies",
       "alarms",
-      "downloads"
+      "downloads",
+      "contextMenus"
     ],
     "host_permissions": [
       "<all_urls>"

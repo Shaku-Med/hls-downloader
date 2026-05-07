@@ -1,5 +1,8 @@
 // tabId -> [{ url, streamKind, capturedHeaders }]
 const detectedStreams = {};
+const CTX_IMG_ROOT = 'sg_ctx_img_root';
+const CTX_IMG_FMT_PREFIX = 'sg_ctx_img_fmt_';
+const CTX_IMG_FMTS = ['png', 'jpg', 'jpeg', 'webp'];
 
 /** @type {Record<number, ReturnType<typeof setTimeout>>} */
 const _ytdlpPageTimer = {};
@@ -313,6 +316,136 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   delete _ytdlpPageCap[tabId];
   delete detectedStreams[tabId];
+});
+
+function setupImageContextMenus() {
+  chrome.contextMenus.removeAll(() => {
+    chrome.contextMenus.create({
+      id: CTX_IMG_ROOT,
+      title: 'Stuff Grabber: Download image (PNG)',
+      contexts: ['image'],
+    });
+    for (const fmt of CTX_IMG_FMTS) {
+      chrome.contextMenus.create({
+        id: `${CTX_IMG_FMT_PREFIX}${fmt}`,
+        parentId: CTX_IMG_ROOT,
+        title: `Save as ${fmt.toUpperCase()}`,
+        contexts: ['image'],
+      });
+    }
+  });
+}
+
+chrome.runtime.onInstalled.addListener(() => {
+  setupImageContextMenus();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  setupImageContextMenus();
+});
+
+setupImageContextMenus();
+
+function ctxMimeFromFormat(fmt) {
+  const f = String(fmt || '').toLowerCase();
+  if (f === 'png') return 'image/png';
+  if (f === 'webp') return 'image/webp';
+  if (f === 'jpg' || f === 'jpeg') return 'image/jpeg';
+  return 'image/png';
+}
+
+function ctxExtFromMime(mime) {
+  const m = String(mime || '').toLowerCase();
+  if (m.includes('png')) return 'png';
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('jpeg')) return 'jpg';
+  if (m.includes('jpg')) return 'jpg';
+  return '';
+}
+
+function ctxSafeStemFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const seg = (u.pathname.split('/').filter(Boolean).pop() || 'image').replace(/\.[a-z0-9]{2,5}$/i, '');
+    const clean = seg.replace(/[<>:"/\\|?*\x00-\x1f]+/g, ' ').replace(/\s+/g, ' ').trim();
+    return (clean || 'image').slice(0, 80);
+  } catch (_) {
+    return 'image';
+  }
+}
+
+async function ctxConvertImageBlob(blob, fmt) {
+  const mime = ctxMimeFromFormat(fmt);
+  const bmp = await createImageBitmap(blob);
+  const canvas = new OffscreenCanvas(bmp.width, bmp.height);
+  const ctx = canvas.getContext('2d', { alpha: true });
+  if (!ctx) throw new Error('No drawing context');
+  ctx.drawImage(bmp, 0, 0);
+  bmp.close();
+  const out = await canvas.convertToBlob({
+    type: mime,
+    quality: mime === 'image/jpeg' ? 0.92 : undefined,
+  });
+  return out;
+}
+
+async function ctxDownloadImageAs(url, fmt) {
+  const stem = ctxSafeStemFromUrl(url);
+  let blob = null;
+  let ext = fmt === 'jpeg' ? 'jpg' : fmt;
+  try {
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const srcBlob = await res.blob();
+    const srcExt = ctxExtFromMime(srcBlob.type);
+    const want = (fmt || 'png').toLowerCase();
+    if (srcExt && (want === srcExt || (want === 'jpeg' && srcExt === 'jpg'))) {
+      blob = srcBlob;
+      ext = srcExt;
+    } else {
+      blob = await ctxConvertImageBlob(srcBlob, want);
+      ext = want === 'jpeg' ? 'jpg' : want;
+    }
+  } catch (_) {
+    blob = null;
+  }
+
+  if (blob) {
+    const blobUrl = URL.createObjectURL(blob);
+    try {
+      await chrome.downloads.download({
+        url: blobUrl,
+        filename: `${stem}.${ext || 'png'}`,
+        saveAs: false,
+        conflictAction: 'uniquify',
+      });
+    } finally {
+      setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
+    }
+    return;
+  }
+
+  await chrome.downloads.download({
+    url,
+    filename: `${stem}.${ext || 'jpg'}`,
+    saveAs: false,
+    conflictAction: 'uniquify',
+  });
+}
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  const id = String(info.menuItemId || '');
+  const srcUrl = (info.srcUrl || '').toString();
+  if (!srcUrl) return;
+  let fmt = 'png';
+  if (id.startsWith(CTX_IMG_FMT_PREFIX)) {
+    fmt = id.slice(CTX_IMG_FMT_PREFIX.length).toLowerCase();
+  } else if (id !== CTX_IMG_ROOT) {
+    return;
+  }
+  ctxDownloadImageAs(srcUrl, fmt).catch((e) => {
+    console.warn('Stuff Grabber context image download failed', e);
+  });
 });
 
 // Download queue: up to 4 native host processes, shared pending queue
