@@ -341,7 +341,7 @@ function respond(sendResponse, payload) {
   try {
     sendResponse(payload);
   } catch (e) {
-    console.error('HLS Grabber: sendResponse failed', e);
+    console.error('Stuff Grabber: sendResponse failed', e);
   }
 }
 

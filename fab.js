@@ -235,19 +235,20 @@
   const shadow = host.attachShadow({ mode: 'open' });
 
   shadow.innerHTML = `
-<button type="button" class="fab" aria-label="Open HLS Grabber" title="HLS Grabber">
+<button type="button" class="fab" aria-label="Open Stuff Grabber" title="Stuff Grabber">
   <img class="fab-icon" src="" alt="" draggable="false" />
   <span class="fab-badge" hidden></span>
 </button>
 <div class="panel" hidden>
   <div class="panel-head">
-    <span class="panel-title">HLS Grabber</span>
+    <span class="panel-title">Stuff Grabber</span>
     <button type="button" class="close-p" aria-label="Close">×</button>
   </div>
   <div class="panel-scroll">
     <div class="path-line" id="fab-path"></div>
     <div class="jobs-block" id="fab-jobs"></div>
     <div id="fab-streams"></div>
+    <div id="fab-images"></div>
   </div>
 </div>`;
 
@@ -263,6 +264,7 @@
   const fabPath = shadow.getElementById('fab-path');
   const fabJobs = shadow.getElementById('fab-jobs');
   const fabStreams = shadow.getElementById('fab-streams');
+  const fabImages = shadow.getElementById('fab-images');
   const closeBtn = shadow.querySelector('.close-p');
 
   function applyFabTheme(mode, accent) {
@@ -598,6 +600,7 @@
       }
       renderJobs(response.jobs || [], response);
       renderStreams(response.streams || [], response.pageTitle || '', hasPath);
+      renderImages(hasPath);
       updateQueueBadge(response);
       if (panel.classList.contains('open')) positionPanel();
     });
@@ -820,7 +823,7 @@
               resetFabDlBtn();
               refreshPanelJobsOnly();
               if (chrome.runtime.lastError || !r?.ok) {
-                console.warn('HLS Grabber fab:', chrome.runtime.lastError || r?.error);
+                console.warn('Stuff Grabber fab:', chrome.runtime.lastError || r?.error);
               }
             });
           };
@@ -865,6 +868,88 @@
       card.appendChild(row);
       fabStreams.appendChild(card);
     });
+  }
+
+  function renderImages(hasPath) {
+    if (!fabImages) return;
+    fabImages.textContent = '';
+    const api = typeof window !== 'undefined' ? window.HLS_IMAGE_DL : null;
+    if (!api || typeof api.listImages !== 'function' || typeof api.downloadUrlAs !== 'function') return;
+
+    const imgs = api.listImages() || [];
+    if (!imgs.length) return;
+
+    const head = document.createElement('div');
+    head.className = 'kind';
+    head.style.cssText = 'font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;margin:6px 0 8px;';
+    head.textContent = `Images on page (${imgs.length})`;
+    fabImages.appendChild(head);
+
+    const mkRow = (img, idx) => {
+      const card = document.createElement('div');
+      card.className = 'stream-card';
+
+      const title = document.createElement('div');
+      title.className = 'kind';
+      const dim = img.w && img.h ? ` · ${img.w}×${img.h}` : '';
+      title.textContent = `Image ${idx + 1}${dim}`;
+
+      const line = document.createElement('div');
+      line.className = 'url';
+      line.textContent = img.url;
+
+      const preview = document.createElement('img');
+      preview.src = img.url;
+      preview.alt = img.alt || '';
+      preview.referrerPolicy = 'no-referrer';
+      preview.style.cssText =
+        'width:100%;max-height:140px;object-fit:contain;border-radius:8px;margin-top:8px;border:1px solid var(--line);background:var(--bg);';
+
+      const row = document.createElement('div');
+      row.className = 'fn-row';
+
+      const sel = document.createElement('select');
+      sel.style.cssText =
+        'flex:1;min-width:0;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;background:var(--bg);color:var(--text);';
+      sel.innerHTML = `
+        <option value="png">PNG</option>
+        <option value="jpg">JPG</option>
+        <option value="jpeg">JPEG</option>
+        <option value="webp">WEBP</option>
+      `;
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'dl';
+      btn.textContent = 'Download';
+      if (!hasPath) btn.disabled = true;
+      btn.addEventListener('click', () => {
+        if (!hasPath) {
+          chrome.runtime.openOptionsPage();
+          return;
+        }
+        btn.disabled = true;
+        btn.textContent = '…';
+        const stem = (img.alt && img.alt.trim()) || `image_${idx + 1}`;
+        Promise.resolve(api.downloadUrlAs(img.url, sel.value, stem))
+          .catch(() => {})
+          .finally(() => {
+            btn.disabled = false;
+            btn.textContent = 'Download';
+          });
+      });
+
+      row.appendChild(sel);
+      row.appendChild(btn);
+
+      card.appendChild(title);
+      card.appendChild(line);
+      card.appendChild(preview);
+      card.appendChild(row);
+      return card;
+    };
+
+    imgs.forEach((img, i) => fabImages.appendChild(mkRow(img, i)));
   }
 
   function onFabStorageChanged(changes, area) {

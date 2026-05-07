@@ -1,5 +1,6 @@
 const KEY = 'userDownloadPath';
 const FLOAT_KEY = 'floatGrabberEnabled';
+const IMG_DL_KEY = 'imageHoverDownloadEnabled';
 const YTDLP_MODE_KEY = 'ytDlpQualityMode';
 const YTDLP_MAX_H_KEY = 'ytDlpMaxHeight';
 const THEME_MODE_KEY = 'uiThemeMode';
@@ -13,7 +14,7 @@ function showStatus(msg, kind) {
 }
 
 function load() {
-  chrome.storage.local.get([KEY, FLOAT_KEY, YTDLP_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
+  chrome.storage.local.get([KEY, FLOAT_KEY, IMG_DL_KEY, YTDLP_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
     const err = chrome.runtime.lastError;
     if (err) {
       showStatus(String(err), 'err');
@@ -22,6 +23,8 @@ function load() {
     document.getElementById('path').value = (data && data[KEY]) || '';
     const floatEl = document.getElementById('float-on');
     if (floatEl) floatEl.checked = data[FLOAT_KEY] !== false;
+    const imgDlEl = document.getElementById('img-dl-on');
+    if (imgDlEl) imgDlEl.checked = data[IMG_DL_KEY] === true; // default OFF
     const qEl = document.getElementById('ytdlp-quality');
     if (qEl) qEl.value = data[YTDLP_MODE_KEY] === 'ask' ? 'ask' : 'auto';
     const hEl = document.getElementById('ytdlp-max-h');
@@ -82,6 +85,13 @@ const floatOn = document.getElementById('float-on');
 if (floatOn) {
   floatOn.addEventListener('change', () => {
     chrome.storage.local.set({ [FLOAT_KEY]: !!floatOn.checked });
+  });
+}
+
+const imgDlOn = document.getElementById('img-dl-on');
+if (imgDlOn) {
+  imgDlOn.addEventListener('change', () => {
+    chrome.storage.local.set({ [IMG_DL_KEY]: !!imgDlOn.checked });
   });
 }
 

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>HLS Grabber: save folder</title>
+  <title>Stuff Grabber: save folder</title>
   <link rel="stylesheet" href="style/options.css" />
 </head>
 <body>
@@ -21,6 +21,13 @@
         <span>Show floating grabber button on web pages (corner shortcut).</span>
       </label>
       <div class="hint">When off, only the toolbar popup lists streams. Same download queue and badges either way.</div>
+    </div>
+    <div class="row">
+      <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; font-weight: 500;">
+        <input id="img-dl-on" type="checkbox" style="width: auto; margin-top: 3px;" />
+        <span>Enable image hover highlighter (hover an image → Download as PNG/JPG/WEBP).</span>
+      </label>
+      <div class="hint">Default is off. The floating panel will still show an Images list for download/preview; this toggle only controls the hover highlight + popover.</div>
     </div>
     <div class="row">
       <label for="ytdlp-quality">Social / yt-dlp quality</label>

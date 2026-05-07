@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Install script for HLS Grabber native host.
+Install script for Stuff Grabber native host.
 Run this once after loading the extension.
 """
 
@@ -45,7 +45,7 @@ def install_windows(ext_id):
 
     manifest = {
         "name": NATIVE_HOST_NAME,
-        "description": "HLS Grabber native host",
+        "description": "Stuff Grabber native host",
         "path": ps_wrapper.replace("/", "\\"),
         "type": "stdio",
         "allowed_origins": [f"chrome-extension://{ext_id}/"]
@@ -142,7 +142,7 @@ def install_native_windows(ext_id):
 
     manifest = {
         "name": NATIVE_HOST_NAME,
-        "description": "HLS Grabber native host",
+        "description": "Stuff Grabber native host",
         "path": os.path.normpath(bat_path),
         "type": "stdio",
         "allowed_origins": [f"chrome-extension://{ext_id}/"],
@@ -172,7 +172,7 @@ def install_native_windows(ext_id):
 def install_linux(ext_id):
     manifest = {
         "name": NATIVE_HOST_NAME,
-        "description": "HLS Grabber native host",
+        "description": "Stuff Grabber native host",
         "path": HOST_SCRIPT,
         "type": "stdio",
         "allowed_origins": [f"chrome-extension://{ext_id}/"]
@@ -195,7 +195,7 @@ def install_linux(ext_id):
 
 
 def main():
-    print("=== HLS Grabber Native Host Installer ===\n")
+    print("=== Stuff Grabber Native Host Installer ===\n")
 
     # Check ffmpeg
     if not shutil.which("ffmpeg"):

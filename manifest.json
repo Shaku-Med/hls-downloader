@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
-    "name": "HLS Grabber",
+    "name": "Stuff Grabber",
     "version": "1.0",
-    "description": "Grabs HLS, DASH, and direct video URLs (including many social sites) and saves them with ffmpeg",
+    "description": "Grabs HLS, DASH, direct video URLs, and page images; saves via helper tools",
     "permissions": [
       "webRequest",
       "nativeMessaging",
@@ -39,7 +39,7 @@
     "content_scripts": [
       {
         "matches": ["http://*/*", "https://*/*"],
-        "js": ["yt-page-helpers.js", "fab.js"],
+        "js": ["yt-page-helpers.js", "fab.js", "image-hover-download.js"],
         "run_at": "document_idle"
       }
     ],

@@ -1,4 +1,4 @@
-# HLS Grabber (Chrome extension + little helper on your PC)
+# Stuff Grabber (Chrome extension + little helper on your PC)
 
 This thing watches network requests in Chrome, lists video-ish URLs it thinks look useful, then your computer actually saves the file using **ffmpeg** through a small **Python** program (the "native host"). The extension by itself can not write to disk, which is why that extra step exists.
 

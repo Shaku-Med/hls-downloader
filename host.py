@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HLS Grabber - Native Messaging Host
+Stuff Grabber - Native Messaging Host
 Receives stream URLs from the Chrome extension. Resolves social/platform URLs with yt-dlp;
 otherwise runs ffmpeg (HLS, DASH, direct) when possible.
 Supports multiple JSON messages per connection (use connectNative in the extension).
