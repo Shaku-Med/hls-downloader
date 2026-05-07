@@ -614,6 +614,30 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'DOWNLOAD_IMAGE_URL') {
+    const url = (message.url || '').toString().trim();
+    const filename = (message.filename || '').toString().trim();
+    if (!url) {
+      respond(sendResponse, { ok: false, error: 'Missing URL' });
+      return true;
+    }
+    const opts = {
+      url,
+      saveAs: false,
+      conflictAction: 'uniquify',
+    };
+    if (filename) opts.filename = filename;
+    chrome.downloads.download(opts, (downloadId) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        respond(sendResponse, { ok: false, error: err.message || String(err) });
+        return;
+      }
+      respond(sendResponse, { ok: true, downloadId });
+    });
+    return true;
+  }
+
   if (message.type === 'GET_STREAMS') {
     const tabIdFromMsg =
       message.tabId != null && message.tabId >= 0 ? message.tabId : null;

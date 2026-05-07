@@ -2894,7 +2894,7 @@ def run_ffmpeg_with_updates(url, filename, message):
                 if "windowsapps" in ex:
                     extra = (
                         " Microsoft Store Python often fails here even after pip install; "
-                        "install Python from python.org, run native-host/install.py with that Python, "
+                        "install Python from python.org, run python/install.py with that Python, "
                         "or set User env var HLS_GRABBER_PYTHON to a working python.exe "
                         "(see host_wrapper.bat)."
                     )
@@ -2908,7 +2908,7 @@ def run_ffmpeg_with_updates(url, filename, message):
                                 f"native host (Python: {sys.executable}). "
                                 f'Install with: "{sys.executable}" -m pip install -U yt-dlp '
                                 f"(same interpreter Chrome uses). "
-                                f"Or re-run native-host/install.py with the Python where yt-dlp works.{extra}"
+                                f"Or re-run python/install.py with the Python where yt-dlp works.{extra}"
                             ),
                         },
                         job_id,

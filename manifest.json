@@ -9,13 +9,14 @@
       "storage",
       "tabs",
       "cookies",
-      "alarms"
+      "alarms",
+      "downloads"
     ],
     "host_permissions": [
       "<all_urls>"
     ],
     "background": {
-      "service_worker": "background.js"
+      "service_worker": "public/scripts/background.js"
     },
     "icons": {
       "16": "asset/icon-16.png",
@@ -24,7 +25,7 @@
       "128": "asset/icon-128.png"
     },
     "action": {
-      "default_popup": "popup.html",
+      "default_popup": "public/popup.html",
       "default_icon": {
         "16": "asset/icon-16.png",
         "32": "asset/icon-32.png",
@@ -33,13 +34,13 @@
       }
     },
     "options_ui": {
-      "page": "options.html",
+      "page": "public/options.html",
       "open_in_tab": true
     },
     "content_scripts": [
       {
         "matches": ["http://*/*", "https://*/*"],
-        "js": ["yt-page-helpers.js", "fab.js", "image-hover-download.js"],
+        "js": ["public/scripts/yt-page-helpers.js", "public/scripts/fab.js", "public/scripts/image-hover-download.js"],
         "run_at": "document_idle"
       }
     ],

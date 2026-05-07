@@ -25,14 +25,14 @@ The extension only talks to Chrome; the **host** is what runs ffmpeg. There is a
 From a terminal, `cd` into this same folder and run:
 
 ```text
-python install.py
+python python/install.py
 ```
 
 It will ask for the extension ID you copied. On Windows it writes a small `host_wrapper.bat` and registers the JSON manifest + registry so Chrome can find the host. On Linux it drops files under your Chrome config. WSL is sort of supported but weirder, read the script comments if you live there.
 
 After that, **fully quit and reopen Chrome** (not just a tab) so it picks up the new native messaging registration.
 
-If you **reload the extension** or get a new ID, run `install.py` again with the new id.
+If you **reload the extension** or get a new ID, run `python/install.py` again with the new id.
 
 ## Where files save
 
@@ -63,7 +63,7 @@ That overwrites the `icon-16`, `32`, `48`, `128` files the manifest points at.
 ## If it feels broken
 
 - **"Native host" errors / download never really starts**  
-  Re-run `install.py` with the correct extension id, restart Chrome, make sure you did not move the project folder to a new path without re-installing (the host points at real paths on disk)
+  Re-run `python/install.py` with the correct extension id, restart Chrome, make sure you did not move the project folder to a new path without re-installing (the host points at real paths on disk)
 
 - **ffmpeg not found**  
   Install it, put it on PATH, open a new terminal, try `ffmpeg -version`
@@ -74,4 +74,4 @@ That overwrites the `icon-16`, `32`, `48`, `128` files the manifest points at.
 - **Too many junk URLs on some sites**  
   The extension tries to filter noise but social sites are messy; pick a playlist or obvious main url when in doubt
 
-That is more or less it. The `host.py` file is the thing Chrome launches; you can read it if you are curious. Good luck
+That is more or less it. The `python/host.py` file is the thing Chrome launches; you can read it if you are curious. Good luck

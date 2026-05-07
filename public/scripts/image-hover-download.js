@@ -303,6 +303,37 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1500);
   }
 
+  function extFromUrl(url) {
+    try {
+      const u = new URL(url, location.href);
+      const p = u.pathname || '';
+      const m = p.match(/\.([a-z0-9]{2,5})$/i);
+      if (!m) return '';
+      const e = m[1].toLowerCase();
+      if (e === 'jpeg') return 'jpg';
+      return e;
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function requestBackgroundUrlDownload(url, filename) {
+    return new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_IMAGE_URL', url, filename }, (res) => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          reject(new Error(err.message || String(err)));
+          return;
+        }
+        if (!res || !res.ok) {
+          reject(new Error((res && res.error) || 'Download failed'));
+          return;
+        }
+        resolve(res);
+      });
+    });
+  }
+
   async function convertImageBlob(blob, fmt) {
     const mime = mimeFromFormat(fmt);
     const bmp = await createImageBitmap(blob);
@@ -343,13 +374,8 @@
         srcExt && (outExt === srcExt || (outExt === 'jpeg' && srcExt === 'jpg')) ? blob : await convertImageBlob(blob, outExt);
       downloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
     } catch (e) {
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = '';
-      a.rel = 'noreferrer';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      const fallbackExt = extFromUrl(url) || 'jpg';
+      await requestBackgroundUrlDownload(url, `${stem}.${fallbackExt}`);
     }
   }
 
@@ -382,13 +408,9 @@
       downloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
     } catch (e) {
       try {
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = '';
-        a.rel = 'noreferrer';
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
+        const stem = fileStemFromImg(img, url);
+        const fallbackExt = extFromUrl(url) || 'jpg';
+        await requestBackgroundUrlDownload(url, `${stem}.${fallbackExt}`);
       } catch (_) {
         console.warn('Image download failed', e);
       }
