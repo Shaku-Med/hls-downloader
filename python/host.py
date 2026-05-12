@@ -321,8 +321,11 @@ def _is_hls_input(url: str, message) -> bool:
 
 
 def _use_hls_aac_bsf(url: str, message) -> bool:
-    """HLS fMP4 to .mp4 often needs this; DASH/MP4 direct usually does not."""
+    """HLS fMP4/MPEG-TS+AAC to .mp4 often needs this; MP3-in-HLS must not use aac_adtstoasc."""
     u = (url or "").lower()
+    # e.g. …/playlist/id.128.mp3/playlist.m3u8 — segments are MP3, not ADTS AAC
+    if re.search(r"\.mp3/playlist\.m3u8", u):
+        return False
     if ".m3u8" in u or u.endswith(".m3u") or re.search(r"\.m3u8[?#]", u):
         return True
     if re.search(r"\.(?:txt|php|asp|aspx|ashx|jsp)(?:[?#]|$)", u) and (
@@ -341,6 +344,16 @@ def _use_hls_aac_bsf(url: str, message) -> bool:
     if sk in ("direct", "dash", "mpd", "mp4", "webm", "yt", "social", "by_header", "other"):
         return False
     return False
+
+
+def _ffmpeg_preferred_container_ext(url: str, message) -> str:
+    """Prefer .mp3 when HLS variant is explicitly MP3 (SoundCloud progressive); else .mp4."""
+    if not _is_hls_input(url, message):
+        return ".mp4"
+    u = (url or "").lower()
+    if re.search(r"\.mp3/playlist\.m3u8", u):
+        return ".mp3"
+    return ".mp4"
 
 
 # --- Social / streaming platforms → yt-dlp ---------------------------------
@@ -374,6 +387,10 @@ def _yt_dlp_importable_in_process() -> bool:
 
 
 _TIKTOK_CDN_STREAM_HOSTS = ("tiktokcdn.com", "musical.ly", "tiktokv.com")
+# Signed HLS from SoundCloud CDNs. The tab is often soundcloud.com (yt-dlp social rule), but
+# yt-dlp must not swallow a raw *.m3u8 URL — use ffmpeg. Includes *.sndcdn.com (cf-hls-media, etc.)
+# and *.soundcloud.com media hosts (ec-media, …); not the main site URL bar host.
+_SOUNDCLOUD_CDN_STREAM_HOSTS = ("soundcloud.cloud", "sndcdn.com", "soundcloud.com")
 
 _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
     ("YouTube", ("googlevideo.com", "youtube.com", "youtu.be", "ytimg.com")),
@@ -495,10 +512,15 @@ def _page_is_tiktok(page_url: str) -> bool:
 def _social_platform_for_yt_dlp(stream_url: str, page_url: str, message: Any) -> Optional[str]:
     """
     Host matched a known social / streaming CDN → use yt-dlp.
-    Exception: HLS from TikTok-like CDNs when the tab is not a TikTok page (obfuscated HLS, etc.).
+    Exceptions (use ffmpeg instead):
+    - HLS from SoundCloud's media CDN (signed m3u8 URLs).
+    - HLS from TikTok-like CDNs when the tab is not a TikTok page (obfuscated HLS, etc.).
     """
     sh = _netloc_host(stream_url)
     ph = _netloc_host(page_url)
+    if _is_hls_input(stream_url, message):
+        if _host_matches_any(sh, _SOUNDCLOUD_CDN_STREAM_HOSTS):
+            return None
     if _is_hls_input(stream_url, message) and not _page_is_tiktok(page_url):
         if _host_matches_any(sh, _TIKTOK_CDN_STREAM_HOSTS):
             return None
@@ -2965,14 +2987,14 @@ def run_ffmpeg_with_updates(url, filename, message):
         low = (filename or "").strip().lower()
         if low in ("video", "stream", "download", "audio", "track"):
             effective_filename = _spotify_filename_hint(url, page_for_social, filename)
-
     if _looks_like_vtt_url(url):
         _download_vtt_immediate(url, message, out_dir, effective_filename, job_id)
         if _CURRENT_JOB_ID == job_id:
             _CURRENT_JOB_ID = ""
         return
 
-    output_path = _safe_output_path(out_dir, effective_filename, ".mp4")
+    out_ext = _ffmpeg_preferred_container_ext(url, message)
+    output_path = _safe_output_path(out_dir, effective_filename, out_ext)
 
     proc: Optional[subprocess.Popen] = None
     try:
