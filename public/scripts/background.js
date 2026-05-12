@@ -54,6 +54,9 @@ function hlsMediaSegmentUrl(u) {
 function classifyVideoFromUrl(url) {
   if (shouldIgnoreAsNoiseUrl(url)) return null;
   const u = String(url).toLowerCase();
+  if (/[/.]vtt(?:[?#]|$)/.test(u) || /[?&](format|ext|type|mime)=([^&#]*vtt|text%2fvtt)(?:[&#]|$)/i.test(u)) {
+    return { kind: 'subtitle', reason: 'vtt' };
+  }
 
   if (/[/.](m3u8|m3u)(?:[?#]|$)/.test(u)) {
     return { kind: 'hls', reason: 'path' };
@@ -135,6 +138,9 @@ function getHeaderValue(headers, name) {
  */
 function streamKindFromContentType(contentType) {
   const c = (contentType || '').toLowerCase().split(';')[0].trim();
+  if (c === 'text/vtt') {
+    return 'subtitle';
+  }
   if (c === 'application/vnd.apple.mpegurl' || c === 'application/x-mpegurl' || c === 'audio/mpegurl') {
     return 'hls_by_header';
   }

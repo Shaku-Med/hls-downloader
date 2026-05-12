@@ -1330,6 +1330,89 @@ def _http_get_text(url: str, header_block: str, timeout: float = 60.0) -> str:
     )
 
 
+def _looks_like_vtt_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    path = (urlsplit(u).path or "").lower()
+    if path.endswith(".vtt"):
+        return True
+    if re.search(r"[?&](format|ext|type|mime)=([^&#]*vtt|text%2Fvtt)(&|$)", u):
+        return True
+    return False
+
+
+def _download_vtt_immediate(url: str, message: dict, out_dir: str, filename: str, job_id: str) -> None:
+    output_path = _safe_output_path(out_dir, filename, ".vtt")
+    send_message(
+        with_job_id(
+            {
+                "type": "progress",
+                "phase": "starting",
+                "detail": "Fetching VTT subtitle...",
+                "output": output_path,
+            },
+            job_id,
+        )
+    )
+    header_block = build_ffmpeg_header_block(message, url)
+    try:
+        data = _http_get_bytes(url, header_block, timeout=60.0)
+    except Exception as e:
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": f"VTT request failed: {e}",
+                },
+                job_id,
+            )
+        )
+        return
+
+    if not data:
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": "VTT request returned an empty response.",
+                },
+                job_id,
+            )
+        )
+        return
+
+    try:
+        with open(output_path, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": f"Could not save VTT file: {e}",
+                },
+                job_id,
+            )
+        )
+        return
+
+    send_message(
+        with_job_id(
+            {
+                "type": "done",
+                "success": True,
+                "output": output_path,
+                "detail": "Subtitle saved",
+            },
+            job_id,
+        )
+    )
+
+
 def _is_master_playlist(text: str) -> bool:
     return "#EXT-X-STREAM-INF" in text
 
@@ -2882,6 +2965,13 @@ def run_ffmpeg_with_updates(url, filename, message):
         low = (filename or "").strip().lower()
         if low in ("video", "stream", "download", "audio", "track"):
             effective_filename = _spotify_filename_hint(url, page_for_social, filename)
+
+    if _looks_like_vtt_url(url):
+        _download_vtt_immediate(url, message, out_dir, effective_filename, job_id)
+        if _CURRENT_JOB_ID == job_id:
+            _CURRENT_JOB_ID = ""
+        return
+
     output_path = _safe_output_path(out_dir, effective_filename, ".mp4")
 
     proc: Optional[subprocess.Popen] = None

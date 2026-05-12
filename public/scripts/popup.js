@@ -518,9 +518,10 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
 
     const field = document.createElement('div');
     field.className = 'field';
+    const isSubtitle = kind === 'subtitle';
     const lab = document.createElement('label');
     lab.setAttribute('for', `name-${i}`);
-    lab.textContent = 'File name (no .mp4)';
+    lab.textContent = isSubtitle ? 'File name (no .vtt)' : 'File name (no .mp4)';
     const row = document.createElement('div');
     row.className = 'row';
     const input = document.createElement('input');
