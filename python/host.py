@@ -320,6 +320,14 @@ def _is_hls_input(url: str, message) -> bool:
     return sk in ("hls", "apple_hls", "hls_by_header", "m3u8", "m3u")
 
 
+def _is_dash_input(url: str, message) -> bool:
+    u = (url or "").lower()
+    if ".mpd" in u or re.search(r"\.mpd(?:$|[?#])", u):
+        return True
+    sk = (message.get("streamKind") or message.get("stream_kind") or "").strip().lower()
+    return sk in ("dash", "mpd")
+
+
 def _use_hls_aac_bsf(url: str, message) -> bool:
     """HLS fMP4/MPEG-TS+AAC to .mp4 often needs this; MP3-in-HLS must not use aac_adtstoasc."""
     u = (url or "").lower()
@@ -344,6 +352,194 @@ def _use_hls_aac_bsf(url: str, message) -> bool:
     if sk in ("direct", "dash", "mpd", "mp4", "webm", "yt", "social", "by_header", "other"):
         return False
     return False
+
+
+def _ffprobe_first_video_codec(path: str) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if r.returncode != 0:
+            return ""
+        return ((r.stdout or "").strip().splitlines() or [""])[0].strip().lower()
+    except (subprocess.SubprocessError, OSError, IndexError):
+        return ""
+
+
+def _ffmpeg_mp4_to_ts_bsf_args(path: str) -> List[str]:
+    """Annex-B bitstream filter so MP4 parts concat cleanly through MPEG-TS."""
+    codec = _ffprobe_first_video_codec(path)
+    if codec in ("h264", "avc"):
+        return ["-bsf:v", "h264_mp4toannexb"]
+    if codec in ("hevc", "h265"):
+        return ["-bsf:v", "hevc_mp4toannexb"]
+    return []
+
+
+def _ffmpeg_hls_network_fflags() -> List[str]:
+    """Demux from network HLS: generate missing PTS only; discard corrupt packets.
+    Omit +igndts — rewriting DTS clashes with coded frame order in -c:v copy and
+    yields smeared/decoded freezes while audio stays fine."""
+    return ["-fflags", "+genpts+discardcorrupt"]
+
+
+def _ffmpeg_local_file_remux_fflags() -> List[str]:
+    """Local combined fMP4/TS blobs already carry fragment timestamps — do not synthesize PTS."""
+    return ["-fflags", "+discardcorrupt"]
+
+
+def _ffmpeg_concat_demux_fflags() -> List[str]:
+    """TS concat demuxer: keep timestamps from parts; concat step uses -reset_timestamps."""
+    return ["-fflags", "+discardcorrupt"]
+
+
+def _ffmpeg_copy_mux_fixup_args(for_mp4: bool = False) -> List[str]:
+    out: List[str] = [
+        "-avoid_negative_ts",
+        "auto",
+        "-max_muxing_queue_size",
+        "9999",
+    ]
+    if for_mp4:
+        out.extend(["-movflags", "+faststart"])
+    else:
+        out.extend(["-muxpreload", "0", "-muxdelay", "0"])
+    return out
+
+
+def _ffmpeg_force_stream_copy_hls_mp4() -> bool:
+    """If set, use -c copy for HLS/DASH→MP4 (faster but often smears/freezes on bad PTS)."""
+    v = (os.environ.get("HLS_GRABBER_FFMPEG_STREAM_COPY") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+_FFMPEG_X264_ALLOWED_PRESETS = frozenset(
+    {
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+        "placebo",
+    }
+)
+
+
+def _ffmpeg_env_x264_crf_preset_maxrate_mbps() -> Tuple[int, str, Optional[float]]:
+    """
+    Tune H.264 encode size vs quality vs CPU. Defaults favor smaller outputs than ultrafast+low-CRF
+    (which can inflate a ~1GB CDN encode to multi-GB AVC).
+
+    HLS_GRABBER_FFMPEG_CRF — integer roughly 18 (larger files) … 28 (smaller); default 24
+    HLS_GRABBER_FFMPEG_PRESET — x264 preset; default fast (balanced size/speed vs ultrafast)
+    HLS_GRABBER_FFMPEG_VIDEO_MAX_MBPS — peak video bitrate cap, e.g. 8 (= 8 Mbit/s). Optional.
+    """
+    raw_crf = (os.environ.get("HLS_GRABBER_FFMPEG_CRF") or "").strip()
+    try:
+        crf = int(raw_crf) if raw_crf else 24
+    except ValueError:
+        crf = 24
+    crf = max(15, min(32, crf))
+
+    preset = (os.environ.get("HLS_GRABBER_FFMPEG_PRESET") or "fast").strip().lower()
+    if preset not in _FFMPEG_X264_ALLOWED_PRESETS:
+        preset = "fast"
+
+    max_mbps: Optional[float] = None
+    raw_mr = (os.environ.get("HLS_GRABBER_FFMPEG_VIDEO_MAX_MBPS") or "").strip()
+    if raw_mr:
+        try:
+            max_mbps = float(raw_mr.replace(",", "."))
+            if max_mbps <= 0 or max_mbps > 200:
+                max_mbps = None
+        except ValueError:
+            max_mbps = None
+
+    return crf, preset, max_mbps
+
+
+def _ffmpeg_x264_vencode_core_argv() -> List[str]:
+    crf, preset, max_mb = _ffmpeg_env_x264_crf_preset_maxrate_mbps()
+    argv: List[str] = [
+        "-c:v",
+        "libx264",
+        "-preset",
+        preset,
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if max_mb is not None:
+        argv.extend(
+            ["-maxrate", f"{max_mb}M", "-bufsize", f"{max_mb * 2:.4g}M"]
+        )
+    return argv
+
+
+def _ffmpeg_transcode_stable_mp4_from_url(url, message) -> List[str]:
+    """Decode+re-encode video; audio copy. Fixes corrupt reference chains from -c copy HLS mux."""
+    out: List[str] = [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        *_ffmpeg_x264_vencode_core_argv(),
+        "-c:a",
+        "copy",
+    ]
+    if _use_hls_aac_bsf(url, message):
+        out.extend(["-bsf:a", "aac_adtstoasc"])
+    return out
+
+
+def _ffmpeg_transcode_stable_mp4_from_combined_file(container: str) -> List[str]:
+    out: List[str] = [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        *_ffmpeg_x264_vencode_core_argv(),
+        "-c:a",
+        "copy",
+    ]
+    if container == "ts":
+        out.extend(["-bsf:a", "aac_adtstoasc"])
+    return out
+
+
+def _ffmpeg_transcode_stable_mp4_concat_merge() -> List[str]:
+    return [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        *_ffmpeg_x264_vencode_core_argv(),
+        "-c:a",
+        "copy",
+        "-bsf:a",
+        "aac_adtstoasc",
+    ]
 
 
 def _ffmpeg_preferred_container_ext(url: str, message) -> str:
@@ -1755,14 +1951,20 @@ def _ffmpeg_remux_combined_to_output(
     *,
     container: str,
 ) -> None:
-    """ffmpeg -i combined.{ts,mp4} -c copy to output; AAC BSF for MPEG-TS only."""
+    """ffmpeg mux combined TS/fMP4 to MP4; default re-encodes video for stable PTS/GOP."""
     global _active_ffmpeg
+    out_mp4 = output_path.lower().endswith(".mp4")
+    transcoding = out_mp4 and not _ffmpeg_force_stream_copy_hls_mp4()
     send_message(
         with_job_id(
             {
                 "type": "progress",
                 "phase": "encoding",
-                "detail": "Remuxing to MP4 (ffmpeg)…",
+                "detail": (
+                    "Re-encoding video to MP4 (ffmpeg)…"
+                    if transcoding
+                    else "Remuxing to MP4 (ffmpeg)…"
+                ),
                 "output": output_path,
             },
             job_id,
@@ -1775,13 +1977,17 @@ def _ffmpeg_remux_combined_to_output(
         "-loglevel",
         "info",
         "-stats",
+        *_ffmpeg_local_file_remux_fflags(),
         "-i",
         combined_path,
-        "-c",
-        "copy",
     ]
-    if container == "ts":
-        cmd.extend(["-bsf:a", "aac_adtstoasc"])
+    if transcoding:
+        cmd.extend(_ffmpeg_transcode_stable_mp4_from_combined_file(container))
+    else:
+        cmd.extend(["-c", "copy"])
+        if container == "ts":
+            cmd.extend(["-bsf:a", "aac_adtstoasc"])
+    cmd.extend(_ffmpeg_copy_mux_fixup_args(for_mp4=out_mp4))
     cmd.append(output_path)
     try:
         proc = subprocess.Popen(
@@ -2397,13 +2603,16 @@ def _build_ffmpeg_cmd_list(
         "info",
         "-stats",
     ]
+    seek_after_input = False
+    seek_sec = 0.0
     # HLS: default live_start_index is -3 (near live edge) which can make ffmpeg only
     # follow a short sliding window. Force start from the first listed segment, reload
     # playlists longer, and retry flaky segments (without TCP reconnect flags — they
     # destabilize some CDNs).
     if _is_hls_input(url, message):
         if resume_from_sec and resume_from_sec > 0.05:
-            pre.extend(["-ss", f"{float(resume_from_sec):.3f}"])
+            seek_after_input = True
+            seek_sec = float(resume_from_sec)
         pre.extend(
             [
                 "-allowed_extensions",
@@ -2416,8 +2625,7 @@ def _build_ffmpeg_cmd_list(
                 "200M",
                 "-probesize",
                 "200M",
-                "-fflags",
-                "+genpts",
+                *_ffmpeg_hls_network_fflags(),
                 "-f",
                 "hls",
                 "-live_start_index",
@@ -2438,12 +2646,21 @@ def _build_ffmpeg_cmd_list(
             url,
         ]
     )
-    cmd = pre + [
-        "-c",
-        "copy",
-    ]
-    if _use_hls_aac_bsf(url, message):
-        cmd.extend(["-bsf:a", "aac_adtstoasc"])
+    cmd = list(pre)
+    if seek_after_input:
+        cmd.extend(["-ss", f"{seek_sec:.3f}"])
+    out_mp4 = output_path.lower().endswith(".mp4")
+    if (
+        (_is_hls_input(url, message) or _is_dash_input(url, message))
+        and out_mp4
+        and not _ffmpeg_force_stream_copy_hls_mp4()
+    ):
+        cmd.extend(_ffmpeg_transcode_stable_mp4_from_url(url, message))
+    else:
+        cmd.extend(["-c", "copy"])
+        if _use_hls_aac_bsf(url, message):
+            cmd.extend(["-bsf:a", "aac_adtstoasc"])
+    cmd.extend(_ffmpeg_copy_mux_fixup_args(for_mp4=out_mp4))
     cmd.append(output_path)
     return cmd
 
@@ -2654,12 +2871,36 @@ def _ffmpeg_concat_two_mp4_to_one(part_a: str, part_b: str, out_final: str) -> b
     list_path = out_final + ".concat.txt"
     try:
         r1 = subprocess.run(
-            ["ffmpeg", "-y", "-nostdin", "-i", part_a, "-c", "copy", "-f", "mpegts", t1],
+            [
+                "ffmpeg",
+                "-y",
+                "-nostdin",
+                "-i",
+                part_a,
+                "-c",
+                "copy",
+                *_ffmpeg_mp4_to_ts_bsf_args(part_a),
+                "-f",
+                "mpegts",
+                t1,
+            ],
             capture_output=True,
             timeout=3600,
         )
         r2 = subprocess.run(
-            ["ffmpeg", "-y", "-nostdin", "-i", part_b, "-c", "copy", "-f", "mpegts", t2],
+            [
+                "ffmpeg",
+                "-y",
+                "-nostdin",
+                "-i",
+                part_b,
+                "-c",
+                "copy",
+                *_ffmpeg_mp4_to_ts_bsf_args(part_b),
+                "-f",
+                "mpegts",
+                t2,
+            ],
             capture_output=True,
             timeout=3600,
         )
@@ -2670,19 +2911,26 @@ def _ffmpeg_concat_two_mp4_to_one(part_a: str, part_b: str, out_final: str) -> b
         with open(list_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(f"file '{p1}'\nfile '{p2}'\n")
         tmp = out_final + ".merging.mp4"
+        use_merge_copy = _ffmpeg_force_stream_copy_hls_mp4()
+        if use_merge_copy:
+            merge_mid: List[str] = ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
+            merge_mid.extend(["-reset_timestamps", "1"])
+        else:
+            merge_mid = list(_ffmpeg_transcode_stable_mp4_concat_merge())
         r3 = subprocess.run(
             [
                 "ffmpeg",
                 "-y",
                 "-nostdin",
+                *_ffmpeg_concat_demux_fflags(),
                 "-f",
                 "concat",
                 "-safe",
                 "0",
                 "-i",
                 list_path,
-                "-c",
-                "copy",
+                *merge_mid,
+                *_ffmpeg_copy_mux_fixup_args(for_mp4=True),
                 tmp,
             ],
             capture_output=True,
