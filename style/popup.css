@@ -127,3 +127,26 @@ body {
   padding: 10px 12px;
   text-align: center;
 }
+
+.hgr-job-preset-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }
+.hgr-job-preset-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+.hgr-job-preset-select {
+  flex: 1; min-width: 100px; padding: 6px 8px; font-size: 11px;
+  border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); font-family: inherit;
+}
+.hgr-job-preset-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 25%, transparent 75%); }
+.hgr-job-preset-btn {
+  padding: 6px 10px; border: none; border-radius: 8px;
+  background: linear-gradient(180deg, var(--accent) 0%, var(--accent-2) 100%);
+  color: var(--btnText); font-size: 11px; font-weight: 700; cursor: pointer; font-family: inherit;
+}
+.hgr-job-preset-btn:hover { filter: brightness(1.08); }
+.hgr-job-partial-path { font-size: 10px; color: var(--muted); margin-top: 6px; word-break: break-all; line-height: 1.35; }
+.hgr-job-actions-row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
+.hgr-job-delete-btn {
+  padding: 6px 10px; border: 1px solid #6b2b3c; border-radius: 8px;
+  background: #2a1218; color: #ffb4c2; font-size: 11px; font-weight: 600; cursor: pointer; font-family: inherit;
+}
+:root[data-theme="light"] .hgr-job-delete-btn { background: #fff1f2; border-color: #fecdd3; color: #be123c; }
+.hgr-job-delete-btn:hover { filter: brightness(1.06); }
+.hgr-job-delete-btn:disabled { opacity: 0.6; cursor: not-allowed; }

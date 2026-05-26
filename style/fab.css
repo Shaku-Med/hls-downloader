@@ -99,3 +99,19 @@
 .stream-card .dl { background: var(--accent); color: #fff; border: none; border-radius: 8px; padding: 6px 12px; font-size: 11px; font-weight: 600; cursor: pointer; white-space: nowrap; }
 .stream-card .dl:disabled { background: #d6d3d1; cursor: not-allowed; }
 .empty { text-align: center; padding: 20px 8px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+.hgr-job-preset-row { display: flex; gap: 6px; align-items: center; margin-top: 6px; flex-wrap: wrap; }
+.hgr-job-preset-label { font-size: 10px; font-weight: 700; text-transform: uppercase; color: var(--muted); }
+.hgr-job-preset-select {
+  flex: 1; min-width: 90px; padding: 5px 7px; font-size: 11px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--bg); color: var(--text);
+}
+.hgr-job-preset-btn {
+  padding: 5px 9px; border: none; border-radius: 7px; background: var(--accent); color: #fff;
+  font-size: 10px; font-weight: 700; cursor: pointer;
+}
+.hgr-job-partial-path { font-size: 10px; color: var(--muted); margin-top: 4px; word-break: break-all; }
+.hgr-job-actions-row { margin-top: 6px; }
+.hgr-job-delete-btn {
+  padding: 5px 9px; border: 1px solid #fecdd3; border-radius: 7px; background: #fff1f2; color: #be123c;
+  font-size: 10px; font-weight: 600; cursor: pointer;
+}

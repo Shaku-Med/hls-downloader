@@ -624,6 +624,7 @@ function onHostMessage(msg, slotIndex) {
         status: 'downloading',
         detail: msg.detail || msg.phase || 'Running',
         outputPath: msg.output || null,
+        ffmpegPreset: msg.ffmpegPreset || undefined,
       });
       return;
     }
@@ -635,11 +636,13 @@ function onHostMessage(msg, slotIndex) {
     }
     slots[slotIndex].jobId = null;
     if (msg.canceled) {
+      const st = await readJobsState();
+      const prev = (st.jobs || []).find((j) => j.id === jobId);
       await patchJob(jobId, {
         status: 'canceled',
         error: msg.error || 'Canceled',
         detail: '',
-        outputPath: null,
+        outputPath: msg.output || prev?.outputPath || null,
       });
     } else if (msg.success) {
       await patchJob(jobId, {
@@ -709,7 +712,11 @@ async function launchOnSlot(slotIndex, jobId, basePayload) {
     return;
   }
   slots[slotIndex].jobId = jobId;
-  await patchJob(jobId, { status: 'connecting', detail: 'Starting' });
+  await patchJob(jobId, {
+    status: 'connecting',
+    detail: 'Starting',
+    ffmpegPreset: basePayload.ffmpegPreset || null,
+  });
   const full = { ...basePayload, jobId, outputDirectory: outDir };
   try {
     ensurePort(slotIndex).postMessage(full);
@@ -744,6 +751,151 @@ function removeFromPendingOnly(jobId) {
     }
   }
   return false;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForJobInactive(jobId, timeoutMs = 120000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const running = findSlotIndexByJobId(jobId) >= 0;
+    const queued = pendingQueue.some((q) => q.jobId === jobId);
+    if (!running && !queued) {
+      const st = await readJobsState();
+      return (st.jobs || []).find((j) => j.id === jobId) || null;
+    }
+    if (Date.now() > deadline) {
+      throw new Error('Timed out waiting for cancel to finish');
+    }
+    await sleep(200);
+  }
+}
+
+/** Same cancel path as the Cancel button; optional wait until the slot is free. */
+async function cancelDownloadById(jobId, { wait = false } = {}) {
+  if (removeFromPendingOnly(jobId)) {
+    await patchJob(jobId, { status: 'canceled', error: 'Canceled before it started', detail: '' });
+    tryDispatch();
+    return;
+  }
+  const si = findSlotIndexByJobId(jobId);
+  if (si >= 0 && slots[si].port) {
+    try {
+      slots[si].port.postMessage({ type: 'cancel', jobId });
+    } catch (e) {
+      await patchJob(jobId, { status: 'error', error: String(e), detail: '' });
+      slots[si].jobId = null;
+      tryDispatch();
+    }
+  } else if (si >= 0) {
+    slots[si].jobId = null;
+    await patchJob(jobId, { status: 'canceled', error: 'Canceled', detail: '' });
+    tryDispatch();
+  }
+  if (wait) {
+    await waitForJobInactive(jobId);
+  }
+}
+
+function enqueueDownload(jobId, payload) {
+  removeFromPendingOnly(jobId);
+  pendingQueue.push({ jobId, payload });
+}
+
+/** Cancel (like the user Cancel btn), optional delete, then queue the same job again. */
+async function restartDownloadJob(jobId, { newPreset, deleteFile, payload }) {
+  const outDir = await getUserDownloadPath();
+  if (!outDir) {
+    throw new Error('Save folder not set');
+  }
+  const st = await readJobsState();
+  const job = (st.jobs || []).find((j) => j.id === jobId);
+  const outputPath = job && job.outputPath;
+
+  await cancelDownloadById(jobId, { wait: true });
+
+  if (deleteFile && outputPath) {
+    const del = await deleteOutputFileViaNative(outputPath, outDir);
+    if (!del.ok) {
+      throw new Error(del.error || 'Could not delete file');
+    }
+  }
+
+  const fullPayload = {
+    ...(job?.downloadPayload || {}),
+    ...payload,
+    jobId,
+    ffmpegPreset: newPreset,
+  };
+  if (deleteFile) {
+    delete fullPayload.numberedOutput;
+  } else {
+    fullPayload.numberedOutput = true;
+  }
+
+  await patchJob(jobId, {
+    status: 'queued',
+    detail: 'Waiting',
+    error: null,
+    outputPath: null,
+    ffmpegPreset: newPreset,
+    downloadPayload: fullPayload,
+    label: (payload.filename || job?.label || 'video').toString(),
+    fileStem: (payload.filename || job?.fileStem || 'video').toString(),
+  });
+  enqueueDownload(jobId, fullPayload);
+  tryDispatch();
+}
+
+function deleteOutputFileViaNative(outputPath, outputDirectory) {
+  return new Promise((resolve) => {
+    if (!outputPath || !outputDirectory) {
+      resolve({ ok: true, skipped: true });
+      return;
+    }
+    const requestId = genJobId();
+    const timeoutMs = 30000;
+    let settled = false;
+    const port = chrome.runtime.connectNative(NATIVE);
+    const t = setTimeout(() => finish({ ok: false, error: 'Timed out deleting file' }), timeoutMs);
+    function finish(out) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      try {
+        port.disconnect();
+      } catch (_) {
+        // ignore
+      }
+      resolve(out);
+    }
+    port.onMessage.addListener((msg) => {
+      if (settled) return;
+      if (msg && msg.type === 'delete_output_file_result' && msg.requestId === requestId) {
+        finish({ ok: msg.success !== false, error: msg.error || null });
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      if (settled) return;
+      finish({ ok: false, error: chrome.runtime.lastError?.message || 'Native host disconnected' });
+    });
+    try {
+      port.postMessage({
+        type: 'delete_output_file',
+        requestId,
+        path: outputPath,
+        outputDirectory,
+      });
+    } catch (e) {
+      finish({ ok: false, error: String(e) });
+    }
+  });
+}
+
+async function cancelJobAndWait(jobId) {
+  await cancelDownloadById(jobId, { wait: true });
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -851,6 +1003,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'DELETE_JOB_FILE' && message.jobId) {
+    (async () => {
+      const jobId = message.jobId;
+      const outDir = await getUserDownloadPath();
+      if (!outDir) {
+        respond(sendResponse, { ok: false, error: 'Save folder not set' });
+        return;
+      }
+      const st = await readJobsState();
+      const job = (st.jobs || []).find((j) => j.id === jobId);
+      const outputPath = job && job.outputPath;
+      if (!outputPath) {
+        respond(sendResponse, { ok: false, error: 'No file to delete' });
+        return;
+      }
+      const del = await deleteOutputFileViaNative(outputPath, outDir);
+      if (!del.ok) {
+        respond(sendResponse, { ok: false, error: del.error || 'Could not delete file' });
+        return;
+      }
+      await patchJob(jobId, {
+        outputPath: null,
+        error: job.status === 'canceled' ? 'Canceled (file deleted)' : job.error,
+      });
+      respond(sendResponse, { ok: true });
+    })();
+    return true;
+  }
+
   if (message.type === 'DISMISS_DONE') {
     (async () => {
       const st = await readJobsState();
@@ -863,25 +1044,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'CANCEL_DOWNLOAD' && message.jobId) {
     (async () => {
-      const jobId = message.jobId;
-      if (removeFromPendingOnly(jobId)) {
-        await patchJob(jobId, { status: 'canceled', error: 'Canceled before it started', detail: '' });
-        tryDispatch();
-        respond(sendResponse, { ok: true });
-        return;
-      }
-      const si = findSlotIndexByJobId(jobId);
-      if (si >= 0 && slots[si].port) {
-        try {
-          slots[si].port.postMessage({ type: 'cancel', jobId });
-        } catch (e) {
-          await patchJob(jobId, { status: 'error', error: String(e), detail: '' });
-          slots[si].jobId = null;
-          tryDispatch();
-        }
-        respond(sendResponse, { ok: true });
-        return;
-      }
+      await cancelDownloadById(message.jobId);
       respond(sendResponse, { ok: true });
     })();
     return true;
@@ -993,6 +1156,145 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'GET_FFMPEG_ENCODE_PRESET') {
+    (async () => {
+      const payload = message.payload || {};
+      if (!payload.url) {
+        respond(sendResponse, { ok: false, error: 'No stream URL', applies: false });
+        return;
+      }
+      const tabIdForJob = payload.tabId != null ? payload.tabId : sender.tab?.id ?? null;
+      let tabUrl = '';
+      if (tabIdForJob != null) {
+        try {
+          const t = await chrome.tabs.get(tabIdForJob);
+          tabUrl = (t && t.url) || '';
+        } catch (_) {
+          // ignore
+        }
+      }
+      let cookie = (payload.cookie && String(payload.cookie).trim()) || '';
+      if (!cookie) {
+        cookie = await getCookieStringPromise(payload.url, tabUrl);
+      }
+      const requestId = genJobId();
+      const base = {
+        type: 'ffmpeg_encode_preset',
+        requestId,
+        url: payload.url,
+        tabId: tabIdForJob ?? undefined,
+        streamKind: payload.streamKind,
+        cookie: cookie || undefined,
+        userAgent: payload.userAgent,
+        capturedHeaders: payload.capturedHeaders,
+        authorization: payload.authorization,
+        referer: payload.referer,
+        pageUrl: payload.pageUrl,
+        origin: payload.origin,
+      };
+      if (!base.userAgent) {
+        try {
+          base.userAgent = (typeof navigator !== 'undefined' && navigator.userAgent) || undefined;
+        } catch (_) {
+          // ignore
+        }
+      }
+      if (!base.referer && tabUrl && /^https?:/i.test(tabUrl)) {
+        base.referer = tabUrl;
+        try {
+          base.origin = new URL(tabUrl).origin;
+        } catch (_) {
+          // ignore
+        }
+      }
+      if (tabUrl && /^https?:/i.test(tabUrl)) {
+        base.pageUrl = tabUrl;
+      }
+      const timeoutMs = 90000;
+      let settled = false;
+      const port = chrome.runtime.connectNative(NATIVE);
+      const t = setTimeout(() => {
+        finish({ ok: false, error: 'Timed out probing encode preset', applies: false, requestId });
+      }, timeoutMs);
+      function finish(out) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(t);
+        try {
+          port.disconnect();
+        } catch (_) {
+          // ignore
+        }
+        respond(sendResponse, out);
+      }
+      port.onMessage.addListener((msg) => {
+        if (settled) return;
+        if (msg && msg.type === 'ffmpeg_encode_preset_result' && msg.requestId === requestId) {
+          finish({
+            ok: msg.success !== false,
+            requestId: msg.requestId,
+            applies: msg.applies === true,
+            recommendedPreset: msg.recommendedPreset || 'veryfast',
+            alternatePreset: msg.alternatePreset || 'fast',
+            allowedPresets: msg.allowedPresets || [],
+            durationSec: msg.durationSec || 0,
+            sizeBytes: msg.sizeBytes || 0,
+            envLocked: !!msg.envLocked,
+            autoReason: msg.autoReason || '',
+            error: msg.error || null,
+          });
+        }
+      });
+      port.onDisconnect.addListener(() => {
+        if (settled) return;
+        const err = chrome.runtime.lastError && chrome.runtime.lastError.message;
+        finish({ ok: false, applies: false, error: err || 'Native host disconnected', requestId });
+      });
+      try {
+        port.postMessage(base);
+      } catch (e) {
+        finish({ ok: false, applies: false, error: String(e), requestId });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'SWITCH_FFMPEG_PRESET') {
+    (async () => {
+      const jobId = message.jobId;
+      const newPreset = (message.newPreset || '').toString().toLowerCase();
+      const deleteFile = message.deleteFile === true;
+      const basePayload = message.payload || {};
+      if (!jobId || !newPreset) {
+        respond(sendResponse, { ok: false, error: 'Missing job or preset' });
+        return;
+      }
+      const queuedIdx = pendingQueue.findIndex((q) => q.jobId === jobId);
+      if (queuedIdx >= 0) {
+        pendingQueue[queuedIdx].payload = {
+          ...pendingQueue[queuedIdx].payload,
+          ...basePayload,
+          jobId,
+          ffmpegPreset: newPreset,
+        };
+        await patchJob(jobId, { ffmpegPreset: newPreset, detail: `Queued (${newPreset})` });
+        respond(sendResponse, { ok: true, jobId });
+        return;
+      }
+      try {
+        await restartDownloadJob(jobId, {
+          newPreset,
+          deleteFile,
+          payload: basePayload,
+        });
+        respond(sendResponse, { ok: true, jobId });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === 'START_DOWNLOAD') {
     (async () => {
       const payload = message.payload;
@@ -1069,10 +1371,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         streamUrl: payload.url,
         streamKind: payload.streamKind || null,
         fileStem: (payload.filename || label).toString(),
+        ffmpegPreset: base.ffmpegPreset || null,
+        downloadPayload: base,
         lastAuthRefresh: Date.now(),
         startedAt: Date.now(),
       });
-      pendingQueue.push({ jobId, payload: base });
+      enqueueDownload(jobId, base);
       tryDispatch();
       respond(sendResponse, { ok: true, jobId });
     })();
