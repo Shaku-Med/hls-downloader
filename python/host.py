@@ -443,15 +443,18 @@ _FFMPEG_X264_ALLOWED_PRESETS = frozenset(
         "placebo",
     }
 )
+# Auto x264 preset: long/large sources use fast; shorter/smaller use veryfast.
+_FFMPEG_AUTO_PRESET_DURATION_FAST_SEC = 3600.0
+_FFMPEG_AUTO_PRESET_SIZE_FAST_BYTES = 1_073_741_824  # 1 GiB
 
 
-def _ffmpeg_env_x264_crf_preset_maxrate_mbps() -> Tuple[int, str, Optional[float]]:
+def _ffmpeg_env_x264_crf_maxrate_mbps() -> Tuple[int, Optional[float]]:
     """
     Tune H.264 encode size vs quality vs CPU. Defaults favor smaller outputs than ultrafast+low-CRF
     (which can inflate a ~1GB CDN encode to multi-GB AVC).
 
     HLS_GRABBER_FFMPEG_CRF — integer roughly 18 (larger files) … 28 (smaller); default 24
-    HLS_GRABBER_FFMPEG_PRESET — x264 preset; default fast (balanced size/speed vs ultrafast)
+    HLS_GRABBER_FFMPEG_PRESET — optional fixed x264 preset; when unset, auto veryfast/fast
     HLS_GRABBER_FFMPEG_VIDEO_MAX_MBPS — peak video bitrate cap, e.g. 8 (= 8 Mbit/s). Optional.
     """
     raw_crf = (os.environ.get("HLS_GRABBER_FFMPEG_CRF") or "").strip()
@@ -460,10 +463,6 @@ def _ffmpeg_env_x264_crf_preset_maxrate_mbps() -> Tuple[int, str, Optional[float
     except ValueError:
         crf = 24
     crf = max(15, min(32, crf))
-
-    preset = (os.environ.get("HLS_GRABBER_FFMPEG_PRESET") or "fast").strip().lower()
-    if preset not in _FFMPEG_X264_ALLOWED_PRESETS:
-        preset = "fast"
 
     max_mbps: Optional[float] = None
     raw_mr = (os.environ.get("HLS_GRABBER_FFMPEG_VIDEO_MAX_MBPS") or "").strip()
@@ -475,16 +474,65 @@ def _ffmpeg_env_x264_crf_preset_maxrate_mbps() -> Tuple[int, str, Optional[float
         except ValueError:
             max_mbps = None
 
-    return crf, preset, max_mbps
+    return crf, max_mbps
 
 
-def _ffmpeg_x264_vencode_core_argv() -> List[str]:
-    crf, preset, max_mb = _ffmpeg_env_x264_crf_preset_maxrate_mbps()
+def _ffmpeg_env_preset_override() -> Optional[str]:
+    raw = (os.environ.get("HLS_GRABBER_FFMPEG_PRESET") or "").strip().lower()
+    if not raw:
+        return None
+    if raw in _FFMPEG_X264_ALLOWED_PRESETS:
+        return raw
+    return "fast"
+
+
+def _ffmpeg_pick_x264_preset(
+    duration_sec: float = 0.0, size_bytes: Optional[int] = None
+) -> str:
+    """Pick x264 preset from duration/size unless HLS_GRABBER_FFMPEG_PRESET is set."""
+    override = _ffmpeg_env_preset_override()
+    if override:
+        return override
+    dur = max(0.0, float(duration_sec or 0.0))
+    sz = int(size_bytes) if size_bytes is not None and size_bytes > 0 else 0
+    if dur >= _FFMPEG_AUTO_PRESET_DURATION_FAST_SEC or sz >= _FFMPEG_AUTO_PRESET_SIZE_FAST_BYTES:
+        return "fast"
+    return "veryfast"
+
+
+def _message_media_hints(message) -> Tuple[float, Optional[int]]:
+    """Optional duration/size hints from the extension message."""
+    dur = 0.0
+    size: Optional[int] = None
+    if not message:
+        return dur, size
+    for key in ("duration", "durationSec", "duration_sec", "mediaDuration"):
+        v = message.get(key)
+        if v is not None:
+            try:
+                dur = max(dur, float(v))
+            except (TypeError, ValueError):
+                pass
+    for key in ("fileSize", "file_size", "contentLength", "size"):
+        v = message.get(key)
+        if v is not None:
+            try:
+                n = int(v)
+                if n > 0:
+                    size = max(size or 0, n)
+            except (TypeError, ValueError):
+                pass
+    return dur, size
+
+
+def _ffmpeg_x264_vencode_core_argv(*, preset: Optional[str] = None) -> List[str]:
+    crf, max_mb = _ffmpeg_env_x264_crf_maxrate_mbps()
+    effective_preset = preset or _ffmpeg_pick_x264_preset()
     argv: List[str] = [
         "-c:v",
         "libx264",
         "-preset",
-        preset,
+        effective_preset,
         "-crf",
         str(crf),
         "-pix_fmt",
@@ -497,14 +545,16 @@ def _ffmpeg_x264_vencode_core_argv() -> List[str]:
     return argv
 
 
-def _ffmpeg_transcode_stable_mp4_from_url(url, message) -> List[str]:
+def _ffmpeg_transcode_stable_mp4_from_url(
+    url, message, *, preset: Optional[str] = None
+) -> List[str]:
     """Decode+re-encode video; audio copy. Fixes corrupt reference chains from -c copy HLS mux."""
     out: List[str] = [
         "-map",
         "0:v:0",
         "-map",
         "0:a:0?",
-        *_ffmpeg_x264_vencode_core_argv(),
+        *_ffmpeg_x264_vencode_core_argv(preset=preset),
         "-c:a",
         "copy",
     ]
@@ -513,13 +563,15 @@ def _ffmpeg_transcode_stable_mp4_from_url(url, message) -> List[str]:
     return out
 
 
-def _ffmpeg_transcode_stable_mp4_from_combined_file(container: str) -> List[str]:
+def _ffmpeg_transcode_stable_mp4_from_combined_file(
+    container: str, *, preset: Optional[str] = None
+) -> List[str]:
     out: List[str] = [
         "-map",
         "0:v:0",
         "-map",
         "0:a:0?",
-        *_ffmpeg_x264_vencode_core_argv(),
+        *_ffmpeg_x264_vencode_core_argv(preset=preset),
         "-c:a",
         "copy",
     ]
@@ -528,13 +580,15 @@ def _ffmpeg_transcode_stable_mp4_from_combined_file(container: str) -> List[str]
     return out
 
 
-def _ffmpeg_transcode_stable_mp4_concat_merge() -> List[str]:
+def _ffmpeg_transcode_stable_mp4_concat_merge(
+    *, preset: Optional[str] = None
+) -> List[str]:
     return [
         "-map",
         "0:v:0",
         "-map",
         "0:a:0?",
-        *_ffmpeg_x264_vencode_core_argv(),
+        *_ffmpeg_x264_vencode_core_argv(preset=preset),
         "-c:a",
         "copy",
         "-bsf:a",
@@ -1462,6 +1516,38 @@ def _parse_hls_media_segments(
     return out
 
 
+def _hls_playlist_duration_seconds(playlist_text: str) -> float:
+    total = 0.0
+    for raw_line in (playlist_text or "").splitlines():
+        line = raw_line.strip()
+        if not line.upper().startswith("#EXTINF:"):
+            continue
+        rest = line.split(":", 1)[1]
+        dur_str = rest.split(",", 1)[0].strip()
+        try:
+            total += max(0.0, float(dur_str))
+        except ValueError:
+            continue
+    return total
+
+
+def _hls_playlist_estimated_size_bytes(
+    playlist_text: str, playlist_url: str
+) -> Optional[int]:
+    """Sum #EXT-X-BYTERANGE lengths when present; None if segments have no size hints."""
+    entries = _parse_hls_media_segments(playlist_text, playlist_url)
+    if not entries:
+        return None
+    total = 0
+    has_estimate = False
+    for _seg_url, byte_range in entries:
+        if byte_range is None:
+            continue
+        total += int(byte_range[1])
+        has_estimate = True
+    return total if has_estimate and total > 0 else None
+
+
 def _find_mpegts_payload_start(data: bytes, start: int = 0) -> int:
     return _find_best_mpegts_start(data, start)
 
@@ -1982,7 +2068,9 @@ def _ffmpeg_remux_combined_to_output(
         combined_path,
     ]
     if transcoding:
-        cmd.extend(_ffmpeg_transcode_stable_mp4_from_combined_file(container))
+        ld, ls = _local_file_format_hints(combined_path)
+        preset = _ffmpeg_pick_x264_preset(ld, ls)
+        cmd.extend(_ffmpeg_transcode_stable_mp4_from_combined_file(container, preset=preset))
     else:
         cmd.extend(["-c", "copy"])
         if container == "ts":
@@ -2655,7 +2743,8 @@ def _build_ffmpeg_cmd_list(
         and out_mp4
         and not _ffmpeg_force_stream_copy_hls_mp4()
     ):
-        cmd.extend(_ffmpeg_transcode_stable_mp4_from_url(url, message))
+        preset = _ffmpeg_probe_transcode_preset(url, message, header_block)
+        cmd.extend(_ffmpeg_transcode_stable_mp4_from_url(url, message, preset=preset))
     else:
         cmd.extend(["-c", "copy"])
         if _use_hls_aac_bsf(url, message):
@@ -2689,6 +2778,98 @@ def _ffprobe_duration_seconds(path: str) -> float:
         return max(0.0, float((r.stdout or "").strip().splitlines()[0]))
     except (ValueError, subprocess.SubprocessError, OSError, IndexError):
         return 0.0
+
+
+def _local_file_format_hints(path: str) -> Tuple[float, Optional[int]]:
+    dur = _ffprobe_duration_seconds(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = None
+    return dur, size
+
+
+def _ffprobe_url_format_hints(url: str, header_block: str) -> Tuple[float, Optional[int]]:
+    if not url or not shutil.which("ffprobe"):
+        return 0.0, None
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-headers",
+                header_block,
+                "-show_entries",
+                "format=duration,size",
+                "-of",
+                "json",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        if r.returncode != 0:
+            return 0.0, None
+        data = json.loads(r.stdout or "{}")
+        fmt = data.get("format") or {}
+        dur = 0.0
+        raw_d = fmt.get("duration")
+        if raw_d is not None:
+            try:
+                dur = max(0.0, float(raw_d))
+            except (TypeError, ValueError):
+                pass
+        size: Optional[int] = None
+        raw_s = fmt.get("size")
+        if raw_s is not None:
+            try:
+                n = int(raw_s)
+                if n > 0:
+                    size = n
+            except (TypeError, ValueError):
+                pass
+        return dur, size
+    except (
+        FileNotFoundError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+        OSError,
+    ):
+        return 0.0, None
+
+
+def _ffmpeg_probe_transcode_preset(
+    url,
+    message,
+    header_block,
+    *,
+    local_path: Optional[str] = None,
+) -> str:
+    """Inspect source duration/size and pick fast vs veryfast x264 preset."""
+    dur, size = _message_media_hints(message)
+    if local_path and os.path.isfile(local_path):
+        ld, ls = _local_file_format_hints(local_path)
+        dur = max(dur, ld)
+        if ls:
+            size = max(size or 0, ls) or ls
+    if _is_hls_input(url, message):
+        try:
+            var_url, var_text = _resolve_variant_playlist_url(url, header_block)
+            dur = max(dur, _hls_playlist_duration_seconds(var_text))
+            est = _hls_playlist_estimated_size_bytes(var_text, var_url)
+            if est:
+                size = max(size or 0, est) or est
+        except (urllib.error.URLError, OSError, ValueError, UnicodeError):
+            pass
+    if dur <= 0.05 or size is None:
+        ud, us = _ffprobe_url_format_hints(url, header_block)
+        dur = max(dur, ud)
+        if us:
+            size = max(size or 0, us) or us
+    return _ffmpeg_pick_x264_preset(dur, size)
 
 
 def _ffprobe_video_validation(path: str) -> Tuple[float, bool]:
@@ -2916,7 +3097,14 @@ def _ffmpeg_concat_two_mp4_to_one(part_a: str, part_b: str, out_final: str) -> b
             merge_mid: List[str] = ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
             merge_mid.extend(["-reset_timestamps", "1"])
         else:
-            merge_mid = list(_ffmpeg_transcode_stable_mp4_concat_merge())
+            da, sa = _local_file_format_hints(part_a)
+            db, sb = _local_file_format_hints(part_b)
+            total_dur = da + db
+            total_size = (sa or 0) + (sb or 0)
+            preset = _ffmpeg_pick_x264_preset(
+                total_dur, total_size if total_size > 0 else None
+            )
+            merge_mid = list(_ffmpeg_transcode_stable_mp4_concat_merge(preset=preset))
         r3 = subprocess.run(
             [
                 "ffmpeg",
