@@ -212,10 +212,10 @@ def main():
     is_wsl = os.path.exists("/proc/version") and "microsoft" in open("/proc/version").read().lower()
 
     if is_wsl:
-        print("\nDetected WSL environment — installing for Windows Chrome...")
+        print("\nDetected WSL environment  installing for Windows Chrome...")
         install_windows(ext_id)
     elif sys.platform == "win32":
-        print("\nDetected native Windows — installing for Google Chrome...")
+        print("\nDetected native Windows  installing for Google Chrome...")
         install_native_windows(ext_id)
     else:
         print("\nInstalling for Linux Chrome...")

@@ -323,7 +323,7 @@ def _is_hls_input(url: str, message) -> bool:
 def _use_hls_aac_bsf(url: str, message) -> bool:
     """HLS fMP4/MPEG-TS+AAC to .mp4 often needs this; MP3-in-HLS must not use aac_adtstoasc."""
     u = (url or "").lower()
-    # e.g. …/playlist/id.128.mp3/playlist.m3u8 — segments are MP3, not ADTS AAC
+    # e.g. …/playlist/id.128.mp3/playlist.m3u8  segments are MP3, not ADTS AAC
     if re.search(r"\.mp3/playlist\.m3u8", u):
         return False
     if ".m3u8" in u or u.endswith(".m3u") or re.search(r"\.m3u8[?#]", u):
@@ -388,7 +388,7 @@ def _yt_dlp_importable_in_process() -> bool:
 
 _TIKTOK_CDN_STREAM_HOSTS = ("tiktokcdn.com", "musical.ly", "tiktokv.com")
 # Signed HLS from SoundCloud CDNs. The tab is often soundcloud.com (yt-dlp social rule), but
-# yt-dlp must not swallow a raw *.m3u8 URL — use ffmpeg. Includes *.sndcdn.com (cf-hls-media, etc.)
+# yt-dlp must not swallow a raw *.m3u8 URL  use ffmpeg. Includes *.sndcdn.com (cf-hls-media, etc.)
 # and *.soundcloud.com media hosts (ec-media, …); not the main site URL bar host.
 _SOUNDCLOUD_CDN_STREAM_HOSTS = ("soundcloud.cloud", "sndcdn.com", "soundcloud.com")
 
@@ -1468,7 +1468,7 @@ def _strip_webp_prefix(data: bytes) -> Optional[bytes]:
 
 
 def _obfuscation_kind_from_magic(data: bytes) -> Optional[str]:
-    """Wrapper kind from magic bytes. Raw MPEG-TS at 0 is not a wrapper — return None."""
+    """Wrapper kind from magic bytes. Raw MPEG-TS at 0 is not a wrapper  return None."""
     s = _strip_leading_garbage(data)
     if not s:
         return None
@@ -2316,7 +2316,7 @@ def _build_ffmpeg_cmd_list(
     ]
     # HLS: default live_start_index is -3 (near live edge) which can make ffmpeg only
     # follow a short sliding window. Force start from the first listed segment, reload
-    # playlists longer, and retry flaky segments (without TCP reconnect flags — they
+    # playlists longer, and retry flaky segments (without TCP reconnect flags  they
     # destabilize some CDNs).
     if _is_hls_input(url, message):
         if resume_from_sec and resume_from_sec > 0.05:
@@ -2987,7 +2987,7 @@ def run_ffmpeg_with_updates(url, filename, message):
                         var_text_r,
                     )
                     return
-                # clean_kind "ts": extension mismatch only — ffmpeg HLS demuxer + ALL suffices.
+                # clean_kind "ts": extension mismatch only  ffmpeg HLS demuxer + ALL suffices.
 
             ob_kind: Optional[str] = None
             try:

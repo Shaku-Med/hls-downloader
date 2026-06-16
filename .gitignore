@@ -20,7 +20,7 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-store/
 
-# Chrome extension — never commit private keys or packed builds
+# Chrome extension  never commit private keys or packed builds
 *.pem
 *.crx
 *.zip

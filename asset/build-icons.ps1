@@ -3,7 +3,7 @@ $ErrorActionPreference = 'Stop'
 $dir = $PSScriptRoot
 $src = Join-Path $dir 'icon.png'
 if (-not (Test-Path -LiteralPath $src)) {
-  Write-Error "Missing $src — place the master image there, then re-run."
+  Write-Error "Missing $src  place the master image there, then re-run."
 }
 foreach ($s in 16, 32, 48, 128) {
   $out = Join-Path $dir "icon-$s.png"
