@@ -2,6 +2,7 @@ const KEY = 'userDownloadPath';
 const FLOAT_KEY = 'floatGrabberEnabled';
 const IMG_DL_KEY = 'imageHoverDownloadEnabled';
 const YTDLP_MODE_KEY = 'ytDlpQualityMode';
+const FFMPEG_PRESET_MODE_KEY = 'ffmpegPresetMode';
 const YTDLP_MAX_H_KEY = 'ytDlpMaxHeight';
 const THEME_MODE_KEY = 'uiThemeMode';
 const THEME_ACCENT_KEY = 'uiThemeAccent';
@@ -14,7 +15,7 @@ function showStatus(msg, kind) {
 }
 
 function load() {
-  chrome.storage.local.get([KEY, FLOAT_KEY, IMG_DL_KEY, YTDLP_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
+  chrome.storage.local.get([KEY, FLOAT_KEY, IMG_DL_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
     const err = chrome.runtime.lastError;
     if (err) {
       showStatus(String(err), 'err');
@@ -27,6 +28,8 @@ function load() {
     if (imgDlEl) imgDlEl.checked = data[IMG_DL_KEY] === true; // default OFF
     const qEl = document.getElementById('ytdlp-quality');
     if (qEl) qEl.value = data[YTDLP_MODE_KEY] === 'ask' ? 'ask' : 'auto';
+    const fpEl = document.getElementById('ffmpeg-preset-mode');
+    if (fpEl) fpEl.value = data[FFMPEG_PRESET_MODE_KEY] === 'auto' ? 'auto' : 'ask';
     const hEl = document.getElementById('ytdlp-max-h');
     if (hEl) {
       const v = data[YTDLP_MAX_H_KEY];
@@ -100,6 +103,14 @@ if (ytdlpQuality) {
   ytdlpQuality.addEventListener('change', () => {
     const v = ytdlpQuality.value === 'ask' ? 'ask' : 'auto';
     chrome.storage.local.set({ [YTDLP_MODE_KEY]: v });
+  });
+}
+
+const ffmpegPresetMode = document.getElementById('ffmpeg-preset-mode');
+if (ffmpegPresetMode) {
+  ffmpegPresetMode.addEventListener('change', () => {
+    const v = ffmpegPresetMode.value === 'ask' ? 'ask' : 'auto';
+    chrome.storage.local.set({ [FFMPEG_PRESET_MODE_KEY]: v });
   });
 }
 

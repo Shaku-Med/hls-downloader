@@ -644,10 +644,17 @@
       } else if (job.status === 'canceled') {
         d.textContent = job.error || 'Canceled';
       } else {
-        d.textContent = job.detail || job.error || '';
+        let detail = job.detail || job.error || '';
+        if (job.ffmpegPreset && ['queued', 'connecting', 'downloading'].includes(job.status)) {
+          detail = detail ? `${detail} · preset ${job.ffmpegPreset}` : `preset ${job.ffmpegPreset}`;
+        }
+        d.textContent = detail;
       }
       card.appendChild(t);
       card.appendChild(d);
+      if (typeof HLS_FFMPEG !== 'undefined' && HLS_FFMPEG.enhanceJobCard) {
+        HLS_FFMPEG.enhanceJobCard(job, card, { onRefresh: refreshPanelJobsOnly });
+      }
       const row = document.createElement('div');
       row.className = 'row-btns';
       if (['queued', 'connecting', 'downloading'].includes(job.status)) {
@@ -812,23 +819,81 @@
             origin: payload.origin,
           };
 
-          const finishDl = (ytFmt) => {
-            const finalPayload = { ...payload };
+          const buildFinalPayload = (ytFmt, ffmpegPreset, extra = {}) => {
+            const finalPayload = { ...payload, ...extra };
             if (ytFmt) finalPayload.ytDlpFormat = ytFmt;
+            if (ffmpegPreset) finalPayload.ffmpegPreset = ffmpegPreset;
             if (pageOnly) {
               const tel = shadow.getElementById(`fab-thumb-${i}`);
               if (tel && tel.checked) finalPayload.ytDlpWriteThumbnail = true;
             }
+            return finalPayload;
+          };
+
+          const sendDownload = (finalPayload, onResult) => {
             chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload: finalPayload }, (r) => {
               resetFabDlBtn();
               refreshPanelJobsOnly();
               if (chrome.runtime.lastError || !r?.ok) {
                 console.warn('Stuff Grabber fab:', chrome.runtime.lastError || r?.error);
               }
+              if (onResult) onResult(r);
             });
           };
 
-          maybeAskYtdlpFormat(kind, probePayload, finishDl, () => {
+          const finishDl = (ytFmt, ffmpegPreset, extra) => {
+            sendDownload(buildFinalPayload(ytFmt, ffmpegPreset, extra));
+          };
+
+          maybeAskYtdlpFormat(kind, probePayload, (ytFmt) => {
+            const ffProbe = { ...probePayload, streamKind: kind };
+            const ffCtx = {
+              filename,
+              ext: '.mp4',
+              onStart: (preset, cb) => {
+                if (preset == null) {
+                  finishDl(ytFmt, null);
+                  if (cb) cb(null, null);
+                  return;
+                }
+                sendDownload(buildFinalPayload(ytFmt, preset), (r) => {
+                  if (!r?.ok) {
+                    if (cb) cb(r?.error || 'Could not start', null);
+                    return;
+                  }
+                  if (cb) cb(null, r.jobId);
+                });
+              },
+              onSwitch: ({ jobId, preset, deleteFile }, cb) => {
+                chrome.runtime.sendMessage(
+                  {
+                    type: 'SWITCH_FFMPEG_PRESET',
+                    jobId,
+                    newPreset: preset,
+                    deleteFile,
+                    payload: buildFinalPayload(ytFmt, preset),
+                  },
+                  (r) => {
+                    if (chrome.runtime.lastError || !r?.ok) {
+                      if (cb) cb(chrome.runtime.lastError?.message || r?.error || 'Switch failed', null);
+                      return;
+                    }
+                    refreshPanelJobsOnly();
+                    if (cb) cb(null, r.jobId);
+                  }
+                );
+              },
+              getJobOutputPath: () => '',
+            };
+            const askFf =
+              typeof HLS_FFMPEG !== 'undefined' && HLS_FFMPEG.maybeAskFfmpegPreset
+                ? HLS_FFMPEG.maybeAskFfmpegPreset.bind(HLS_FFMPEG)
+                : (_k, _p, ctx) => ctx.onStart(null, () => {});
+            askFf(kind, ffProbe, ffCtx, () => {
+              resetFabDlBtn();
+              refreshPanelJobsOnly();
+            });
+          }, () => {
             resetFabDlBtn();
             refreshPanelJobsOnly();
           });

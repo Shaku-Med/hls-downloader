@@ -231,10 +231,27 @@ function renderJobsBanner(jobs, meta) {
     } else if (job.status === 'canceled') {
       d.textContent = job.error || 'Canceled';
     } else {
-      d.textContent = job.detail || job.error || '';
+      let detail = job.detail || job.error || '';
+      if (job.ffmpegPreset && ['queued', 'connecting', 'downloading'].includes(job.status)) {
+        detail = detail ? `${detail} · preset ${job.ffmpegPreset}` : `preset ${job.ffmpegPreset}`;
+      }
+      d.textContent = detail;
     }
     card.appendChild(t);
     card.appendChild(d);
+    if (typeof HLS_FFMPEG !== 'undefined' && HLS_FFMPEG.enhanceJobCard) {
+      HLS_FFMPEG.enhanceJobCard(job, card, {
+        onRefresh: () => {
+          chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
+            renderJobsBanner(response?.jobs || [], {
+              running: response?.running,
+              queueLength: response?.queueLength,
+              max: response?.max,
+            });
+          });
+        },
+      });
+    }
     if (job.outputPath && job.status === 'completed') {
       const p = document.createElement('div');
       p.className = 'job-path';
@@ -518,9 +535,10 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
 
     const field = document.createElement('div');
     field.className = 'field';
+    const isSubtitle = kind === 'subtitle';
     const lab = document.createElement('label');
     lab.setAttribute('for', `name-${i}`);
-    lab.textContent = 'File name (no .mp4)';
+    lab.textContent = isSubtitle ? 'File name (no .vtt)' : 'File name (no .mp4)';
     const row = document.createElement('div');
     row.className = 'row';
     const input = document.createElement('input');
@@ -658,19 +676,27 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
               origin: payload.origin,
             };
 
-            const startDl = (ytFmt) => {
-              const finalPayload = { ...payload };
+            const buildFinalPayload = (ytFmt, ffmpegPreset, extra = {}) => {
+              const finalPayload = { ...payload, ...extra };
               if (ytFmt) finalPayload.ytDlpFormat = ytFmt;
+              if (ffmpegPreset) finalPayload.ffmpegPreset = ffmpegPreset;
               const th = document.getElementById(`thumb-${i}`);
               if (pageOnly && th && th.checked) finalPayload.ytDlpWriteThumbnail = true;
+              return finalPayload;
+            };
+
+            const sendDownload = (finalPayload, onResult) => {
               chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload: finalPayload }, (r) => {
                 if (chrome.runtime.lastError) {
-                  resetDlUi();
-                  statusEl.style.display = 'block';
-                  statusEl.className = 'status err';
-                  statusEl.textContent = chrome.runtime.lastError.message;
+                  onResult({ ok: false, error: chrome.runtime.lastError.message });
                   return;
                 }
+                onResult(r || { ok: false });
+              });
+            };
+
+            const startDl = (ytFmt, ffmpegPreset, extra) => {
+              sendDownload(buildFinalPayload(ytFmt, ffmpegPreset, extra), (r) => {
                 if (!r?.ok) {
                   resetDlUi();
                   statusEl.style.display = 'block';
@@ -687,7 +713,55 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
               });
             };
 
-            maybeAskYtdlpFormat(kind, probePayload, startDl, () => {
+            maybeAskYtdlpFormat(kind, probePayload, (ytFmt) => {
+              const ffProbe = { ...probePayload, streamKind: kind };
+              const jobOutputPaths = {};
+              const ffCtx = {
+                filename,
+                ext: '.mp4',
+                onStart: (preset, cb) => {
+                  if (preset == null) {
+                    startDl(ytFmt, null);
+                    if (cb) cb(null, null);
+                    return;
+                  }
+                  sendDownload(buildFinalPayload(ytFmt, preset), (r) => {
+                    if (!r?.ok) {
+                      if (cb) cb(r?.error || 'Could not start', null);
+                      return;
+                    }
+                    if (r.jobId) jobOutputPaths[r.jobId] = '';
+                    if (cb) cb(null, r.jobId);
+                  });
+                },
+                onSwitch: ({ jobId, preset, deleteFile }, cb) => {
+                  chrome.runtime.sendMessage(
+                    {
+                      type: 'SWITCH_FFMPEG_PRESET',
+                      jobId,
+                      newPreset: preset,
+                      deleteFile,
+                      payload: buildFinalPayload(ytFmt, preset),
+                    },
+                    (r) => {
+                      if (chrome.runtime.lastError || !r?.ok) {
+                        if (cb) cb(chrome.runtime.lastError?.message || r?.error || 'Switch failed', null);
+                        return;
+                      }
+                      if (cb) cb(null, r.jobId);
+                    }
+                  );
+                },
+                getJobOutputPath: (jid) => jobOutputPaths[jid] || '',
+              };
+              const askFf =
+                typeof HLS_FFMPEG !== 'undefined' && HLS_FFMPEG.maybeAskFfmpegPreset
+                  ? HLS_FFMPEG.maybeAskFfmpegPreset.bind(HLS_FFMPEG)
+                  : (_k, _p, ctx) => ctx.onStart(null, () => {});
+              askFf(kind, ffProbe, ffCtx, () => {
+                resetDlUi();
+              });
+            }, () => {
               resetDlUi();
               statusEl.style.display = 'block';
               statusEl.className = 'status err';

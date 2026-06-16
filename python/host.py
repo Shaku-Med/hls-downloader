@@ -163,11 +163,35 @@ def send_message(data):
 
 
 def with_job_id(data, job_id):
-    if job_id:
-        d = {**data, "jobId": job_id}
-    else:
-        d = data
+    d = {**data, "jobId": job_id} if job_id else dict(data)
+    if job_id and d.get("type") == "progress" and "ffmpegPreset" not in d:
+        st = _JOB_LIVE.get(job_id) or {}
+        preset = (st.get("ffmpegPreset") or "").strip()
+        if preset:
+            d["ffmpegPreset"] = preset
     return d
+
+
+def _job_live_from_message(output, url, message) -> Dict[str, Any]:
+    live: Dict[str, Any] = {"output": output, "tsec": 0.0, "url": url}
+    raw_preset = (message.get("ffmpegPreset") or "").strip().lower()
+    if raw_preset:
+        live["ffmpegPreset"] = raw_preset
+    return live
+
+
+def _send_done_canceled(job_id: str, error: str = "Canceled") -> None:
+    payload: Dict[str, Any] = {
+        "type": "done",
+        "success": False,
+        "canceled": True,
+        "error": error,
+    }
+    st = _JOB_LIVE.get(job_id) or {}
+    out = (st.get("output") or "").strip()
+    if out and os.path.isfile(out):
+        payload["output"] = out
+    send_message(with_job_id(payload, job_id))
 
 
 _WIN_RESERVED = (
@@ -216,6 +240,26 @@ def _safe_output_path(download_dir, filename, ext=".mp4"):
     stem = _sanitize_filename_stem(filename)
     stem = _shorten_stem_for_windows(stem, download_dir, ext)
     return os.path.join(download_dir, f"{stem}{ext}")
+
+
+def _numbered_output_path(download_dir, filename, ext=".mp4") -> str:
+    """Next free path: stem (1).ext, stem (2).ext, … when base already exists."""
+    base = _safe_output_path(download_dir, filename, ext)
+    if not os.path.isfile(base):
+        return base
+    stem_full = os.path.splitext(base)[0]
+    ext_part = os.path.splitext(base)[1] or ext
+    for n in range(1, 10000):
+        candidate = f"{stem_full} ({n}){ext_part}"
+        if not os.path.isfile(candidate):
+            return candidate
+    return base
+
+
+def _resolve_output_path(message, out_dir: str, filename: str, ext: str = ".mp4") -> str:
+    if message and message.get("numberedOutput"):
+        return _numbered_output_path(out_dir, filename, ext)
+    return _safe_output_path(out_dir, filename, ext)
 
 
 def _yt_dlp_output_target(message: dict, out_dir: str, filename: str) -> str:
@@ -320,6 +364,14 @@ def _is_hls_input(url: str, message) -> bool:
     return sk in ("hls", "apple_hls", "hls_by_header", "m3u8", "m3u")
 
 
+def _is_dash_input(url: str, message) -> bool:
+    u = (url or "").lower()
+    if ".mpd" in u or re.search(r"\.mpd(?:$|[?#])", u):
+        return True
+    sk = (message.get("streamKind") or message.get("stream_kind") or "").strip().lower()
+    return sk in ("dash", "mpd")
+
+
 def _use_hls_aac_bsf(url: str, message) -> bool:
     """HLS fMP4/MPEG-TS+AAC to .mp4 often needs this; MP3-in-HLS must not use aac_adtstoasc."""
     u = (url or "").lower()
@@ -344,6 +396,334 @@ def _use_hls_aac_bsf(url: str, message) -> bool:
     if sk in ("direct", "dash", "mpd", "mp4", "webm", "yt", "social", "by_header", "other"):
         return False
     return False
+
+
+def _ffprobe_first_video_codec(path: str) -> str:
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if r.returncode != 0:
+            return ""
+        return ((r.stdout or "").strip().splitlines() or [""])[0].strip().lower()
+    except (subprocess.SubprocessError, OSError, IndexError):
+        return ""
+
+
+def _ffmpeg_mp4_to_ts_bsf_args(path: str) -> List[str]:
+    """Annex-B bitstream filter so MP4 parts concat cleanly through MPEG-TS."""
+    codec = _ffprobe_first_video_codec(path)
+    if codec in ("h264", "avc"):
+        return ["-bsf:v", "h264_mp4toannexb"]
+    if codec in ("hevc", "h265"):
+        return ["-bsf:v", "hevc_mp4toannexb"]
+    return []
+
+
+def _ffmpeg_hls_network_fflags() -> List[str]:
+    """Demux from network HLS: generate missing PTS only; discard corrupt packets.
+    Omit +igndts — rewriting DTS clashes with coded frame order in -c:v copy and
+    yields smeared/decoded freezes while audio stays fine."""
+    return ["-fflags", "+genpts+discardcorrupt"]
+
+
+def _ffmpeg_local_file_remux_fflags() -> List[str]:
+    """Local combined fMP4/TS blobs already carry fragment timestamps — do not synthesize PTS."""
+    return ["-fflags", "+discardcorrupt"]
+
+
+def _ffmpeg_concat_demux_fflags() -> List[str]:
+    """TS concat demuxer: keep timestamps from parts; concat step uses -reset_timestamps."""
+    return ["-fflags", "+discardcorrupt"]
+
+
+def _ffmpeg_copy_mux_fixup_args(for_mp4: bool = False) -> List[str]:
+    out: List[str] = [
+        "-avoid_negative_ts",
+        "auto",
+        "-max_muxing_queue_size",
+        "9999",
+    ]
+    if for_mp4:
+        out.extend(["-movflags", "+faststart"])
+    else:
+        out.extend(["-muxpreload", "0", "-muxdelay", "0"])
+    return out
+
+
+def _ffmpeg_force_stream_copy_hls_mp4() -> bool:
+    """If set, use -c copy for HLS/DASH→MP4 (faster but often smears/freezes on bad PTS)."""
+    v = (os.environ.get("HLS_GRABBER_FFMPEG_STREAM_COPY") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
+
+
+_FFMPEG_X264_ALLOWED_PRESETS = frozenset(
+    {
+        "ultrafast",
+        "superfast",
+        "veryfast",
+        "faster",
+        "fast",
+        "medium",
+        "slow",
+        "slower",
+        "veryslow",
+        "placebo",
+    }
+)
+_FFMPEG_X264_PRESET_ORDER: Tuple[str, ...] = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+)
+# Auto x264 preset tiers from duration/size (fastest → slowest along _FFMPEG_X264_PRESET_ORDER).
+_FFMPEG_AUTO_PRESET_DURATION_FAST_SEC = 3600.0
+_FFMPEG_AUTO_PRESET_SIZE_FAST_BYTES = 1_073_741_824  # 1 GiB
+
+
+def _ffmpeg_env_x264_crf_maxrate_mbps() -> Tuple[int, Optional[float]]:
+    """
+    Tune H.264 encode size vs quality vs CPU. Defaults favor smaller outputs than ultrafast+low-CRF
+    (which can inflate a ~1GB CDN encode to multi-GB AVC).
+
+    HLS_GRABBER_FFMPEG_CRF — integer roughly 18 (larger files) … 28 (smaller); default 24
+    HLS_GRABBER_FFMPEG_PRESET — optional fixed x264 preset; when unset, auto veryfast/fast
+    HLS_GRABBER_FFMPEG_VIDEO_MAX_MBPS — peak video bitrate cap, e.g. 8 (= 8 Mbit/s). Optional.
+    """
+    raw_crf = (os.environ.get("HLS_GRABBER_FFMPEG_CRF") or "").strip()
+    try:
+        crf = int(raw_crf) if raw_crf else 24
+    except ValueError:
+        crf = 24
+    crf = max(15, min(32, crf))
+
+    max_mbps: Optional[float] = None
+    raw_mr = (os.environ.get("HLS_GRABBER_FFMPEG_VIDEO_MAX_MBPS") or "").strip()
+    if raw_mr:
+        try:
+            max_mbps = float(raw_mr.replace(",", "."))
+            if max_mbps <= 0 or max_mbps > 200:
+                max_mbps = None
+        except ValueError:
+            max_mbps = None
+
+    return crf, max_mbps
+
+
+def _ffmpeg_env_preset_override() -> Optional[str]:
+    raw = (os.environ.get("HLS_GRABBER_FFMPEG_PRESET") or "").strip().lower()
+    if not raw:
+        return None
+    if raw in _FFMPEG_X264_ALLOWED_PRESETS:
+        return raw
+    return "fast"
+
+
+def _ffmpeg_auto_x264_preset(
+    duration_sec: float = 0.0, size_bytes: Optional[int] = None
+) -> str:
+    """Pick one of all x264 presets from duration/size (no env or user override)."""
+    dur = max(0.0, float(duration_sec or 0.0))
+    sz = int(size_bytes) if size_bytes is not None and size_bytes > 0 else 0
+    if dur >= 7200 or sz >= 4 * _FFMPEG_AUTO_PRESET_SIZE_FAST_BYTES:
+        return "medium"
+    if dur >= _FFMPEG_AUTO_PRESET_DURATION_FAST_SEC or sz >= _FFMPEG_AUTO_PRESET_SIZE_FAST_BYTES:
+        return "fast"
+    if dur >= 1800 or sz >= 512 * 1024 * 1024:
+        return "faster"
+    if dur >= 600 or sz >= 200 * 1024 * 1024:
+        return "veryfast"
+    if dur >= 180 or sz >= 50 * 1024 * 1024:
+        return "superfast"
+    return "ultrafast"
+
+
+def _ffmpeg_resolve_x264_preset(
+    message,
+    duration_sec: float = 0.0,
+    size_bytes: Optional[int] = None,
+) -> str:
+    """Env override, then message.ffmpegPreset, then auto duration/size."""
+    env = _ffmpeg_env_preset_override()
+    if env:
+        return env
+    if message:
+        raw = (message.get("ffmpegPreset") or "").strip().lower()
+        if raw in _FFMPEG_X264_ALLOWED_PRESETS:
+            return raw
+    return _ffmpeg_auto_x264_preset(duration_sec, size_bytes)
+
+
+def _ffmpeg_auto_preset_reason(duration_sec: float, size_bytes: Optional[int]) -> str:
+    dur = max(0.0, float(duration_sec or 0.0))
+    sz = int(size_bytes) if size_bytes is not None and size_bytes > 0 else 0
+    parts: List[str] = []
+    if dur >= 7200:
+        parts.append("duration ≥ 2 hours")
+    elif dur >= _FFMPEG_AUTO_PRESET_DURATION_FAST_SEC:
+        parts.append("duration ≥ 1 hour")
+    elif dur >= 1800:
+        parts.append("duration ≥ 30 min")
+    elif dur >= 600:
+        parts.append("duration ≥ 10 min")
+    elif dur >= 180:
+        parts.append("duration ≥ 3 min")
+    elif dur > 0.5:
+        parts.append("short clip")
+    if sz >= 4 * _FFMPEG_AUTO_PRESET_SIZE_FAST_BYTES:
+        parts.append("size ≥ 4 GB")
+    elif sz >= _FFMPEG_AUTO_PRESET_SIZE_FAST_BYTES:
+        parts.append("size ≥ 1 GB")
+    elif sz >= 512 * 1024 * 1024:
+        parts.append("size ≥ 512 MB")
+    elif sz >= 200 * 1024 * 1024:
+        parts.append("size ≥ 200 MB")
+    elif sz >= 50 * 1024 * 1024:
+        parts.append("size ≥ 50 MB")
+    if not parts:
+        return "very small / unknown source"
+    return ", ".join(parts)
+
+
+def _ffmpeg_download_needs_x264_reencode(url: str, message) -> bool:
+    """True when this job will re-encode HLS/DASH to MP4 (not yt-dlp or stream-copy)."""
+    page_for_social = (message.get("pageUrl") or message.get("referer") or "").strip()
+    if _social_platform_for_yt_dlp(url, page_for_social, message):
+        return False
+    if _ffmpeg_force_stream_copy_hls_mp4():
+        return False
+    if _ffmpeg_preferred_container_ext(url, message) != ".mp4":
+        return False
+    return _is_hls_input(url, message) or _is_dash_input(url, message)
+
+
+def _ffmpeg_pick_x264_preset(
+    duration_sec: float = 0.0, size_bytes: Optional[int] = None
+) -> str:
+    """Pick x264 preset from duration/size unless HLS_GRABBER_FFMPEG_PRESET is set."""
+    override = _ffmpeg_env_preset_override()
+    if override:
+        return override
+    return _ffmpeg_auto_x264_preset(duration_sec, size_bytes)
+
+
+def _message_media_hints(message) -> Tuple[float, Optional[int]]:
+    """Optional duration/size hints from the extension message."""
+    dur = 0.0
+    size: Optional[int] = None
+    if not message:
+        return dur, size
+    for key in ("duration", "durationSec", "duration_sec", "mediaDuration"):
+        v = message.get(key)
+        if v is not None:
+            try:
+                dur = max(dur, float(v))
+            except (TypeError, ValueError):
+                pass
+    for key in ("fileSize", "file_size", "contentLength", "size"):
+        v = message.get(key)
+        if v is not None:
+            try:
+                n = int(v)
+                if n > 0:
+                    size = max(size or 0, n)
+            except (TypeError, ValueError):
+                pass
+    return dur, size
+
+
+def _ffmpeg_x264_vencode_core_argv(*, preset: Optional[str] = None) -> List[str]:
+    crf, max_mb = _ffmpeg_env_x264_crf_maxrate_mbps()
+    effective_preset = preset or _ffmpeg_pick_x264_preset()
+    argv: List[str] = [
+        "-c:v",
+        "libx264",
+        "-preset",
+        effective_preset,
+        "-crf",
+        str(crf),
+        "-pix_fmt",
+        "yuv420p",
+    ]
+    if max_mb is not None:
+        argv.extend(
+            ["-maxrate", f"{max_mb}M", "-bufsize", f"{max_mb * 2:.4g}M"]
+        )
+    return argv
+
+
+def _ffmpeg_transcode_stable_mp4_from_url(
+    url, message, *, preset: Optional[str] = None
+) -> List[str]:
+    """Decode+re-encode video; audio copy. Fixes corrupt reference chains from -c copy HLS mux."""
+    out: List[str] = [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        *_ffmpeg_x264_vencode_core_argv(preset=preset),
+        "-c:a",
+        "copy",
+    ]
+    if _use_hls_aac_bsf(url, message):
+        out.extend(["-bsf:a", "aac_adtstoasc"])
+    return out
+
+
+def _ffmpeg_transcode_stable_mp4_from_combined_file(
+    container: str, *, preset: Optional[str] = None
+) -> List[str]:
+    out: List[str] = [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        *_ffmpeg_x264_vencode_core_argv(preset=preset),
+        "-c:a",
+        "copy",
+    ]
+    if container == "ts":
+        out.extend(["-bsf:a", "aac_adtstoasc"])
+    return out
+
+
+def _ffmpeg_transcode_stable_mp4_concat_merge(
+    *, preset: Optional[str] = None
+) -> List[str]:
+    return [
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        *_ffmpeg_x264_vencode_core_argv(preset=preset),
+        "-c:a",
+        "copy",
+        "-bsf:a",
+        "aac_adtstoasc",
+    ]
 
 
 def _ffmpeg_preferred_container_ext(url: str, message) -> str:
@@ -1266,6 +1646,38 @@ def _parse_hls_media_segments(
     return out
 
 
+def _hls_playlist_duration_seconds(playlist_text: str) -> float:
+    total = 0.0
+    for raw_line in (playlist_text or "").splitlines():
+        line = raw_line.strip()
+        if not line.upper().startswith("#EXTINF:"):
+            continue
+        rest = line.split(":", 1)[1]
+        dur_str = rest.split(",", 1)[0].strip()
+        try:
+            total += max(0.0, float(dur_str))
+        except ValueError:
+            continue
+    return total
+
+
+def _hls_playlist_estimated_size_bytes(
+    playlist_text: str, playlist_url: str
+) -> Optional[int]:
+    """Sum #EXT-X-BYTERANGE lengths when present; None if segments have no size hints."""
+    entries = _parse_hls_media_segments(playlist_text, playlist_url)
+    if not entries:
+        return None
+    total = 0
+    has_estimate = False
+    for _seg_url, byte_range in entries:
+        if byte_range is None:
+            continue
+        total += int(byte_range[1])
+        has_estimate = True
+    return total if has_estimate and total > 0 else None
+
+
 def _find_mpegts_payload_start(data: bytes, start: int = 0) -> int:
     return _find_best_mpegts_start(data, start)
 
@@ -1349,6 +1761,89 @@ def _http_get_bytes(
 def _http_get_text(url: str, header_block: str, timeout: float = 60.0) -> str:
     return _http_get_bytes(url, header_block, max_bytes=None, timeout=timeout).decode(
         "utf-8", errors="replace"
+    )
+
+
+def _looks_like_vtt_url(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if not u:
+        return False
+    path = (urlsplit(u).path or "").lower()
+    if path.endswith(".vtt"):
+        return True
+    if re.search(r"[?&](format|ext|type|mime)=([^&#]*vtt|text%2Fvtt)(&|$)", u):
+        return True
+    return False
+
+
+def _download_vtt_immediate(url: str, message: dict, out_dir: str, filename: str, job_id: str) -> None:
+    output_path = _safe_output_path(out_dir, filename, ".vtt")
+    send_message(
+        with_job_id(
+            {
+                "type": "progress",
+                "phase": "starting",
+                "detail": "Fetching VTT subtitle...",
+                "output": output_path,
+            },
+            job_id,
+        )
+    )
+    header_block = build_ffmpeg_header_block(message, url)
+    try:
+        data = _http_get_bytes(url, header_block, timeout=60.0)
+    except Exception as e:
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": f"VTT request failed: {e}",
+                },
+                job_id,
+            )
+        )
+        return
+
+    if not data:
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": "VTT request returned an empty response.",
+                },
+                job_id,
+            )
+        )
+        return
+
+    try:
+        with open(output_path, "wb") as f:
+            f.write(data)
+    except OSError as e:
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": f"Could not save VTT file: {e}",
+                },
+                job_id,
+            )
+        )
+        return
+
+    send_message(
+        with_job_id(
+            {
+                "type": "done",
+                "success": True,
+                "output": output_path,
+                "detail": "Subtitle saved",
+            },
+            job_id,
+        )
     )
 
 
@@ -1671,15 +2166,30 @@ def _ffmpeg_remux_combined_to_output(
     job_id: str,
     *,
     container: str,
+    message: Optional[dict] = None,
 ) -> None:
-    """ffmpeg -i combined.{ts,mp4} -c copy to output; AAC BSF for MPEG-TS only."""
+    """ffmpeg mux combined TS/fMP4 to MP4; default re-encodes video for stable PTS/GOP."""
     global _active_ffmpeg
+    out_mp4 = output_path.lower().endswith(".mp4")
+    transcoding = out_mp4 and not _ffmpeg_force_stream_copy_hls_mp4()
+    preset = ""
+    if transcoding:
+        ld, ls = _local_file_format_hints(combined_path)
+        preset = _ffmpeg_resolve_x264_preset(message, ld, ls)
     send_message(
         with_job_id(
             {
                 "type": "progress",
                 "phase": "encoding",
-                "detail": "Remuxing to MP4 (ffmpeg)…",
+                "detail": (
+                    f"Re-encoding video to MP4 (x264 preset {preset})…"
+                    if transcoding and preset
+                    else (
+                        "Re-encoding video to MP4 (ffmpeg)…"
+                        if transcoding
+                        else "Remuxing to MP4 (ffmpeg)…"
+                    )
+                ),
                 "output": output_path,
             },
             job_id,
@@ -1692,13 +2202,20 @@ def _ffmpeg_remux_combined_to_output(
         "-loglevel",
         "info",
         "-stats",
+        *_ffmpeg_local_file_remux_fflags(),
         "-i",
         combined_path,
-        "-c",
-        "copy",
     ]
-    if container == "ts":
-        cmd.extend(["-bsf:a", "aac_adtstoasc"])
+    if transcoding:
+        if not preset:
+            ld, ls = _local_file_format_hints(combined_path)
+            preset = _ffmpeg_resolve_x264_preset(message, ld, ls)
+        cmd.extend(_ffmpeg_transcode_stable_mp4_from_combined_file(container, preset=preset))
+    else:
+        cmd.extend(["-c", "copy"])
+        if container == "ts":
+            cmd.extend(["-bsf:a", "aac_adtstoasc"])
+    cmd.extend(_ffmpeg_copy_mux_fixup_args(for_mp4=out_mp4))
     cmd.append(output_path)
     try:
         proc = subprocess.Popen(
@@ -2050,7 +2567,7 @@ def _download_clean_hls_no_strip(
             return
 
         _ffmpeg_remux_combined_to_output(
-            combined_path, output_path, job_id, container=container
+            combined_path, output_path, job_id, container=container, message=message
         )
     finally:
         _clear_active_if(proc)
@@ -2292,7 +2809,7 @@ def _download_obfuscated_hls(
             return
 
         _ffmpeg_remux_combined_to_output(
-            combined_path, output_path, job_id, container=container
+            combined_path, output_path, job_id, container=container, message=message
         )
     finally:
         _clear_active_if(proc)
@@ -2314,13 +2831,16 @@ def _build_ffmpeg_cmd_list(
         "info",
         "-stats",
     ]
+    seek_after_input = False
+    seek_sec = 0.0
     # HLS: default live_start_index is -3 (near live edge) which can make ffmpeg only
     # follow a short sliding window. Force start from the first listed segment, reload
     # playlists longer, and retry flaky segments (without TCP reconnect flags  they
     # destabilize some CDNs).
     if _is_hls_input(url, message):
         if resume_from_sec and resume_from_sec > 0.05:
-            pre.extend(["-ss", f"{float(resume_from_sec):.3f}"])
+            seek_after_input = True
+            seek_sec = float(resume_from_sec)
         pre.extend(
             [
                 "-allowed_extensions",
@@ -2333,8 +2853,7 @@ def _build_ffmpeg_cmd_list(
                 "200M",
                 "-probesize",
                 "200M",
-                "-fflags",
-                "+genpts",
+                *_ffmpeg_hls_network_fflags(),
                 "-f",
                 "hls",
                 "-live_start_index",
@@ -2355,14 +2874,91 @@ def _build_ffmpeg_cmd_list(
             url,
         ]
     )
-    cmd = pre + [
-        "-c",
-        "copy",
-    ]
-    if _use_hls_aac_bsf(url, message):
-        cmd.extend(["-bsf:a", "aac_adtstoasc"])
+    cmd = list(pre)
+    if seek_after_input:
+        cmd.extend(["-ss", f"{seek_sec:.3f}"])
+    out_mp4 = output_path.lower().endswith(".mp4")
+    preset = ""
+    if (
+        (_is_hls_input(url, message) or _is_dash_input(url, message))
+        and out_mp4
+        and not _ffmpeg_force_stream_copy_hls_mp4()
+    ):
+        preset = _ffmpeg_probe_transcode_preset(url, message, header_block)
+        cmd.extend(_ffmpeg_transcode_stable_mp4_from_url(url, message, preset=preset))
+    else:
+        cmd.extend(["-c", "copy"])
+        if _use_hls_aac_bsf(url, message):
+            cmd.extend(["-bsf:a", "aac_adtstoasc"])
+    cmd.extend(_ffmpeg_copy_mux_fixup_args(for_mp4=out_mp4))
     cmd.append(output_path)
-    return cmd
+    return cmd, preset if "preset" in locals() else ""
+
+
+def _handle_ffmpeg_encode_preset_probe(message: dict) -> None:
+    """Probe duration/size and return recommended x264 preset for UI picker."""
+    req_id = (message.get("requestId") or "").strip()
+    url = (message.get("url") or "").strip()
+
+    def reply(**fields: Any) -> None:
+        send_message({"type": "ffmpeg_encode_preset_result", "requestId": req_id, **fields})
+
+    if not url:
+        reply(success=False, error="No URL", applies=False)
+        return
+    if not _ffmpeg_download_needs_x264_reencode(url, message):
+        reply(success=True, applies=False)
+        return
+    env_locked = _ffmpeg_env_preset_override()
+    header_block = build_ffmpeg_header_block(message, url)
+    try:
+        dur, size = _ffmpeg_probe_transcode_stats(url, message, header_block)
+    except (urllib.error.URLError, OSError, ValueError, UnicodeError) as e:
+        reply(success=False, error=str(e), applies=True)
+        return
+    recommended = (
+        env_locked
+        if env_locked
+        else _ffmpeg_resolve_x264_preset(message, dur, size)
+    )
+    reply(
+        success=True,
+        applies=True,
+        recommendedPreset=recommended,
+        allowedPresets=list(_FFMPEG_X264_PRESET_ORDER),
+        durationSec=dur,
+        sizeBytes=size,
+        envLocked=bool(env_locked),
+        autoReason=_ffmpeg_auto_preset_reason(dur, size),
+    )
+
+
+def _handle_delete_output_file(message: dict) -> None:
+    """Delete a partial/finished output file under the user's save folder (UI restart flow)."""
+    req_id = (message.get("requestId") or "").strip()
+    path = (message.get("path") or "").strip()
+    out_dir = (message.get("outputDirectory") or message.get("outputDir") or "").strip()
+
+    def reply(**fields: Any) -> None:
+        send_message({"type": "delete_output_file_result", "requestId": req_id, **fields})
+
+    if not path or not out_dir:
+        reply(success=False, error="Missing path or outputDirectory")
+        return
+    try:
+        ap = os.path.abspath(path)
+        ad = os.path.abspath(out_dir)
+        if not (ap == ad or ap.startswith(ad + os.sep)):
+            reply(success=False, error="Path is outside the configured save folder")
+            return
+        removed: List[str] = []
+        for candidate in (path, path + ".part", path + ".cont.mp4"):
+            if candidate and os.path.isfile(candidate):
+                os.remove(candidate)
+                removed.append(os.path.basename(candidate))
+        reply(success=True, removed=removed)
+    except OSError as e:
+        reply(success=False, error=str(e))
 
 
 def _ffprobe_duration_seconds(path: str) -> float:
@@ -2389,6 +2985,111 @@ def _ffprobe_duration_seconds(path: str) -> float:
         return max(0.0, float((r.stdout or "").strip().splitlines()[0]))
     except (ValueError, subprocess.SubprocessError, OSError, IndexError):
         return 0.0
+
+
+def _local_file_format_hints(path: str) -> Tuple[float, Optional[int]]:
+    dur = _ffprobe_duration_seconds(path)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = None
+    return dur, size
+
+
+def _ffprobe_url_format_hints(url: str, header_block: str) -> Tuple[float, Optional[int]]:
+    if not url or not shutil.which("ffprobe"):
+        return 0.0, None
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-headers",
+                header_block,
+                "-show_entries",
+                "format=duration,size",
+                "-of",
+                "json",
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+        if r.returncode != 0:
+            return 0.0, None
+        data = json.loads(r.stdout or "{}")
+        fmt = data.get("format") or {}
+        dur = 0.0
+        raw_d = fmt.get("duration")
+        if raw_d is not None:
+            try:
+                dur = max(0.0, float(raw_d))
+            except (TypeError, ValueError):
+                pass
+        size: Optional[int] = None
+        raw_s = fmt.get("size")
+        if raw_s is not None:
+            try:
+                n = int(raw_s)
+                if n > 0:
+                    size = n
+            except (TypeError, ValueError):
+                pass
+        return dur, size
+    except (
+        FileNotFoundError,
+        ValueError,
+        json.JSONDecodeError,
+        subprocess.SubprocessError,
+        OSError,
+    ):
+        return 0.0, None
+
+
+def _ffmpeg_probe_transcode_stats(
+    url,
+    message,
+    header_block,
+    *,
+    local_path: Optional[str] = None,
+) -> Tuple[float, Optional[int]]:
+    """Inspect source duration/size for preset selection."""
+    dur, size = _message_media_hints(message)
+    if local_path and os.path.isfile(local_path):
+        ld, ls = _local_file_format_hints(local_path)
+        dur = max(dur, ld)
+        if ls:
+            size = max(size or 0, ls) or ls
+    if _is_hls_input(url, message):
+        try:
+            var_url, var_text = _resolve_variant_playlist_url(url, header_block)
+            dur = max(dur, _hls_playlist_duration_seconds(var_text))
+            est = _hls_playlist_estimated_size_bytes(var_text, var_url)
+            if est:
+                size = max(size or 0, est) or est
+        except (urllib.error.URLError, OSError, ValueError, UnicodeError):
+            pass
+    if dur <= 0.05 or size is None:
+        ud, us = _ffprobe_url_format_hints(url, header_block)
+        dur = max(dur, ud)
+        if us:
+            size = max(size or 0, us) or us
+    return dur, size
+
+
+def _ffmpeg_probe_transcode_preset(
+    url,
+    message,
+    header_block,
+    *,
+    local_path: Optional[str] = None,
+) -> str:
+    dur, size = _ffmpeg_probe_transcode_stats(
+        url, message, header_block, local_path=local_path
+    )
+    return _ffmpeg_resolve_x264_preset(message, dur, size)
 
 
 def _ffprobe_video_validation(path: str) -> Tuple[float, bool]:
@@ -2562,7 +3263,9 @@ def _verify_yt_dlp_audio_output(output_path: str) -> Tuple[bool, str]:
     return True, ""
 
 
-def _ffmpeg_concat_two_mp4_to_one(part_a: str, part_b: str, out_final: str) -> bool:
+def _ffmpeg_concat_two_mp4_to_one(
+    part_a: str, part_b: str, out_final: str, *, message: Optional[dict] = None
+) -> bool:
     d = os.path.dirname(os.path.abspath(out_final)) or "."
     fd, t1 = tempfile.mkstemp(suffix=".ts", dir=d, prefix="hgr_")
     os.close(fd)
@@ -2571,12 +3274,36 @@ def _ffmpeg_concat_two_mp4_to_one(part_a: str, part_b: str, out_final: str) -> b
     list_path = out_final + ".concat.txt"
     try:
         r1 = subprocess.run(
-            ["ffmpeg", "-y", "-nostdin", "-i", part_a, "-c", "copy", "-f", "mpegts", t1],
+            [
+                "ffmpeg",
+                "-y",
+                "-nostdin",
+                "-i",
+                part_a,
+                "-c",
+                "copy",
+                *_ffmpeg_mp4_to_ts_bsf_args(part_a),
+                "-f",
+                "mpegts",
+                t1,
+            ],
             capture_output=True,
             timeout=3600,
         )
         r2 = subprocess.run(
-            ["ffmpeg", "-y", "-nostdin", "-i", part_b, "-c", "copy", "-f", "mpegts", t2],
+            [
+                "ffmpeg",
+                "-y",
+                "-nostdin",
+                "-i",
+                part_b,
+                "-c",
+                "copy",
+                *_ffmpeg_mp4_to_ts_bsf_args(part_b),
+                "-f",
+                "mpegts",
+                t2,
+            ],
             capture_output=True,
             timeout=3600,
         )
@@ -2587,19 +3314,35 @@ def _ffmpeg_concat_two_mp4_to_one(part_a: str, part_b: str, out_final: str) -> b
         with open(list_path, "w", encoding="utf-8", newline="\n") as f:
             f.write(f"file '{p1}'\nfile '{p2}'\n")
         tmp = out_final + ".merging.mp4"
+        use_merge_copy = _ffmpeg_force_stream_copy_hls_mp4()
+        if use_merge_copy:
+            merge_mid: List[str] = ["-c", "copy", "-bsf:a", "aac_adtstoasc"]
+            merge_mid.extend(["-reset_timestamps", "1"])
+        else:
+            da, sa = _local_file_format_hints(part_a)
+            db, sb = _local_file_format_hints(part_b)
+            total_dur = da + db
+            total_size = (sa or 0) + (sb or 0)
+            preset = _ffmpeg_resolve_x264_preset(
+                message,
+                total_dur,
+                total_size if total_size > 0 else None,
+            )
+            merge_mid = list(_ffmpeg_transcode_stable_mp4_concat_merge(preset=preset))
         r3 = subprocess.run(
             [
                 "ffmpeg",
                 "-y",
                 "-nostdin",
+                *_ffmpeg_concat_demux_fflags(),
                 "-f",
                 "concat",
                 "-safe",
                 "0",
                 "-i",
                 list_path,
-                "-c",
-                "copy",
+                *merge_mid,
+                *_ffmpeg_copy_mux_fixup_args(for_mp4=True),
                 tmp,
             ],
             capture_output=True,
@@ -2716,7 +3459,12 @@ def _handle_hls_auth_refresh(new_message: dict) -> None:
     )
 
     header_block = build_ffmpeg_header_block(new_message, new_url)
-    cmd = _build_ffmpeg_cmd_list(
+    st_refresh = _JOB_LIVE.get(job_id) or {}
+    stored_preset = (st_refresh.get("ffmpegPreset") or "").strip().lower()
+    if stored_preset in _FFMPEG_X264_ALLOWED_PRESETS and not (new_message.get("ffmpegPreset") or "").strip():
+        new_message = dict(new_message)
+        new_message["ffmpegPreset"] = stored_preset
+    cmd, _x264_preset = _build_ffmpeg_cmd_list(
         new_url, new_message, cont_path, header_block, resume_from_sec=offset
     )
     cproc: Optional[subprocess.Popen] = None
@@ -2826,7 +3574,7 @@ def _handle_hls_auth_refresh(new_message: dict) -> None:
             job_id,
         )
     )
-    if not _ffmpeg_concat_two_mp4_to_one(out_path, cont_path, out_path):
+    if not _ffmpeg_concat_two_mp4_to_one(out_path, cont_path, out_path, message=new_message):
         _SILENCE_FFMPEG_DONE.discard(job_id)
         send_message(
             with_job_id(
@@ -2904,8 +3652,14 @@ def run_ffmpeg_with_updates(url, filename, message):
         low = (filename or "").strip().lower()
         if low in ("video", "stream", "download", "audio", "track"):
             effective_filename = _spotify_filename_hint(url, page_for_social, filename)
+    if _looks_like_vtt_url(url):
+        _download_vtt_immediate(url, message, out_dir, effective_filename, job_id)
+        if _CURRENT_JOB_ID == job_id:
+            _CURRENT_JOB_ID = ""
+        return
+
     out_ext = _ffmpeg_preferred_container_ext(url, message)
-    output_path = _safe_output_path(out_dir, effective_filename, out_ext)
+    output_path = _resolve_output_path(message, out_dir, effective_filename, out_ext)
 
     proc: Optional[subprocess.Popen] = None
     try:
@@ -2939,12 +3693,14 @@ def run_ffmpeg_with_updates(url, filename, message):
                 )
                 return
             ytdlp_out = _yt_dlp_output_target(message, out_dir, effective_filename)
-            _JOB_LIVE[job_id] = {"output": ytdlp_out, "tsec": 0.0, "url": url}
+            _JOB_LIVE[job_id] = _job_live_from_message(ytdlp_out, url, message)
             run_yt_dlp_with_updates(url, message, ytdlp_out, job_id, platform_label)
             return
 
         header_block = build_ffmpeg_header_block(message, url)
-        cmd = _build_ffmpeg_cmd_list(url, message, output_path, header_block, resume_from_sec=0.0)
+        cmd, x264_preset = _build_ffmpeg_cmd_list(
+            url, message, output_path, header_block, resume_from_sec=0.0
+        )
 
         if _is_hls_input(url, message):
             send_message(
@@ -2976,7 +3732,7 @@ def run_ffmpeg_with_updates(url, filename, message):
                 except Exception:
                     clean_kind = None
                 if clean_kind == "fmp4":
-                    _JOB_LIVE[job_id] = {"output": output_path, "tsec": 0.0, "url": url}
+                    _JOB_LIVE[job_id] = _job_live_from_message(output_path, url, message)
                     _download_clean_hls_no_strip(
                         message,
                         output_path,
@@ -2997,7 +3753,7 @@ def run_ffmpeg_with_updates(url, filename, message):
             except Exception:
                 ob_kind = None
             if ob_kind:
-                _JOB_LIVE[job_id] = {"output": output_path, "tsec": 0.0, "url": url}
+                _JOB_LIVE[job_id] = _job_live_from_message(output_path, url, message)
                 _download_obfuscated_hls(
                     url,
                     message,
@@ -3009,12 +3765,15 @@ def run_ffmpeg_with_updates(url, filename, message):
                 )
                 return
 
+        start_detail = "Starting ffmpeg"
+        if x264_preset:
+            start_detail = f"Starting ffmpeg (x264 preset {x264_preset})"
         send_message(
             with_job_id(
                 {
                     "type": "progress",
                     "phase": "starting",
-                    "detail": "Starting ffmpeg",
+                    "detail": start_detail,
                     "output": output_path,
                 },
                 job_id,
@@ -3046,7 +3805,10 @@ def run_ffmpeg_with_updates(url, filename, message):
 
         with _PROC_LOCK:
             _active_ffmpeg = proc
-        _JOB_LIVE[job_id] = {"output": output_path, "tsec": 0.0, "url": url}
+        live: Dict[str, Any] = _job_live_from_message(output_path, url, message)
+        if x264_preset and "ffmpegPreset" not in live:
+            live["ffmpegPreset"] = x264_preset
+        _JOB_LIVE[job_id] = live
 
         stderr_lines = []
         last_send = 0.0
@@ -3110,17 +3872,7 @@ def run_ffmpeg_with_updates(url, filename, message):
             return
         tail = "".join(stderr_lines[-30:]).strip()
         if _CANCEL_EVENT.is_set():
-            send_message(
-                with_job_id(
-                    {
-                        "type": "done",
-                        "success": False,
-                        "canceled": True,
-                        "error": "Canceled",
-                    },
-                    job_id,
-                )
-            )
+            _send_done_canceled(job_id)
             return
         if code == 0:
             send_message(
@@ -3166,6 +3918,20 @@ def main():
         if mtype == "ytdlp_formats":
             threading.Thread(
                 target=_handle_ytdlp_formats,
+                args=(message,),
+                daemon=True,
+            ).start()
+            continue
+        if mtype == "ffmpeg_encode_preset":
+            threading.Thread(
+                target=_handle_ffmpeg_encode_preset_probe,
+                args=(message,),
+                daemon=True,
+            ).start()
+            continue
+        if mtype == "delete_output_file":
+            threading.Thread(
+                target=_handle_delete_output_file,
                 args=(message,),
                 daemon=True,
             ).start()

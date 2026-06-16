@@ -30,6 +30,14 @@
       <div class="hint">Default is off. The floating panel will still show an Images list for download/preview; this toggle only controls the hover highlight + popover.</div>
     </div>
     <div class="row">
+      <label for="ffmpeg-preset-mode">HLS / DASH re-encode speed</label>
+      <select id="ffmpeg-preset-mode" style="width: 100%; padding: 10px 12px; font-size: 14px; border: 1px solid #d6d3d1; border-radius: 8px; background: #fff;">
+        <option value="auto">Auto (pick from all x264 presets by length/size)</option>
+        <option value="ask">Ask before download — dropdown with all presets</option>
+      </select>
+      <div class="hint">Applies when ffmpeg re-encodes HLS/DASH to MP4. Presets from ultrafast → placebo; long/large sources auto-pick slower presets. You can switch mid-download and choose whether to delete the partial file or save as <code>name (1).mp4</code>.</div>
+    </div>
+    <div class="row">
       <label for="ytdlp-quality">Social / yt-dlp quality</label>
       <select id="ytdlp-quality" style="width: 100%; padding: 10px 12px; font-size: 14px; border: 1px solid #d6d3d1; border-radius: 8px; background: #fff;">
         <option value="auto">Use best video + best audio (merged automatically)</option>
