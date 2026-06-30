@@ -7,6 +7,10 @@
   const THEME_ACCENT_KEY = 'uiThemeAccent';
   const MIN_SIZE = 28;
   const HIDE_DELAY_MS = 180;
+  // How long the pointer must rest on a *different* image before the popover
+  // moves to it. Stops neighbouring grid thumbnails from stealing focus while
+  // you're just on your way to click Download.
+  const SWITCH_DELAY_MS = 220;
   const MAX_LIST = 80;
   const MAX_HOVER_SCAN = 220;
   const BOX_REFRESH_MS = 450;
@@ -82,12 +86,21 @@
         font-size: 12px;
         outline: none;
       }
+      :host([data-theme-mode="page"]) select {
+        background: var(--sg-accent);
+        color: var(--sg-btnText);
+        border-color: color-mix(in srgb, var(--sg-accent) 72%, var(--sg-line) 28%);
+      }
+      :host([data-theme-mode="page"]) select option {
+        background: var(--sg-accent);
+        color: var(--sg-btnText);
+      }
       button.dl {
         padding: 9px 12px;
         border-radius: 12px;
-        border: 1px solid rgba(255,255,255,.14);
+        border: 1px solid color-mix(in srgb, var(--sg-accent) 70%, transparent 30%);
         background: linear-gradient(180deg, var(--sg-accent, #2563eb) 0%, var(--sg-accent-2, #1d4ed8) 100%);
-        color: #fff;
+        color: var(--sg-btnText, #fff);
         cursor: pointer;
         font-size: 12px;
         font-weight: 700;
@@ -132,36 +145,64 @@
   const elClose = shadow.getElementById('x');
 
   function applyTheme(mode, accent) {
-    const prefersDark = (() => {
-      try {
-        return window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-      } catch (_) {
-        return true;
-      }
-    })();
-    const resolved = mode === 'light' || mode === 'dark' ? mode : prefersDark ? 'dark' : 'light';
-    const palette = {
-      blue: ['#2563eb', '#1d4ed8'],
-      violet: ['#8b5cf6', '#7c3aed'],
-      emerald: ['#10b981', '#059669'],
-      rose: ['#f43f5e', '#e11d48'],
-      orange: ['#f97316', '#ea580c'],
+    const themeApi = window.HGR_THEME;
+    const varMap = {
+      bg: '--sg-bg',
+      surface: '--sg-surface',
+      text: '--sg-text',
+      muted: '--sg-muted',
+      line: '--sg-line',
+      accent: '--sg-accent',
+      accent2: '--sg-accent-2',
+      btnText: '--sg-btnText',
     };
-    const c = palette[accent] || palette.blue;
-    host.style.setProperty('--sg-accent', c[0]);
-    host.style.setProperty('--sg-accent-2', c[1]);
-    if (resolved === 'dark') {
-      host.style.setProperty('--sg-surface', 'rgba(15, 23, 42, 0.92)');
-      host.style.setProperty('--sg-text', '#e6e9ef');
-      host.style.setProperty('--sg-line', 'rgba(255,255,255,.16)');
-      host.style.setProperty('--sg-muted', 'rgba(230,233,239,.74)');
-    } else {
-      host.style.setProperty('--sg-surface', 'rgba(255, 255, 255, 0.96)');
-      host.style.setProperty('--sg-text', '#0f172a');
-      host.style.setProperty('--sg-line', 'rgba(15, 23, 42, 0.16)');
-      host.style.setProperty('--sg-muted', 'rgba(15, 23, 42, 0.60)');
+    let resolved = 'dark';
+    if (themeApi) {
+      resolved = themeApi.applyThemeToHost(host, mode, accent, varMap);
     }
-    elHL.style.boxShadow = `0 0 0 3px ${resolved === 'dark' ? 'rgba(255,255,255,.08)' : 'rgba(37,99,235,.18)'}`;
+    updateImageHoverChrome(resolved, mode);
+  }
+
+  function updateImageHoverChrome(resolved, mode) {
+    elHL.style.borderColor = 'var(--sg-accent, #2563eb)';
+    elHL.style.boxShadow =
+      mode === 'page'
+        ? '0 0 0 3px color-mix(in srgb, var(--sg-accent) 22%, transparent)'
+        : resolved === 'dark'
+          ? '0 0 0 3px rgba(255,255,255,.08)'
+          : '0 0 0 3px rgba(37,99,235,.18)';
+  }
+
+  let unbindImageTheme = null;
+  if (window.HGR_THEME && window.HGR_THEME.bindLiveThemeHost) {
+    unbindImageTheme = window.HGR_THEME.bindLiveThemeHost(
+      host,
+      {
+        bg: '--sg-bg',
+        surface: '--sg-surface',
+        text: '--sg-text',
+        muted: '--sg-muted',
+        line: '--sg-line',
+        accent: '--sg-accent',
+        accent2: '--sg-accent-2',
+        btnText: '--sg-btnText',
+      },
+      (resolved, mode) => updateImageHoverChrome(resolved, mode)
+    );
+  } else {
+    chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
+      if (chrome.runtime.lastError) return;
+      applyTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+      if (changes[THEME_MODE_KEY] || changes[THEME_ACCENT_KEY]) {
+        chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
+          if (chrome.runtime.lastError) return;
+          applyTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
+        });
+      }
+    });
   }
 
   function isImgGood(img) {
@@ -456,6 +497,16 @@
   let _lastBoxesAt = 0;
   let _rafId = 0;
   let _lastHoverUrl = '';
+  let _switchTimer = 0;
+  let _pendingImg = null;
+
+  function clearPendingSwitch() {
+    if (_switchTimer) {
+      window.clearTimeout(_switchTimer);
+      _switchTimer = 0;
+    }
+    _pendingImg = null;
+  }
 
   function recomputeBoxes() {
     const now = Date.now();
@@ -508,6 +559,15 @@
 
   function onPointerMove(ev) {
     if (!st.enabled) return;
+    // While the pointer sits on the popover itself, don't switch or hide — the
+    // user is reaching for the Download button, so leave everything where it is.
+    if (st.hoveringUi) {
+      if (st.hideTimer) {
+        clearTimeout(st.hideTimer);
+        st.hideTimer = null;
+      }
+      return;
+    }
     const x = ev.clientX;
     const y = ev.clientY;
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
@@ -515,21 +575,46 @@
     const img = boxHit(x, y);
     if (!(img instanceof HTMLImageElement) || !isImgGood(img)) {
       st.hoveringImg = false;
+      clearPendingSwitch();
       scheduleHide();
       return;
     }
-    const url = pickImgUrl(img);
     st.hoveringImg = true;
     if (st.hideTimer) {
       clearTimeout(st.hideTimer);
       st.hideTimer = null;
     }
-    if (url && url === _lastHoverUrl && st.activeImg === img) {
+
+    // Same image already showing: just keep the outline aligned.
+    if (st.activeImg === img) {
+      clearPendingSwitch();
       positionUi(img);
       return;
     }
-    _lastHoverUrl = url || '';
-    showFor(img);
+
+    // Nothing showing yet: reveal straight away so it still feels instant.
+    if (!st.activeImg) {
+      clearPendingSwitch();
+      _lastHoverUrl = pickImgUrl(img) || '';
+      showFor(img);
+      return;
+    }
+
+    // A popover is already up for another image. Only hand it over once the
+    // pointer genuinely settles on this one — a quick pass shouldn't grab it.
+    if (_pendingImg !== img) {
+      clearPendingSwitch();
+      _pendingImg = img;
+      _switchTimer = window.setTimeout(() => {
+        _switchTimer = 0;
+        const target = _pendingImg;
+        _pendingImg = null;
+        if (!st.enabled || st.hoveringUi) return;
+        if (!(target instanceof HTMLImageElement) || !isImgGood(target)) return;
+        _lastHoverUrl = pickImgUrl(target) || '';
+        showFor(target);
+      }, SWITCH_DELAY_MS);
+    }
   }
 
   function onScrollReposition() {
@@ -553,6 +638,7 @@
   function unmount() {
     setVisible(false);
     st.activeImg = null;
+    clearPendingSwitch();
     window.removeEventListener('pointermove', onPointerMove, true);
     window.removeEventListener('scroll', onScrollReposition, true);
     window.removeEventListener('resize', onResizeReposition, false);
@@ -576,6 +662,7 @@
     st.hoveringUi = false;
     st.hoveringImg = false;
     st.activeImg = null;
+    clearPendingSwitch();
     setVisible(false);
   });
   elDl.addEventListener('click', () => void handleDownloadClick());
@@ -585,20 +672,6 @@
     if (st.enabled) mount();
     else unmount();
   }
-
-  chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
-    if (chrome.runtime.lastError) return;
-    applyTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
-  });
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'local') return;
-    if (changes[THEME_MODE_KEY] || changes[THEME_ACCENT_KEY]) {
-      chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
-        if (chrome.runtime.lastError) return;
-        applyTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
-      });
-    }
-  });
 
   chrome.storage.local.get([ENABLE_KEY], (d) => {
     if (chrome.runtime.lastError) return;
@@ -610,7 +683,7 @@
     setEnabled(changes[ENABLE_KEY].newValue === true);
   });
 
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || msg.type !== 'CONTEXT_IMAGE_DOWNLOAD_AS') return;
     const p = msg.payload || {};
     const url = (p.url || '').toString().trim();

@@ -1,77 +1,82 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <title>Stuff Grabber: save folder</title>
-  <link rel="stylesheet" href="../style/options.css" />
-</head>
-<body>
-  <h1>Where to save video</h1>
-  <p>
-    Files are written by ffmpeg on your PC. Paste a full folder path. Four downloads can run at once; extras wait in line.
-  </p>
-  <div class="row">
-    <label for="path">Folder path</label>
-    <input id="path" type="text" placeholder="C:\Users\You\Videos\HLS" autocomplete="off" />
-    <div class="hint">Example: <code>C:\Users\You\Videos\HLS</code>. It is stored in this browser so you do not have to re-enter it; change it here anytime. We create the folder if it is not there.</div>
-  </div>
-    <div class="row">
-      <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; font-weight: 500;">
-        <input id="float-on" type="checkbox" checked style="width: auto; margin-top: 3px;" />
-        <span>Show floating grabber button on web pages (corner shortcut).</span>
-      </label>
-      <div class="hint">When off, only the toolbar popup lists streams. Same download queue and badges either way.</div>
-    </div>
-    <div class="row">
-      <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; font-weight: 500;">
-        <input id="img-dl-on" type="checkbox" style="width: auto; margin-top: 3px;" />
-        <span>Enable image hover highlighter (hover an image → Download as PNG/JPG/WEBP).</span>
-      </label>
-      <div class="hint">Default is off. The floating panel will still show an Images list for download/preview; this toggle only controls the hover highlight + popover.</div>
-    </div>
-    <div class="row">
-      <label for="ffmpeg-preset-mode">HLS / DASH re-encode speed</label>
-      <select id="ffmpeg-preset-mode" style="width: 100%; padding: 10px 12px; font-size: 14px; border: 1px solid #d6d3d1; border-radius: 8px; background: #fff;">
-        <option value="auto">Auto (pick from all x264 presets by length/size)</option>
-        <option value="ask">Ask before download — dropdown with all presets</option>
-      </select>
-      <div class="hint">Applies when ffmpeg re-encodes HLS/DASH to MP4. Presets from ultrafast → placebo; long/large sources auto-pick slower presets. You can switch mid-download and choose whether to delete the partial file or save as <code>name (1).mp4</code>.</div>
-    </div>
-    <div class="row">
-      <label for="ytdlp-quality">Social / yt-dlp quality</label>
-      <select id="ytdlp-quality" style="width: 100%; padding: 10px 12px; font-size: 14px; border: 1px solid #d6d3d1; border-radius: 8px; background: #fff;">
-        <option value="auto">Use best video + best audio (merged automatically)</option>
-        <option value="ask">Ask me to pick a format when several are available</option>
-      </select>
-      <div class="hint">yt-dlp downloads need the real page URL; the extension already prefers that. Asking only applies to YouTube-style and other social detections that use yt-dlp.</div>
-    </div>
-    <div class="row">
-      <label for="ytdlp-max-h">Max video height (pixels)</label>
-      <input id="ytdlp-max-h" type="text" inputmode="numeric" placeholder="e.g. 1080, blank for default cap" autocomplete="off" />
-      <div class="hint">Limits merged video resolution (e.g. <code>1080</code> for 1080p). Leave blank for the built-in default. Enter <code>0</code> for no height limit.</div>
-    </div>
-    <div class="row">
-      <label for="ui-theme-mode">Theme mode</label>
-      <select id="ui-theme-mode">
-        <option value="system">System</option>
-        <option value="light">Light</option>
-        <option value="dark">Dark</option>
-      </select>
-    </div>
-    <div class="row">
-      <label for="ui-theme-accent">Color scheme</label>
-      <select id="ui-theme-accent">
-        <option value="blue">Blue</option>
-        <option value="violet">Violet</option>
-        <option value="emerald">Emerald</option>
-        <option value="rose">Rose</option>
-        <option value="orange">Orange</option>
-      </select>
-    </div>
-    <div class="actions">
-    <button type="button" id="save">Save</button>
-  </div>
-  <div id="status" hidden></div>
-  <script src="scripts/options.js"></script>
-</body>
-</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="color-scheme" content="dark light" />
+  <title>Stuff Grabber settings</title>
+  <link rel="stylesheet" href="../style/options.css" />
+</head>
+<body>
+  <h1>Settings</h1>
+  <p>
+    Your files get written straight to your PC. Tell me which folder to use below. I'll keep up to four downloads going at once, and anything extra waits its turn.
+  </p>
+  <div class="row">
+    <label for="path">Folder path</label>
+    <input id="path" type="text" placeholder="C:\Users\You\Videos\HLS" autocomplete="off" />
+    <div class="hint">Example: <code>C:\Users\You\Videos\HLS</code>. It is stored in this browser so you do not have to re-enter it; change it here anytime. We create the folder if it is not there.</div>
+  </div>
+    <div class="row">
+      <label class="row-check" for="float-on">
+        <input id="float-on" type="checkbox" checked />
+        <span>Show floating grabber button on web pages (corner shortcut).</span>
+      </label>
+      <div class="hint">When off, only the toolbar popup lists streams. Same download queue and badges either way.</div>
+    </div>
+    <div class="row">
+      <label class="row-check" for="img-dl-on">
+        <input id="img-dl-on" type="checkbox" />
+        <span>Enable image hover highlighter (hover an image → Download as PNG/JPG/WEBP).</span>
+      </label>
+      <div class="hint">Default is off. The floating panel will still show an Images list for download/preview; this toggle only controls the hover highlight + popover.</div>
+    </div>
+    <div class="row">
+      <label for="ffmpeg-preset-mode">HLS / DASH re-encode speed</label>
+      <select id="ffmpeg-preset-mode">
+        <option value="auto">Auto (pick from all x264 presets by length/size)</option>
+        <option value="ask">Ask me first, with a dropdown of every preset</option>
+      </select>
+      <div class="hint">Applies when ffmpeg re-encodes HLS/DASH to MP4. Presets from ultrafast → placebo; long/large sources auto-pick slower presets. You can switch mid-download and choose whether to delete the partial file or save as <code>name (1).mp4</code>.</div>
+    </div>
+    <div class="row">
+      <label for="ytdlp-quality">Social / yt-dlp quality</label>
+      <select id="ytdlp-quality">
+        <option value="auto">Use best video + best audio (merged automatically)</option>
+        <option value="ask">Ask me to pick a format when several are available</option>
+      </select>
+      <div class="hint">yt-dlp downloads need the real page URL; the extension already prefers that. Asking only applies to YouTube-style and other social detections that use yt-dlp.</div>
+    </div>
+    <div class="row">
+      <label for="ytdlp-max-h">Max video height (pixels)</label>
+      <input id="ytdlp-max-h" type="text" inputmode="numeric" placeholder="e.g. 1080, blank for default cap" autocomplete="off" />
+      <div class="hint">Limits merged video resolution (e.g. <code>1080</code> for 1080p). Leave blank for the built-in default. Enter <code>0</code> for no height limit.</div>
+    </div>
+    <div class="row">
+      <label for="ui-theme-mode">Theme</label>
+      <select id="ui-theme-mode">
+        <option value="system">Match my browser</option>
+        <option value="page">Match the page I'm on</option>
+        <option value="light">Always light</option>
+        <option value="dark">Always dark</option>
+      </select>
+      <div class="hint">Pick one, they take turns. <strong>Match my browser</strong> follows your light or dark setting. <strong>Match the page I'm on</strong> copies that site's background and text colors. The last two just stay put.</div>
+    </div>
+    <div class="row" id="ui-theme-accent-row" hidden>
+      <label for="ui-theme-accent">Color scheme</label>
+      <select id="ui-theme-accent">
+        <option value="blue">Blue</option>
+        <option value="violet">Violet</option>
+        <option value="emerald">Emerald</option>
+        <option value="rose">Rose</option>
+        <option value="orange">Orange</option>
+      </select>
+      <div class="hint">Only used when theme is set to Always light or Always dark.</div>
+    </div>
+    <div class="actions">
+    <button type="button" id="save">Save</button>
+  </div>
+  <div id="status" hidden></div>
+  <script src="scripts/theme-helpers.js"></script>
+  <script src="scripts/options.js"></script>
+</body>
+</html>

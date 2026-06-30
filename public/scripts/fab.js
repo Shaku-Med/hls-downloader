@@ -78,71 +78,11 @@
 
   /** @param {(row: object | null | undefined) => void} callback */
   function showYtdlpFormatPicker(title, rows, callback) {
-    const overlay = document.createElement('div');
-    overlay.style.cssText =
-      'position:fixed;inset:0;background:rgba(0,0,0,.42);z-index:2147483646;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box;';
-    const box = document.createElement('div');
-    box.style.cssText =
-      'background:#fff;border-radius:12px;padding:14px 16px;max-width:380px;width:100%;max-height:78vh;overflow:auto;box-shadow:0 8px 32px rgba(0,0,0,.18);';
-    const h = document.createElement('div');
-    h.style.cssText = 'font-weight:600;font-size:14px;margin-bottom:6px;color:#1c1917;';
-    h.textContent = 'Choose quality';
-    const sub = document.createElement('div');
-    sub.style.cssText = 'font-size:12px;color:#57534e;margin-bottom:12px;line-height:1.4;';
-    sub.textContent = (title && title.trim()) || 'Several formats are available.';
-    const form = document.createElement('div');
-    form.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
-    const mkBtn = (label, onClick) => {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.textContent = label;
-      b.style.cssText =
-        'text-align:left;padding:10px 12px;border:1px solid #e7e2dc;border-radius:8px;background:#faf8f5;font-size:13px;cursor:pointer;font-family:inherit;';
-      b.addEventListener('mouseenter', () => {
-        b.style.background = '#fff7ed';
-      });
-      b.addEventListener('mouseleave', () => {
-        b.style.background = '#faf8f5';
-      });
-      b.addEventListener('click', onClick);
-      return b;
-    };
-    form.appendChild(
-      mkBtn('Best available (auto merge)', () => {
-        document.body.removeChild(overlay);
-        callback(null);
-      })
-    );
-    for (const r of rows) {
-      const rowRef = r;
-      form.appendChild(
-        mkBtn(rowRef.label || rowRef.format_id, () => {
-          document.body.removeChild(overlay);
-          callback(rowRef);
-        })
-      );
+    if (window.HGR_THEME && window.HGR_THEME.showYtdlpFormatPicker) {
+      window.HGR_THEME.showYtdlpFormatPicker(title, rows, callback);
+      return;
     }
-    const cancel = document.createElement('button');
-    cancel.type = 'button';
-    cancel.textContent = 'Cancel';
-    cancel.style.cssText =
-      'margin-top:10px;padding:8px 12px;border:none;background:transparent;color:#78716c;font-size:12px;cursor:pointer;font-family:inherit;width:100%;';
-    cancel.addEventListener('click', () => {
-      document.body.removeChild(overlay);
-      callback(undefined);
-    });
-    box.appendChild(h);
-    box.appendChild(sub);
-    box.appendChild(form);
-    box.appendChild(cancel);
-    overlay.appendChild(box);
-    overlay.addEventListener('click', (ev) => {
-      if (ev.target === overlay) {
-        document.body.removeChild(overlay);
-        callback(undefined);
-      }
-    });
-    document.body.appendChild(overlay);
+    callback(null);
   }
 
   function maybeAskYtdlpFormat(kind, probePayload, onPick, onCancel) {
@@ -247,6 +187,13 @@
   <div class="panel-scroll">
     <div class="path-line" id="fab-path"></div>
     <div class="jobs-block" id="fab-jobs"></div>
+    <div class="rec-section" id="fab-rec">
+      <button type="button" class="rec-btn" id="fab-rec-btn">
+        <span class="rec-dot"></span>
+        <span id="fab-rec-label">Record videos</span>
+      </button>
+      <div class="rec-status" id="fab-rec-status"></div>
+    </div>
     <div id="fab-streams"></div>
     <div id="fab-images"></div>
   </div>
@@ -268,35 +215,23 @@
   const closeBtn = shadow.querySelector('.close-p');
 
   function applyFabTheme(mode, accent) {
-    const prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-    const resolved = mode === 'light' || mode === 'dark' ? mode : (prefersDark ? 'dark' : 'light');
-    const palette = {
-      blue: ['#2563eb', '#1d4ed8'],
-      violet: ['#8b5cf6', '#7c3aed'],
-      emerald: ['#10b981', '#059669'],
-      rose: ['#f43f5e', '#e11d48'],
-      orange: ['#f97316', '#ea580c'],
-    };
-    const c = palette[accent] || palette.blue;
-    host.style.setProperty('--accent', c[0]);
-    host.style.setProperty('--accent-2', c[1]);
-    if (resolved === 'dark') {
-      host.style.setProperty('--bg', '#0f1117');
-      host.style.setProperty('--surface', '#161b27');
-      host.style.setProperty('--text', '#e6e9ef');
-      host.style.setProperty('--muted', '#95a2bb');
-      host.style.setProperty('--line', '#293043');
-    } else {
-      host.style.setProperty('--bg', '#f4f6fb');
-      host.style.setProperty('--surface', '#ffffff');
-      host.style.setProperty('--text', '#0f172a');
-      host.style.setProperty('--muted', '#475569');
-      host.style.setProperty('--line', '#d8e0ef');
+    const themeApi = window.HGR_THEME;
+    if (themeApi) {
+      themeApi.applyThemeToHost(host, mode, accent);
+      return;
     }
+    host.style.setProperty('--bg', '#f4f6fb');
+    host.style.setProperty('--text', '#0f172a');
   }
-  chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
-    applyFabTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
-  });
+
+  let unbindFabTheme = null;
+  if (window.HGR_THEME && window.HGR_THEME.bindLiveThemeHost) {
+    unbindFabTheme = window.HGR_THEME.bindLiveThemeHost(host);
+  } else {
+    chrome.storage.local.get([THEME_MODE_KEY, THEME_ACCENT_KEY], (cfg) => {
+      applyFabTheme(cfg?.[THEME_MODE_KEY] || 'system', cfg?.[THEME_ACCENT_KEY] || 'blue');
+    });
+  }
 
   try {
     const iconEl = shadow.querySelector('.fab-icon');
@@ -470,6 +405,7 @@
         positionPanel();
         requestAnimationFrame(() => positionPanel());
       });
+      fabRecScan();
     } else {
       panel.classList.remove('open');
       setTimeout(() => {
@@ -723,12 +659,11 @@
       u.className = 'url';
       if (pageOnly) {
         const intro = document.createElement('div');
-        intro.style.cssText = 'font-size:10px;color:#57534e;line-height:1.35;margin-bottom:6px;';
+        intro.className = 'stream-page-intro';
         intro.textContent =
           'Social media: yt-dlp uses the page URL below (not a separate stream link).';
         const link = document.createElement('div');
-        link.style.cssText =
-          'word-break:break-all;font-family:ui-monospace,Consolas,monospace;font-size:10px;';
+        link.className = 'stream-page-link';
         link.textContent = url;
         u.appendChild(intro);
         u.appendChild(link);
@@ -974,8 +909,7 @@
       row.className = 'fn-row';
 
       const sel = document.createElement('select');
-      sel.style.cssText =
-        'flex:1;min-width:0;border:1px solid var(--line);border-radius:8px;padding:6px 8px;font-size:12px;background:var(--bg);color:var(--text);';
+      sel.className = 'img-fmt-select';
       sel.innerHTML = `
         <option value="png">PNG</option>
         <option value="jpg">JPG</option>
@@ -1039,6 +973,7 @@
   host._hlsFabCleanup = () => {
     ac.abort();
     chrome.storage.onChanged.removeListener(onFabStorageChanged);
+    if (typeof unbindFabTheme === 'function') unbindFabTheme();
     try {
       panelResizeObserver.disconnect();
     } catch (_) {
@@ -1046,8 +981,118 @@
     }
   };
 
+  /* ── Record Video Elements (FAB) ── */
+  const fabRecSection = shadow.getElementById('fab-rec');
+  const fabRecBtn = shadow.getElementById('fab-rec-btn');
+  const fabRecLabel = shadow.getElementById('fab-rec-label');
+  const fabRecStatus = shadow.getElementById('fab-rec-status');
+  let fabIsRecording = false;
+  let fabRecPoll = null;
+
+  function setFabRecordUiVisible(visible) {
+    if (fabRecSection) fabRecSection.hidden = !visible;
+    if (!visible && fabRecStatus) fabRecStatus.textContent = '';
+  }
+
+  function fabFormatElapsed(sec) {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return m > 0 ? `${m}m ${s}s` : `${s}s`;
+  }
+
+  function fabSendRecorder(action, cb) {
+    // video-recorder.js shares this isolated world; call it directly.
+    const api = window.HLS_VIDEO_REC;
+    if (!api || typeof api[action] !== 'function') {
+      cb({ ok: false, error: 'Recorder not ready' });
+      return;
+    }
+    try {
+      cb(api[action]() || { ok: false });
+    } catch (e) {
+      cb({ ok: false, error: String((e && e.message) || e) });
+    }
+  }
+
+  function fabUpdateRecStatus() {
+    fabSendRecorder('status', (res) => {
+      if (!res || !res.recording) {
+        if (fabIsRecording) {
+          fabIsRecording = false;
+          fabRecBtn.classList.remove('is-rec');
+          fabRecLabel.textContent = 'Record videos';
+          fabRecStatus.textContent = '';
+          if (fabRecPoll) { clearInterval(fabRecPoll); fabRecPoll = null; }
+        }
+        return;
+      }
+      const lines = (res.active || []).map((a) => `${a.label}: ${fabFormatElapsed(a.elapsed)}`);
+      fabRecStatus.textContent = lines.join(' · ') || 'Recording…';
+    });
+  }
+
+  function fabRecScan() {
+    fabSendRecorder('scan', (res) => {
+      if (!res || !res.ok) {
+        setFabRecordUiVisible(false);
+        return;
+      }
+      if (res.recording) {
+        setFabRecordUiVisible(true);
+        fabIsRecording = true;
+        fabRecBtn.classList.add('is-rec');
+        fabRecLabel.textContent = 'Stop recording';
+        if (!fabRecPoll) fabRecPoll = setInterval(fabUpdateRecStatus, 1000);
+        fabUpdateRecStatus();
+      } else if (res.count > 0) {
+        setFabRecordUiVisible(true);
+        fabRecStatus.textContent = `${res.count} video${res.count > 1 ? 's' : ''} on page`;
+      } else {
+        setFabRecordUiVisible(false);
+      }
+    });
+  }
+
+  if (fabRecBtn) {
+    fabRecBtn.addEventListener('click', () => {
+      if (fabIsRecording) {
+        fabRecBtn.disabled = true;
+        fabSendRecorder('stop', (res) => {
+          fabRecBtn.disabled = false;
+          fabIsRecording = false;
+          fabRecBtn.classList.remove('is-rec');
+          fabRecLabel.textContent = 'Record videos';
+          if (fabRecPoll) { clearInterval(fabRecPoll); fabRecPoll = null; }
+          if (res && res.ok && res.stopped) {
+            fabRecStatus.textContent = `Saved ${res.stopped.length} recording${res.stopped.length > 1 ? 's' : ''}`;
+          } else {
+            fabRecStatus.textContent = res?.error || 'Stopped';
+          }
+        });
+      } else {
+        fabRecBtn.disabled = true;
+        fabSendRecorder('start', (res) => {
+          fabRecBtn.disabled = false;
+          if (res && res.ok) {
+            fabIsRecording = true;
+            fabRecBtn.classList.add('is-rec');
+            fabRecLabel.textContent = 'Stop recording';
+            const fail = (res.details || []).filter((d) => !d.ok);
+            let m = `Recording ${res.count} of ${res.total} video${res.total > 1 ? 's' : ''}`;
+            if (fail.length) m += ` · ${fail.length} skipped`;
+            fabRecStatus.textContent = m;
+            if (!fabRecPoll) fabRecPoll = setInterval(fabUpdateRecStatus, 1000);
+          } else {
+            fabRecStatus.textContent = res?.error || 'No videos found';
+          }
+        });
+      }
+    });
+  }
+
   loadPos(() => {
     refreshBadgeOnly();
+    fabRecScan();
   });
   }
 

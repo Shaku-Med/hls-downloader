@@ -52,6 +52,8 @@ The Python host will create the folder if it is missing, but the path has to be 
 
 It is not magic. Some sites use DRM, blob URLs, or only pull video inside workers, so there will be nothing to catch. That is a limitation of this approach, not you.
 
+**Netflix, Disney+, Prime Video, etc.** use **Widevine DRM**. The extension may detect manifest URLs on those sites, but segments are encrypted and **cannot** be saved by ffmpeg or yt-dlp. Use each service's official offline feature, or download from open (non-DRM) sources such as YouTube trailers.
+
 ## Regenerating icons (optional)
 
 There is an `asset` folder with a master `icon.png` and fixed sizes. If you replace `asset/icon.png` and have ffmpeg in PATH, run:

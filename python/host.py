@@ -772,6 +772,27 @@ _TIKTOK_CDN_STREAM_HOSTS = ("tiktokcdn.com", "musical.ly", "tiktokv.com")
 # and *.soundcloud.com media hosts (ec-media, …); not the main site URL bar host.
 _SOUNDCLOUD_CDN_STREAM_HOSTS = ("soundcloud.cloud", "sndcdn.com", "soundcloud.com")
 
+# Netflix (and nflx CDNs): manifests/segments are Widevine-encrypted — ffmpeg/yt-dlp cannot decrypt.
+_NETFLIX_DRM_HOSTS = ("netflix.com", "nflxvideo.net", "nflxso.net", "nflxext.com")
+
+
+def _is_netflix_drm_context(stream_url: str, page_url: str = "") -> bool:
+    for u in (stream_url, page_url):
+        h = _netloc_host(u)
+        if h and _host_matches_any(h, _NETFLIX_DRM_HOSTS):
+            return True
+    return False
+
+
+def _netflix_drm_error_message() -> str:
+    return (
+        "Netflix playback is Widevine DRM encrypted. Stuff Grabber can only save unencrypted "
+        "HLS/DASH/direct streams (ffmpeg/yt-dlp). Netflix manifests and segments cannot be "
+        "decrypted by this tool. Use Netflix's official offline downloads, or grab trailers from "
+        "open sources like YouTube where streams are not DRM-wrapped."
+    )
+
+
 _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
     ("YouTube", ("googlevideo.com", "youtube.com", "youtu.be", "ytimg.com")),
     (
@@ -3654,6 +3675,21 @@ def run_ffmpeg_with_updates(url, filename, message):
             effective_filename = _spotify_filename_hint(url, page_for_social, filename)
     if _looks_like_vtt_url(url):
         _download_vtt_immediate(url, message, out_dir, effective_filename, job_id)
+        if _CURRENT_JOB_ID == job_id:
+            _CURRENT_JOB_ID = ""
+        return
+
+    if _is_netflix_drm_context(url, page_for_social):
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": _netflix_drm_error_message(),
+                },
+                job_id,
+            )
+        )
         if _CURRENT_JOB_ID == job_id:
             _CURRENT_JOB_ID = ""
         return

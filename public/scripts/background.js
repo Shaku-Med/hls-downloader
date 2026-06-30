@@ -9,6 +9,13 @@ const _ytdlpPageTimer = {};
 /** @type {Record<number, Record<string, string>>} */
 const _ytdlpPageCap = {};
 
+function netflixSegmentUrl(u) {
+  if (!/(nflxvideo|nflxso)\./i.test(u)) return false;
+  if (/[/.](m4s|mp4|aac|vtt|webvtt)(?:[?#]|$)/i.test(u)) return true;
+  if (/\/range\/\d+-\d+/.test(u)) return true;
+  return false;
+}
+
 function shouldIgnoreAsNoiseUrl(url) {
   const u = String(url).toLowerCase();
   if (u.startsWith('blob:') || u.startsWith('data:')) return true;
@@ -29,6 +36,7 @@ function shouldIgnoreAsNoiseUrl(url) {
   }
   if (/\/(seg[-_]?\d+\.|chunk|segment-?\d+|[a-f0-9]{4,20}\.m4s|init\.(mp4|m4a))(?:\?|$)/i.test(u)) return true;
   if (hlsMediaSegmentUrl(u)) return true;
+  if (netflixSegmentUrl(u)) return true;
   return false;
 }
 

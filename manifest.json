@@ -40,15 +40,15 @@
     },
     "content_scripts": [
       {
-        "matches": ["http://*/*", "https://*/*"],
-        "js": ["public/scripts/yt-page-helpers.js", "public/scripts/ffmpeg-preset-helpers.js", "public/scripts/fab.js", "public/scripts/image-hover-download.js"],
+        "matches": ["http://*/*", "https://*/*", "file:///*"],
+        "js": ["public/scripts/theme-helpers.js", "public/scripts/yt-page-helpers.js", "public/scripts/ffmpeg-preset-helpers.js", "public/scripts/fab.js", "public/scripts/image-hover-download.js", "public/scripts/video-recorder.js"],
         "run_at": "document_idle"
       }
     ],
     "web_accessible_resources": [
       {
         "resources": ["asset/icon-16.png", "asset/icon-32.png", "asset/icon-48.png", "asset/icon-128.png", "style/fab.css", "style/modal-theme.css"],
-        "matches": ["http://*/*", "https://*/*"]
+        "matches": ["http://*/*", "https://*/*", "file:///*"]
       }
     ]
   }

@@ -14,6 +14,14 @@ function showStatus(msg, kind) {
   el.className = kind === 'ok' ? 'ok' : 'err';
 }
 
+function syncAccentRowVisibility() {
+  const modeEl = document.getElementById('ui-theme-mode');
+  const row = document.getElementById('ui-theme-accent-row');
+  if (!modeEl || !row) return;
+  const mode = modeEl.value || 'system';
+  row.hidden = mode === 'system' || mode === 'page';
+}
+
 function load() {
   chrome.storage.local.get([KEY, FLOAT_KEY, IMG_DL_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
     const err = chrome.runtime.lastError;
@@ -39,6 +47,7 @@ function load() {
     if (tm) tm.value = data[THEME_MODE_KEY] || 'system';
     const ta = document.getElementById('ui-theme-accent');
     if (ta) ta.value = data[THEME_ACCENT_KEY] || 'blue';
+    syncAccentRowVisibility();
   });
 }
 
@@ -132,6 +141,7 @@ if (ytdlpMaxH) {
 const themeMode = document.getElementById('ui-theme-mode');
 if (themeMode) {
   themeMode.addEventListener('change', () => {
+    syncAccentRowVisibility();
     chrome.storage.local.set({ [THEME_MODE_KEY]: themeMode.value || 'system' });
   });
 }
@@ -145,6 +155,11 @@ if (themeAccent) {
 
 window.addEventListener('pageshow', (e) => {
   if (e.persisted) load();
+  else syncAccentRowVisibility();
 });
+
+if (window.HGR_THEME && window.HGR_THEME.initExtensionPageTheme) {
+  window.HGR_THEME.initExtensionPageTheme();
+}
 
 load();

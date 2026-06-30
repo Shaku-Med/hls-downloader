@@ -126,6 +126,17 @@
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent 75%);
 }
 
+.hgr-modal-overlay[data-theme-mode="page"] .hgr-modal-select {
+  background: var(--accent);
+  color: var(--btnText);
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--line) 28%);
+}
+
+.hgr-modal-overlay[data-theme-mode="page"] .hgr-modal-select option {
+  background: var(--accent);
+  color: var(--btnText);
+}
+
 .hgr-modal-trade {
   font-size: 12px;
   border: 1px solid var(--warn-border);
@@ -234,6 +245,97 @@
 
 .hgr-modal-btn-danger:hover {
   filter: brightness(1.06);
+}
+
+/* yt-dlp format picker (popup + in-page) */
+.hgr-picker-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay-bg, rgba(0, 0, 0, 0.55));
+  z-index: 2147483646;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  box-sizing: border-box;
+  font-family: Inter, "Segoe UI", system-ui, sans-serif;
+  color: var(--text);
+}
+
+.hgr-picker-box {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 14px 16px;
+  max-width: 380px;
+  width: 100%;
+  max-height: 78vh;
+  overflow: auto;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.28);
+}
+
+.hgr-picker-title {
+  font-weight: 700;
+  font-size: 14px;
+  margin-bottom: 6px;
+  color: var(--text);
+}
+
+.hgr-picker-sub {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 12px;
+  line-height: 1.45;
+}
+
+.hgr-picker-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.hgr-picker-choice {
+  text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-2, var(--bg));
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  font-family: inherit;
+  transition: background var(--transition, 160ms ease), border-color var(--transition, 160ms ease);
+}
+
+.hgr-picker-choice:hover {
+  background: color-mix(in srgb, var(--surface) 82%, var(--accent) 18%);
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--line) 65%);
+}
+
+.hgr-picker-overlay[data-theme-mode="page"] .hgr-picker-choice {
+  background: var(--accent);
+  color: var(--btnText);
+  border-color: color-mix(in srgb, var(--accent) 72%, var(--line) 28%);
+}
+
+.hgr-picker-overlay[data-theme-mode="page"] .hgr-picker-choice:hover {
+  filter: brightness(1.06);
+}
+
+.hgr-picker-cancel {
+  margin-top: 10px;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  font-family: inherit;
+  width: 100%;
+}
+
+.hgr-picker-cancel:hover {
+  color: var(--text);
 }
 
 /* Job card extras (also duplicated in popup.css / fab.css for non-modal contexts) */

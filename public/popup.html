@@ -11,24 +11,44 @@
     <header class="topbar">
       <div class="topbar-main">
         <div class="brand-row">
-          <div class="brand-title">Stuff Grabber</div>
-          <span class="queue-pill" id="queue-pill">Idle</span>
+          <div class="brand-left">
+            <div class="brand-title">Stuff Grabber</div>
+            <div class="status-dot-wrap" id="status-dot-wrap">
+              <button type="button" class="status-dot" id="status-dot" aria-label="Status" aria-haspopup="true" aria-expanded="false"></button>
+              <div class="status-pop" id="status-pop" role="status" hidden>
+                <div class="status-pop-title" id="status-pop-title">Ready to go</div>
+                <div class="status-pop-body" id="status-pop-body">Everything's set. Open a page with video, audio, or images and I'll grab it for you.</div>
+              </div>
+            </div>
+          </div>
+          <button type="button" id="open-options" class="icon-btn" title="Settings" aria-label="Settings">
+            <svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+          </button>
         </div>
-        <p class="brand-sub" id="context-line">Type a file name or use page title defaults.</p>
+        <p class="brand-sub" id="context-line">Give it a name, or I'll borrow the page title.</p>
       </div>
       <div class="settings-row">
-        <div id="path-line" class="path-line">Loading save location…</div>
-        <a href="#" id="open-options" class="settings-link">Options</a>
+        <div id="path-line" class="path-line">Checking your save folder…</div>
+        <button type="button" id="record-btn" class="record-mini" title="Record whatever's playing on this page">
+          <span class="rec-dot"></span>
+          <span id="record-btn-label">Rec</span>
+        </button>
       </div>
+      <div id="record-status" class="record-status" hidden></div>
     </header>
 
     <section id="download-banner" class="jobs-panel" hidden></section>
+
     <main id="content" class="streams-panel">
       <div class="empty">Loading</div>
     </main>
 
-    <footer class="footer">Up to 4 parallel downloads. Queue is shared across tabs.</footer>
+    <footer class="footer">I run up to 4 downloads at once. The rest wait their turn, shared across all your tabs.</footer>
   </div>
+  <script src="scripts/theme-helpers.js"></script>
   <script src="scripts/yt-page-helpers.js"></script>
   <script src="scripts/ffmpeg-preset-helpers.js"></script>
   <script src="scripts/popup.js"></script>

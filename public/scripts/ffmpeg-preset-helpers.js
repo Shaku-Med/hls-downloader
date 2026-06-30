@@ -85,9 +85,28 @@
 
   function applyModalTheme(el, mode, accent) {
     if (!el) return;
+    ensureModalStyles();
+    if (
+      global.HGR_THEME &&
+      typeof global.location !== 'undefined' &&
+      String(global.location.protocol).startsWith('chrome-extension')
+    ) {
+      global.HGR_THEME.syncThemeFromRoot(document.documentElement, el);
+      return;
+    }
+    if (mode === 'page' && global.HGR_THEME && global.HGR_THEME.readPageColors) {
+      const palette = global.HGR_THEME.derivePalette(global.HGR_THEME.readPageColors());
+      global.HGR_THEME.applyPaletteToElement(el, palette);
+      el.setAttribute('data-theme', palette.theme);
+      el.setAttribute('data-theme-mode', 'page');
+      el.removeAttribute('data-accent');
+      return;
+    }
     const resolved = resolveThemeMode(mode);
+    const useAccent = mode === 'light' || mode === 'dark';
     const pal = THEME_PALETTE[resolved] || THEME_PALETTE.dark;
-    const acc = (pal.accents && pal.accents[accent]) || pal.accents.blue;
+    const accKey = useAccent ? accent || 'blue' : 'blue';
+    const acc = (pal.accents && pal.accents[accKey]) || pal.accents.blue;
     el.style.setProperty('--bg', pal.bg);
     el.style.setProperty('--surface', pal.surface);
     el.style.setProperty('--surface-2', pal.surface2);
@@ -98,7 +117,9 @@
     el.style.setProperty('--accent', acc[0]);
     el.style.setProperty('--accent-2', acc[1]);
     el.setAttribute('data-theme', resolved);
-    el.setAttribute('data-accent', accent || 'blue');
+    el.setAttribute('data-theme-mode', mode || 'system');
+    if (useAccent) el.setAttribute('data-accent', accent || 'blue');
+    else el.removeAttribute('data-accent');
   }
 
   function readUiTheme(cb) {
@@ -144,21 +165,21 @@
     const gains = [];
     const losses = [];
     if (rank < refRank) {
-      gains.push('Encodes faster — download finishes sooner');
+      gains.push('Encodes faster, so the download finishes sooner');
       gains.push('Lower CPU use while encoding');
       losses.push('Larger output at the same quality (CRF)');
       losses.push('Less efficient compression');
     } else if (rank > refRank) {
-      gains.push('Better compression — smaller file at the same quality');
+      gains.push('Better compression, so a smaller file at the same quality');
       gains.push('Cleaner detail on longer or high-bitrate sources');
       losses.push('Slower re-encode');
       losses.push('Higher CPU use while encoding');
     } else {
       gains.push('Balanced choice for this source length/size');
-      losses.push('Change to a faster preset to finish sooner, or slower for smaller files');
+      losses.push('Go faster to finish sooner, or slower for smaller files');
     }
-    if (p === 'placebo') losses.push('Very slow — rarely worth it for grabs');
-    if (p === 'ultrafast') losses.push('Largest files — only for very short clips');
+    if (p === 'placebo') losses.push('Very slow, and rarely worth it for grabs');
+    if (p === 'ultrafast') losses.push('Largest files, best kept for very short clips');
     return { title: p, gains, losses };
   }
 
@@ -296,11 +317,21 @@
     }
   }
 
+  function detachOverlayTheme(overlay) {
+    if (overlay && typeof overlay._hgrOffLiveTheme === 'function') {
+      overlay._hgrOffLiveTheme();
+      overlay._hgrOffLiveTheme = null;
+    }
+  }
+
   function mkOverlayBox(themeMode, themeAccent) {
     ensureModalStyles();
     const overlay = document.createElement('div');
     overlay.className = 'hgr-modal-overlay';
     applyModalTheme(overlay, themeMode, themeAccent);
+    if (global.HGR_THEME && global.HGR_THEME.bindLiveOverlayTheme) {
+      overlay._hgrOffLiveTheme = global.HGR_THEME.bindLiveOverlayTheme(overlay);
+    }
     const box = document.createElement('div');
     box.className = 'hgr-modal-box';
     overlay.appendChild(box);
@@ -323,18 +354,19 @@
       const row = document.createElement('div');
       row.className = 'hgr-modal-actions';
       const close = (v) => {
+        detachOverlayTheme(overlay);
         if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
         callback(v);
       };
       const danger = document.createElement('button');
       danger.type = 'button';
       danger.className = 'hgr-modal-btn-danger';
-      danger.textContent = 'Yes — delete and restart';
+      danger.textContent = 'Yes, delete it and start over';
       danger.addEventListener('click', () => close(true));
       const secondary = document.createElement('button');
       secondary.type = 'button';
       secondary.className = 'hgr-modal-btn-secondary';
-      secondary.textContent = 'No — keep file, save new as numbered name';
+      secondary.textContent = 'No, keep it and save the new one with a number';
       secondary.addEventListener('click', () => close(false));
       const ghost = document.createElement('button');
       ghost.type = 'button';
@@ -449,6 +481,7 @@
     btnRow.className = 'hgr-modal-actions';
 
     const closeOverlay = () => {
+      detachOverlayTheme(overlay);
       if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
     };
 
