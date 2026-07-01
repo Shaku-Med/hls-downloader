@@ -17,8 +17,75 @@ HOST_SCRIPT = os.path.join(SCRIPT_DIR, "host.py")
 
 
 def get_extension_id():
-    ext_id = input("Paste your Chrome extension ID (from chrome://extensions): ").strip()
-    return ext_id
+    for arg in sys.argv[1:]:
+        a = arg.strip()
+        if a and not a.startswith("-"):
+            return a
+    return input("Paste your Chrome extension ID (from chrome://extensions): ").strip()
+
+
+def _run(cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+
+def install_ytdlp(python_exe):
+    """
+    Install yt-dlp into the exact Python the native host runs, which is the one running this
+    script. Getting the wrong Python here is the classic cause of a stale yt-dlp that keeps
+    warning about its age, so we pin it to python_exe on purpose.
+    """
+    print("\nInstalling yt-dlp for the host Python...")
+    print(f"  using: {python_exe}")
+    base = [python_exe, "-m", "pip", "install", "-U", "yt-dlp"]
+    r = _run(base)
+    if r.returncode != 0:
+        r = _run(base + ["--user"])
+    if r.returncode == 0:
+        ver = _run([python_exe, "-m", "yt_dlp", "--version"]).stdout.strip()
+        print(f"✓ yt-dlp ready ({ver or 'installed'})")
+        return True
+    print("WARNING: could not install yt-dlp automatically.")
+    tail = (r.stderr or r.stdout or "").strip()[-400:]
+    if tail:
+        print("  " + tail.replace("\n", "\n  "))
+    print(f'  Do it by hand:  "{python_exe}" -m pip install -U --user yt-dlp')
+    return False
+
+
+def ensure_ffmpeg():
+    """Make sure ffmpeg is around, and try to grab it on Windows when a package manager exists."""
+    if shutil.which("ffmpeg"):
+        print("✓ ffmpeg found")
+        return True
+    print("\nffmpeg not found on PATH.")
+    if sys.platform == "win32" and shutil.which("winget"):
+        print("Trying winget to install ffmpeg (this can take a minute)...")
+        _run(
+            [
+                "winget",
+                "install",
+                "--id",
+                "Gyan.FFmpeg",
+                "-e",
+                "--accept-source-agreements",
+                "--accept-package-agreements",
+            ]
+        )
+        if shutil.which("ffmpeg"):
+            print("✓ ffmpeg installed")
+            return True
+        print("winget did not finish the ffmpeg install. Open a new terminal and check again.")
+    print("Install ffmpeg yourself, then open a fresh terminal:")
+    if sys.platform == "win32":
+        print("  winget install Gyan.FFmpeg      or      choco install ffmpeg")
+    elif sys.platform == "darwin":
+        print("  brew install ffmpeg")
+    else:
+        print("  sudo apt install ffmpeg")
+    return False
 
 
 def install_windows(ext_id):
@@ -197,12 +264,6 @@ def install_linux(ext_id):
 def main():
     print("=== Stuff Grabber Native Host Installer ===\n")
 
-    # Check ffmpeg
-    if not shutil.which("ffmpeg"):
-        print("WARNING: ffmpeg not found in PATH. Make sure it's installed.")
-    else:
-        print("✓ ffmpeg found")
-
     ext_id = get_extension_id()
     if not ext_id:
         print("ERROR: Extension ID required")
@@ -221,13 +282,13 @@ def main():
         print("\nInstalling for Linux Chrome...")
         install_linux(ext_id)
 
+    ensure_ffmpeg()
+    install_ytdlp(sys.executable)
+
     print(
-        "\n--- YouTube (yt-dlp) ---\n"
-        "Music videos need JavaScript challenge solving (EJS). Install:\n"
-        f'  "{sys.executable}" -m pip install -U "yt-dlp[default]"\n'
-        "Plus one JS runtime on your PATH (pick one):\n"
+        "\nAll set. Fully quit and reopen Chrome so it picks up the host.\n"
+        "For YouTube music videos you also want one JS runtime on your PATH:\n"
         "  Node.js  https://nodejs.org   or   Deno  https://docs.deno.com/runtime/getting_started/installation/\n"
-        "More info: https://github.com/yt-dlp/yt-dlp/wiki/EJS\n"
     )
 
 

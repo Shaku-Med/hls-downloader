@@ -6,33 +6,38 @@ This thing watches network requests in Chrome, lists video-ish URLs it thinks lo
 
 - **Google Chrome** (or Chromium-based browser that still supports the same extension + native messaging stuff, your mileage may vary)
 - **Python 3** on your machine, and `python` / `py` in PATH so a terminal can start it
-- **ffmpeg** installed and on your PATH, because all the real work is basically `ffmpeg` copying the stream to an mp4 file on disk
-
-If ffmpeg is missing the downloads will just fail in a sad way, so do that before blaming the extension.
+- **ffmpeg** for HLS/DASH work. The installer checks for it and tries to grab it on Windows if you have winget, so you usually do not have to do this by hand.
+- **yt-dlp** for YouTube, Instagram and other social sites. The installer puts this in for you too.
 
 ## Get the extension loaded
 
 1. Open `chrome://extensions`
 2. Turn on **Developer mode** (toggles in the corner somewhere)
-3. Click **Load unpacked** and point it at this folder, the one that has `manifest.json` in it (the `native-host` folder if you are reading this from the repo)
+3. Click **Load unpacked** and point it at this folder, the one that has `manifest.json` in it
 
-Chrome will show you a random-looking **extension ID** under the extension name. You need that in a second for the installer. Copy the whole id string.
+Chrome will show you a random-looking **extension ID** under the extension name. Copy the whole id string, you need it for the installer.
 
-## Wire up the native host (one-time)
+## One command install (does everything)
 
-The extension only talks to Chrome; the **host** is what runs ffmpeg. There is a script for that.
+The extension only talks to Chrome. A small **host** on your PC is what runs ffmpeg and yt-dlp. One script sets all of it up: it registers the host, installs yt-dlp into the right Python, and checks or installs ffmpeg.
 
-From a terminal, `cd` into this same folder and run:
+From a terminal, `cd` into this folder and run it with the Python you want the host to use:
 
 ```text
 python python/install.py
 ```
 
-It will ask for the extension ID you copied. On Windows it writes a small `host_wrapper.bat` and registers the JSON manifest + registry so Chrome can find the host. On Linux it drops files under your Chrome config. WSL is sort of supported but weirder, read the script comments if you live there.
+It asks for the extension ID you copied. You can also pass it straight in so nothing is interactive:
 
-After that, **fully quit and reopen Chrome** (not just a tab) so it picks up the new native messaging registration.
+```text
+python python/install.py YOUR_EXTENSION_ID
+```
 
-If you **reload the extension** or get a new ID, run `python/install.py` again with the new id.
+Then **fully quit and reopen Chrome** (not just a tab) so it picks up the host.
+
+**Which Python matters.** The host uses whatever Python you run `install.py` with, and yt-dlp gets installed into that same one. So if you have more than one Python, run the installer with the exact `python.exe` you want the extension to use. On Windows the wrapper honors a `HLS_GRABBER_PYTHON` user env var if you would rather point it at a specific `python.exe`.
+
+If you **reload the extension** or get a new ID, run `python python/install.py` again with the new id. If you ever bump yt-dlp on the wrong Python and it still looks old, just run the installer again with the correct one.
 
 ## Where files save
 
@@ -61,6 +66,16 @@ There is an `asset` folder with a master `icon.png` and fixed sizes. If you repl
 - `asset\build-icons.cmd` on Windows
 
 That overwrites the `icon-16`, `32`, `48`, `128` files the manifest points at.
+
+## Running the tests
+
+There is a small suite for the host logic that decides yt-dlp routing and cookie handling. From this folder run:
+
+```text
+python -m unittest discover test
+```
+
+It does not touch Chrome or your system, it just checks the pure logic, so it is safe to run anytime.
 
 ## If it feels broken
 
