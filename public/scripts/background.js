@@ -41,6 +41,59 @@ function shouldIgnoreAsNoiseUrl(url) {
 }
 
 /**
+ * Sites and their CDNs where the reliable way to grab a video is handing yt-dlp the
+ * page URL, the same as YouTube. Their signed CDN blobs expire fast and pulling one
+ * directly gives a broken clip, so we surface a single "download this video" row that
+ * uses the tab URL instead. Matches the host or any subdomain of it.
+ */
+const SOCIAL_CDN_HOSTS = [
+  'googlevideo.com', 'youtube.com', 'youtu.be', 'ytimg.com',
+  'instagram.com', 'cdninstagram.com',
+  'facebook.com', 'fb.watch', 'fbcdn.net', 'fbvideo.com', 'threads.net',
+  'tiktok.com', 'tiktokcdn.com', 'tiktokv.com', 'musical.ly', 'muscdn.com', 'ibyteimg.com',
+  'twitter.com', 'x.com', 'twimg.com',
+  'reddit.com', 'redd.it', 'redditmedia.com',
+  'snapchat.com', 'snap.com', 'sc-cdn.net',
+  'twitch.tv', 'ttvnw.net', 'jtvnw.net',
+  'dailymotion.com', 'dm-event.net', 'dmcdn.net',
+  'pinterest.com', 'pinimg.com',
+  'bilibili.com', 'bilivideo.com',
+  'rumble.com',
+  'kick.com',
+];
+
+function hostOfUrl(url) {
+  try {
+    return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
+  } catch {
+    return '';
+  }
+}
+
+function isSocialCdnHost(url) {
+  const h = hostOfUrl(url);
+  if (!h) return false;
+  return SOCIAL_CDN_HOSTS.some((d) => h === d || h.endsWith('.' + d));
+}
+
+/**
+ * A social host serves plenty of images and API calls too. Only treat a request as a
+ * video worth grabbing when the URL actually looks like media, so we do not offer a
+ * page download on a profile page that has no video.
+ */
+function looksLikeMediaRequest(url) {
+  const u = String(url).toLowerCase();
+  if (/[/.](m3u8|m3u|mpd|mp4|m4s|m4v|webm|mov|ts|aac)(?:[?#]|$)/.test(u)) return true;
+  return /(videoplayback|mime=video|itag=|[?&]dash|\bhls\b|progressive|amplify_video|ext_tw_video|\/video\/|playlist|manifest|master)/.test(
+    u
+  );
+}
+
+function socialPageMediaHit(url) {
+  return isSocialCdnHost(url) && !shouldIgnoreAsNoiseUrl(url) && looksLikeMediaRequest(url);
+}
+
+/**
  * HLS fetches thousands of .ts (or fMP4) chunks; only playlists / progressive URLs are valid ffmpeg inputs.
  */
 function hlsMediaSegmentUrl(u) {
@@ -66,6 +119,13 @@ function classifyVideoFromUrl(url) {
     return { kind: 'subtitle', reason: 'vtt' };
   }
 
+  // Social and platform CDNs first, before the generic extension checks below. A signed
+  // Instagram blob ends in .mp4?token and would otherwise look like a plain direct file,
+  // when what we really want is to hand yt-dlp the page URL like we do for YouTube.
+  if (socialPageMediaHit(url)) {
+    return { kind: 'social', reason: 'host' };
+  }
+
   if (/[/.](m3u8|m3u)(?:[?#]|$)/.test(u)) {
     return { kind: 'hls', reason: 'path' };
   }
@@ -74,40 +134,6 @@ function classifyVideoFromUrl(url) {
   }
   if (/[/.](mp4|webm|mkv|mov|m4v|ogv)(?:[?#]|$)/.test(u)) {
     return { kind: 'direct', reason: 'ext' };
-  }
-  if (u.includes('googlevideo.com') && (u.includes('videoplayback') || u.includes('mime=video') || /[?&]itag=/.test(u))) {
-    return { kind: 'yt', reason: 'host' };
-  }
-  if (
-    (u.includes('video.twimg.com') || u.includes('ext_tw_video') || u.includes('twimg.com/amplify_video') || u.includes('twimg.com/ext_tw_video')) &&
-    /\.(mp4|m3u8|m3u)(?:[?#]|$)/.test(u)
-  ) {
-    return { kind: 'social', reason: 'twitter' };
-  }
-  if (u.includes('fbcdn.net') && /(video|mp4|m3u8|m3u|dash)/.test(u)) {
-    return { kind: 'social', reason: 'fb' };
-  }
-  if (u.includes('fb.watch') && /\.(mp4|m3u8)/.test(u)) {
-    return { kind: 'social', reason: 'fb' };
-  }
-  if (u.includes('cdninstagram.com')) {
-    if (
-      /[/.](m3u8|m3u|mp4|mpd|webm)(?:[?#]|$)/i.test(u) ||
-      u.includes('m3u8') ||
-      (/(?:manifest|playlist|master|hls|dash|progressive)/i.test(u) && (u.includes('m3u8') || u.includes('mpd')))
-    ) {
-      return { kind: 'social', reason: 'ig' };
-    }
-    return null;
-  }
-  if (/(tiktokcdn|tiktokv\.com|ibyteimg\.com|muscdn)\./i.test(u) && /(video|byte|m3u8|mp4|m3u)/.test(u)) {
-    return { kind: 'social', reason: 'tiktok' };
-  }
-  if (u.includes('v.redd.it') && /\.(mp4|m3u8|DASH|HLS)/i.test(u)) {
-    return { kind: 'social', reason: 'reddit' };
-  }
-  if (u.includes('snapchat.com') && /(m3u8|mp4|video)/.test(u)) {
-    return { kind: 'social', reason: 'snap' };
   }
   if (u.includes('b-cdn.net') && /(video|m3u8|mp4|mediadelivery)/.test(u)) {
     return { kind: 'direct', reason: 'b-cdn' };
@@ -299,6 +325,13 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (shouldIgnoreAsNoiseUrl(url)) return;
     const lower = String(url).toLowerCase();
     if (/[/.]ts(?:[?#]|$)/i.test(lower) && /(cdninstagram|fbcdn|twimg|googlevideo|akamai|cloudfront|fastly)/i.test(lower)) {
+      return;
+    }
+    // A social CDN media response (e.g. an Instagram video/mp4 blob) should become the
+    // page download, not a raw stream row. Otherwise we would try to pull the signed blob
+    // straight and end up with a broken few-hundred-byte file.
+    if (socialPageMediaHit(url)) {
+      upsertYtdlpPagePlaceholder(tabId, {});
       return;
     }
     const ct = getHeaderValue(details.responseHeaders, 'content-type');
@@ -612,6 +645,54 @@ function getCookieStringPromise(streamUrl, pageUrl) {
             .join('; ')
         );
       });
+    });
+  });
+}
+
+function registrableDomain(host) {
+  const h = (host || '').toLowerCase().replace(/^\.+/, '');
+  const parts = h.split('.').filter(Boolean);
+  if (parts.length <= 2) return h;
+  return parts.slice(-2).join('.');
+}
+
+/**
+ * Full cookie details (including httpOnly) for a site, straight from the browser in plaintext.
+ * yt-dlp gets these as a cookie file, which sidesteps having to decrypt Chrome's own cookie
+ * store (App-Bound Encryption / DPAPI). We are the extension the user is logged in through, so
+ * this is the reliable way to reach logged-in Instagram, Facebook and the like.
+ */
+function getCookieJarPromise(pageUrl) {
+  return new Promise((resolve) => {
+    let host = '';
+    try {
+      host = new URL(pageUrl).hostname;
+    } catch (_) {
+      resolve([]);
+      return;
+    }
+    if (!host) {
+      resolve([]);
+      return;
+    }
+    chrome.cookies.getAll({ domain: registrableDomain(host) }, (cookies) => {
+      if (chrome.runtime.lastError || !cookies) {
+        resolve([]);
+        return;
+      }
+      resolve(
+        cookies.map((c) => ({
+          name: c.name,
+          value: c.value,
+          domain: c.domain,
+          path: c.path || '/',
+          secure: !!c.secure,
+          httpOnly: !!c.httpOnly,
+          hostOnly: !!c.hostOnly,
+          session: !!c.session,
+          expirationDate: c.expirationDate,
+        }))
+      );
     });
   });
 }
@@ -1092,6 +1173,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         referer: payload.referer,
         pageUrl: payload.pageUrl,
         origin: payload.origin,
+        ytDlpCookiesFromBrowser: payload.ytDlpCookiesFromBrowser,
       };
       if (!base.userAgent) {
         try {
@@ -1120,6 +1202,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       } catch (_) {
         // ignore
+      }
+      {
+        const cookiePageUrl =
+          base.pageUrl && /^https?:/i.test(base.pageUrl) ? base.pageUrl : tabUrl;
+        const cookieJar = await getCookieJarPromise(cookiePageUrl);
+        if (cookieJar.length) base.cookieJar = cookieJar;
       }
       const timeoutMs = 125000;
       let settled = false;
@@ -1332,12 +1420,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       if (!cookie) {
         cookie = await getCookieStringPromise(payload.url, tabUrl);
       }
+      const ytdlpKind = payload.streamKind === 'social' || payload.streamKind === 'yt';
+      const cookiePageUrl =
+        payload.pageUrl && /^https?:/i.test(payload.pageUrl) ? payload.pageUrl : tabUrl;
+      const cookieJar = ytdlpKind ? await getCookieJarPromise(cookiePageUrl) : [];
       const { jobId: _jid, outputDirectory: _od, ...rest } = payload;
       const base = {
         ...rest,
         tabId: tabIdForJob ?? undefined,
         cookie: cookie || undefined,
       };
+      if (cookieJar.length) base.cookieJar = cookieJar;
       if (!base.userAgent) {
         try {
           base.userAgent = (typeof navigator !== 'undefined' && navigator.userAgent) || undefined;

@@ -1099,6 +1099,96 @@ def _yt_dlp_header_args(message: dict) -> List[str]:
     return args
 
 
+_YTDLP_COOKIE_BROWSERS = frozenset(
+    {"chrome", "chromium", "edge", "brave", "opera", "vivaldi", "firefox", "safari", "whale"}
+)
+
+
+def _yt_dlp_cookies_from_browser_args(message: dict, target_url: str) -> List[str]:
+    """
+    On your own machine the simplest auth that actually works is letting yt-dlp read cookies
+    straight from the browser you are already logged into. Instagram, Facebook and the like send
+    an empty media response otherwise. YouTube is left out by default since account cookies can
+    trip its bot checks; set the browser to a value like "none" to turn this off.
+    """
+    if _yt_dlp_target_is_youtube_like(target_url):
+        return []
+    raw = (
+        message.get("ytDlpCookiesFromBrowser")
+        or os.environ.get("HLS_GRABBER_COOKIES_FROM_BROWSER")
+        or "chrome"
+    ).strip().lower()
+    if raw in ("", "none", "off", "0", "false", "disabled"):
+        return []
+    browser = raw if raw in _YTDLP_COOKIE_BROWSERS else "chrome"
+    return ["--cookies-from-browser", browser]
+
+
+def _write_netscape_cookie_file(cookie_jar: Any) -> Optional[str]:
+    """
+    Write the extension-supplied cookies as a Netscape cookies.txt for yt-dlp --cookies. These
+    come from the browser in plaintext, so this avoids yt-dlp having to decrypt Chrome's own
+    cookie store (the "Failed to decrypt with DPAPI" App-Bound Encryption error). Returns the temp
+    file path, or None when there is nothing usable. Caller is responsible for deleting it.
+    """
+    if not isinstance(cookie_jar, list) or not cookie_jar:
+        return None
+    lines = ["# Netscape HTTP Cookie File", ""]
+    count = 0
+    for c in cookie_jar:
+        if not isinstance(c, dict):
+            continue
+        name = str(c.get("name") or "")
+        domain = str(c.get("domain") or "").strip()
+        if not name or not domain:
+            continue
+        value = "" if c.get("value") is None else str(c.get("value"))
+        if not c.get("hostOnly") and not domain.startswith("."):
+            domain = "." + domain
+        include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+        path = str(c.get("path") or "/") or "/"
+        secure = "TRUE" if c.get("secure") else "FALSE"
+        exp = c.get("expirationDate")
+        try:
+            expiry = str(int(float(exp))) if exp else "0"
+        except (TypeError, ValueError):
+            expiry = "0"
+        domain_field = ("#HttpOnly_" + domain) if c.get("httpOnly") else domain
+        lines.append("\t".join([domain_field, include_sub, path, secure, expiry, name, value]))
+        count += 1
+    if not count:
+        return None
+    try:
+        fd, path = tempfile.mkstemp(prefix="sg_cookies_", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines) + "\n")
+        return path
+    except OSError:
+        return None
+
+
+def _remove_temp_file_quietly(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _yt_dlp_cookies_args(message: dict, target_url: str) -> List[str]:
+    """
+    Prefer the cookie jar the extension handed us (already written to a temp file), then fall back
+    to reading the browser store directly. YouTube stays cookie-free by default either way.
+    """
+    if _yt_dlp_target_is_youtube_like(target_url):
+        return []
+    jar_file = message.get("_ytDlpCookieFile")
+    if jar_file and os.path.isfile(jar_file):
+        return ["--cookies", jar_file]
+    return _yt_dlp_cookies_from_browser_args(message, target_url)
+
+
 def _yt_dlp_format_string(message: dict, target_url: str) -> str:
     """
     Prefer best video + best audio (merged with ffmpeg). Use bestvideo* (asterisk) first so yt-dlp
@@ -1143,6 +1233,7 @@ def _yt_dlp_build_cmd(prefix: List[str], message: dict, output_path: str, target
     if thumbs:
         cmd.extend(["--write-thumbnail", "--convert-thumbnails", "jpg"])
     cmd.extend(_yt_dlp_youtube_cli_extras(message, target_url))
+    cmd.extend(_yt_dlp_cookies_args(message, target_url))
     cmd.extend(_yt_dlp_header_args(message))
     cmd.append(target_url)
     return cmd
@@ -1185,12 +1276,16 @@ def _handle_ytdlp_formats(message: dict) -> None:
             }
         )
         return
+    cookie_file = _write_netscape_cookie_file(message.get("cookieJar"))
+    if cookie_file:
+        message["_ytDlpCookieFile"] = cookie_file
     cmd: List[str] = list(prefix) + [
         "--dump-single-json",
         "--no-download",
         "--skip-download",
     ]
     cmd.extend(_yt_dlp_youtube_cli_extras(message, target))
+    cmd.extend(_yt_dlp_cookies_args(message, target))
     cmd.extend(_yt_dlp_header_args(message))
     cmd.append(target)
     run_kw: Dict[str, Any] = {
@@ -1213,6 +1308,8 @@ def _handle_ytdlp_formats(message: dict) -> None:
             }
         )
         return
+    finally:
+        _remove_temp_file_quietly(cookie_file)
     if r.returncode != 0 or not (r.stdout or "").strip():
         tail = ((r.stderr or "") + (r.stdout or ""))[-800:]
         send_message(
@@ -1312,6 +1409,9 @@ def run_yt_dlp_with_updates(
     """Download with yt-dlp using page URL first, then stream URL on failure."""
     page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
     run_message = dict(message or {})
+    cookie_file = _write_netscape_cookie_file(run_message.get("cookieJar"))
+    if cookie_file:
+        run_message["_ytDlpCookieFile"] = cookie_file
 
     def run_one(target: str) -> Tuple[int, List[str]]:
         global _active_ffmpeg
@@ -1432,6 +1532,8 @@ def run_yt_dlp_with_updates(
             )
             yt_target = "ytsearch1:" + q
             code, err_lines = run_one(yt_target)
+
+    _remove_temp_file_quietly(cookie_file)
 
     if _CANCEL_EVENT.is_set():
         send_message(

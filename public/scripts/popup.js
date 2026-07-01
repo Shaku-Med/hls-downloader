@@ -39,6 +39,21 @@ function genJobId() {
   return `j_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
 }
 
+/**
+ * Which browser yt-dlp should read cookies from. We are running inside it, so the user agent
+ * tells us. Lets logged-in Instagram/Facebook grabs work without the user setting anything up.
+ * Brave reports itself as Chrome, so those users get the chrome default.
+ */
+function cookieBrowserFromUa() {
+  const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+  if (/Edg\//.test(ua)) return 'edge';
+  if (/OPR\/|Opera/.test(ua)) return 'opera';
+  if (/Vivaldi/.test(ua)) return 'vivaldi';
+  if (/Firefox\//.test(ua)) return 'firefox';
+  if (/Chrome\//.test(ua)) return 'chrome';
+  return '';
+}
+
 function ytdlpFormatSelection(row) {
   if (!row) return '';
   if (row.has_video && row.has_audio) return String(row.format_id);
@@ -612,6 +627,8 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
               if (effOrigin) payload.origin = effOrigin;
             }
             if (plDl) payload.ytDlpDownloadPlaylist = true;
+            const cookieBrowser = cookieBrowserFromUa();
+            if (cookieBrowser) payload.ytDlpCookiesFromBrowser = cookieBrowser;
 
             const probePayload = {
               url: payload.url,
@@ -622,6 +639,7 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
               pageUrl: payload.pageUrl,
               referer: payload.referer,
               origin: payload.origin,
+              ytDlpCookiesFromBrowser: cookieBrowser || undefined,
             };
 
             const buildFinalPayload = (ytFmt, ffmpegPreset, extra = {}) => {
