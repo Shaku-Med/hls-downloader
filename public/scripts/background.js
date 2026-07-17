@@ -60,6 +60,8 @@ const SOCIAL_CDN_HOSTS = [
   'bilibili.com', 'bilivideo.com',
   'rumble.com',
   'kick.com',
+  // Apple Music: FairPlay HLS is useless — hand yt-dlp the music.apple.com song/album URL.
+  'music.apple.com', 'itunes.apple.com', 'mzstatic.com',
 ];
 
 function hostOfUrl(url) {
@@ -74,6 +76,31 @@ function isSocialCdnHost(url) {
   const h = hostOfUrl(url);
   if (!h) return false;
   return SOCIAL_CDN_HOSTS.some((d) => h === d || h.endsWith('.' + d));
+}
+
+function isAppleMusicPage(url) {
+  const h = hostOfUrl(url);
+  return h === 'music.apple.com' || h.endsWith('.music.apple.com');
+}
+
+/** Song / album / playlist / music-video pages that yt-dlp can take as a URL. */
+function isAppleMusicTrackPage(url) {
+  if (!isAppleMusicPage(url)) return false;
+  try {
+    const path = new URL(url).pathname || '';
+    return /\/(song|album|playlist|music-video)\//i.test(path);
+  } catch {
+    return false;
+  }
+}
+
+function isAppleMediaCdnUrl(url) {
+  const h = hostOfUrl(url);
+  if (!h) return false;
+  if (h === 'music.apple.com' || h.endsWith('.music.apple.com')) return true;
+  if (h === 'itunes.apple.com' || h.endsWith('.itunes.apple.com')) return true;
+  if (h === 'mzstatic.com' || h.endsWith('.mzstatic.com')) return true;
+  return false;
 }
 
 /**
@@ -235,10 +262,15 @@ function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
           merged = { ...e.capturedHeaders, ...merged };
         }
       }
-      const rest = list.filter((e) => e.streamKind !== 'social' && e.streamKind !== 'yt');
+      // Drop raw HLS/DASH rows on Apple Music — only the song page URL is usable with yt-dlp.
+      const rest = isAppleMusicPage(pageUrl)
+        ? []
+        : list.filter((e) => e.streamKind !== 'social' && e.streamKind !== 'yt');
       const lower = pageUrl.toLowerCase();
       const kind =
-        lower.includes('youtube.com') || lower.includes('youtu.be') ? 'yt' : 'social';
+        lower.includes('youtube.com') || lower.includes('youtu.be')
+          ? 'yt'
+          : 'social';
       rest.push({
         url: pageUrl,
         streamKind: kind,
@@ -310,7 +342,26 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       upsertYtdlpPagePlaceholder(tabId, captured);
       return;
     }
-    upsertStream(tabId, url, captured, hit.kind);
+    // Apple Music FairPlay m3u8 → never list as HLS; use the tab song URL with yt-dlp.
+    if (
+      isAppleMediaCdnUrl(url) &&
+      (hit.kind === 'hls' || hit.kind === 'dash' || hit.kind === 'direct')
+    ) {
+      upsertYtdlpPagePlaceholder(tabId, captured);
+      return;
+    }
+    chrome.tabs.get(tabId, (tab) => {
+      if (
+        !chrome.runtime.lastError &&
+        tab &&
+        isAppleMusicPage(tab.url || '') &&
+        (hit.kind === 'hls' || hit.kind === 'dash')
+      ) {
+        upsertYtdlpPagePlaceholder(tabId, captured);
+        return;
+      }
+      upsertStream(tabId, url, captured, hit.kind);
+    });
   },
   { urls: ['<all_urls>'] },
   ['requestHeaders', 'extraHeaders']
@@ -334,17 +385,31 @@ chrome.webRequest.onHeadersReceived.addListener(
       upsertYtdlpPagePlaceholder(tabId, {});
       return;
     }
+    if (isAppleMediaCdnUrl(url) && /[/.](m3u8|m3u|mpd|m4s|m4a|aac)(?:[?#]|$)/i.test(lower)) {
+      upsertYtdlpPagePlaceholder(tabId, {});
+      return;
+    }
     const ct = getHeaderValue(details.responseHeaders, 'content-type');
     const k = streamKindFromContentType(ct);
     if (!k) return;
     if (k === 'by_header' && /[/.](ts|m2ts|mts|m4s)(?:[?#]|$)/i.test(lower)) return;
+    if (k === 'hls_by_header' || k === 'dash') {
+      chrome.tabs.get(tabId, (tab) => {
+        if (!chrome.runtime.lastError && tab && isAppleMusicPage(tab.url || '')) {
+          upsertYtdlpPagePlaceholder(tabId, {});
+          return;
+        }
+        upsertStream(tabId, url, {}, k);
+      });
+      return;
+    }
     upsertStream(tabId, url, {}, k);
   },
   { urls: ['<all_urls>'] },
   ['responseHeaders', 'extraHeaders']
 );
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'loading') {
     if (_ytdlpPageTimer[tabId]) {
       clearTimeout(_ytdlpPageTimer[tabId]);
@@ -353,6 +418,14 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
     delete _ytdlpPageCap[tabId];
     detectedStreams[tabId] = [];
     chrome.action.setBadgeText({ text: '', tabId });
+  }
+  // Like YouTube: Apple Music song/album pages get a page-URL download for yt-dlp.
+  if (
+    (changeInfo.status === 'complete' || changeInfo.url) &&
+    tab &&
+    isAppleMusicTrackPage(tab.url || '')
+  ) {
+    upsertYtdlpPagePlaceholder(tabId, {});
   }
 });
 

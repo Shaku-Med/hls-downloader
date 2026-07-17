@@ -465,12 +465,15 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
 
     const kind = stream.streamKind ? String(stream.streamKind) : '';
     const pageOnly = stream.pageDownload === true;
+    const isAppleMusicPage = /music\.apple\.com/i.test(String(url || ''));
     const top = document.createElement('div');
     top.className = 'stream-top';
     const h = document.createElement('div');
     h.className = 'stream-label';
     h.textContent = pageOnly
-      ? 'Download this video'
+      ? isAppleMusicPage
+        ? 'Download this track'
+        : 'Download this video'
       : n > 1
         ? `Stream ${i + 1} of ${n}` + (kind ? ` (${kind})` : '')
         : kind
@@ -487,8 +490,9 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
     if (pageOnly) {
       const intro = document.createElement('div');
       intro.className = 'stream-page-intro';
-      intro.textContent =
-        'This one grabs straight from the page link below, not a separate stream URL.';
+      intro.textContent = isAppleMusicPage
+        ? 'Apple Music: yt-dlp uses the song page URL below (not the FairPlay m3u8 stream).'
+        : 'This one grabs straight from the page link below, not a separate stream URL.';
       const link = document.createElement('div');
       link.className = 'stream-page-link';
       link.textContent = url;
@@ -602,6 +606,14 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
             effRef = a.referer;
             effOrigin = a.origin || effOrigin;
             plDl = !!a.ytDlpDownloadPlaylist;
+          } else if (pageOnly && /music\.apple\.com/i.test(tabUrl || url || '')) {
+            const appleUrl = /music\.apple\.com/i.test(tabUrl || '') ? tabUrl : url;
+            effUrl = appleUrl;
+            effPage = appleUrl;
+            effRef = appleUrl;
+            try {
+              effOrigin = new URL(appleUrl).origin;
+            } catch (_) {}
           } else if (!isHttpUrl(tabUrl)) {
             effPage = effUrl;
             effRef = effUrl;
@@ -627,6 +639,10 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
               if (effOrigin) payload.origin = effOrigin;
             }
             if (plDl) payload.ytDlpDownloadPlaylist = true;
+            if (pageOnly && /music\.apple\.com/i.test(effUrl || '')) {
+              payload.ytDlpAudioOnly = true;
+              payload.streamKind = 'social';
+            }
             const cookieBrowser = cookieBrowserFromUa();
             if (cookieBrowser) payload.ytDlpCookiesFromBrowser = cookieBrowser;
 

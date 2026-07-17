@@ -205,6 +205,8 @@ def _sanitize_filename_stem(name):
     # Keep the user's name as-is (including spaces). Only replace characters that
     # are invalid on Windows/macOS filesystems or unsafe for paths.
     s = (name or "stream").strip()
+    # Strip bidi/format marks (Apple Music titles often include U+200E LRM, etc.)
+    s = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", s)
     # Windows invalid chars + ASCII control chars. Replace with a space to preserve readability.
     s = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", s)
     # Windows forbids trailing spaces and trailing dots. Leading dots are allowed but can be confusing.
@@ -372,8 +374,22 @@ def _is_dash_input(url: str, message) -> bool:
     return sk in ("dash", "mpd")
 
 
-def _use_hls_aac_bsf(url: str, message) -> bool:
-    """HLS fMP4/MPEG-TS+AAC to .mp4 often needs this; MP3-in-HLS must not use aac_adtstoasc."""
+def _use_hls_aac_bsf(
+    url: str,
+    message,
+    *,
+    playlist_text: Optional[str] = None,
+    is_fmp4: Optional[bool] = None,
+) -> bool:
+    """
+    MPEG-TS HLS + AAC → MP4 needs aac_adtstoasc (strips ADTS).
+    fMP4/CMAF AAC is already ASC — applying the filter can corrupt audio (unplayable /
+    seeks to end). MP3-in-HLS must not use it either.
+    """
+    if is_fmp4 is None and playlist_text is not None:
+        is_fmp4 = _hls_playlist_is_fmp4(playlist_text)
+    if is_fmp4:
+        return False
     u = (url or "").lower()
     # e.g. …/playlist/id.128.mp3/playlist.m3u8  segments are MP3, not ADTS AAC
     if re.search(r"\.mp3/playlist\.m3u8", u):
@@ -675,55 +691,86 @@ def _ffmpeg_x264_vencode_core_argv(*, preset: Optional[str] = None) -> List[str]
     return argv
 
 
-def _ffmpeg_transcode_stable_mp4_from_url(
-    url, message, *, preset: Optional[str] = None
+def _ffmpeg_audio_only_encode_args() -> List[str]:
+    """
+    Audio-only HLS → MP4/M4A: re-encode AAC so timestamps/extradata are clean.
+    Stream-copy of FairPlay/SAMPLE-AES produces a full-length file that seeks to the end.
+    """
+    return [
+        "-vn",
+        "-map",
+        "0:a:0?",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+    ]
+
+
+def _ffmpeg_stable_mp4_map_and_encode_args(
+    *,
+    preset: Optional[str] = None,
+    aac_bsf: bool = False,
+    audio_only: bool = False,
 ) -> List[str]:
-    """Decode+re-encode video; audio copy. Fixes corrupt reference chains from -c copy HLS mux."""
+    """
+    Map first video + audio when present. Video map is optional so audio-only HLS
+    does not fail with "Stream map '0:v:0' matches no streams".
+    Re-encode video for stable PTS; copy audio (unless audio_only → re-encode audio).
+    """
+    if audio_only:
+        return _ffmpeg_audio_only_encode_args()
     out: List[str] = [
         "-map",
-        "0:v:0",
+        "0:v:0?",
         "-map",
         "0:a:0?",
         *_ffmpeg_x264_vencode_core_argv(preset=preset),
         "-c:a",
         "copy",
     ]
-    if _use_hls_aac_bsf(url, message):
+    if aac_bsf:
         out.extend(["-bsf:a", "aac_adtstoasc"])
     return out
+
+
+def _ffmpeg_transcode_stable_mp4_from_url(
+    url,
+    message,
+    *,
+    preset: Optional[str] = None,
+    playlist_text: Optional[str] = None,
+    audio_only: bool = False,
+    is_fmp4: Optional[bool] = None,
+) -> List[str]:
+    """Decode+re-encode video; audio copy. Fixes corrupt reference chains from -c copy HLS mux."""
+    return _ffmpeg_stable_mp4_map_and_encode_args(
+        preset=preset,
+        aac_bsf=_use_hls_aac_bsf(
+            url, message, playlist_text=playlist_text, is_fmp4=is_fmp4
+        ),
+        audio_only=audio_only,
+    )
 
 
 def _ffmpeg_transcode_stable_mp4_from_combined_file(
-    container: str, *, preset: Optional[str] = None
+    container: str, *, preset: Optional[str] = None, audio_only: bool = False
 ) -> List[str]:
-    out: List[str] = [
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        *_ffmpeg_x264_vencode_core_argv(preset=preset),
-        "-c:a",
-        "copy",
-    ]
-    if container == "ts":
-        out.extend(["-bsf:a", "aac_adtstoasc"])
-    return out
+    return _ffmpeg_stable_mp4_map_and_encode_args(
+        preset=preset,
+        aac_bsf=(container == "ts"),
+        audio_only=audio_only,
+    )
 
 
 def _ffmpeg_transcode_stable_mp4_concat_merge(
     *, preset: Optional[str] = None
 ) -> List[str]:
-    return [
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a:0?",
-        *_ffmpeg_x264_vencode_core_argv(preset=preset),
-        "-c:a",
-        "copy",
-        "-bsf:a",
-        "aac_adtstoasc",
-    ]
+    return _ffmpeg_stable_mp4_map_and_encode_args(preset=preset, aac_bsf=True)
 
 
 def _ffmpeg_preferred_container_ext(url: str, message) -> str:
@@ -775,6 +822,17 @@ _SOUNDCLOUD_CDN_STREAM_HOSTS = ("soundcloud.cloud", "sndcdn.com", "soundcloud.co
 # Netflix (and nflx CDNs): manifests/segments are Widevine-encrypted — ffmpeg/yt-dlp cannot decrypt.
 _NETFLIX_DRM_HOSTS = ("netflix.com", "nflxvideo.net", "nflxso.net", "nflxext.com")
 
+# Apple Music / iTunes FairPlay (and related CDN hosts). Segments look like AAC but won't decode.
+_APPLE_MUSIC_DRM_HOSTS = (
+    "music.apple.com",
+    "itunes.apple.com",
+    "audio-ssl.itunes.apple.com",
+    "audio.itunes.apple.com",
+    "aod.itunes.apple.com",
+    "aod-ssl.itunes.apple.com",
+    "streamingaudio.itunes.apple.com",
+)
+
 
 def _is_netflix_drm_context(stream_url: str, page_url: str = "") -> bool:
     for u in (stream_url, page_url):
@@ -791,6 +849,142 @@ def _netflix_drm_error_message() -> str:
         "decrypted by this tool. Use Netflix's official offline downloads, or grab trailers from "
         "open sources like YouTube where streams are not DRM-wrapped."
     )
+
+
+def _is_apple_music_drm_context(stream_url: str, page_url: str = "") -> bool:
+    for u in (stream_url, page_url):
+        h = _netloc_host(u)
+        if h and _host_matches_any(h, _APPLE_MUSIC_DRM_HOSTS):
+            return True
+        low = (u or "").lower()
+        if "music.apple.com" in low or "itunes.apple.com" in low:
+            return True
+    return False
+
+
+def _apple_music_drm_error_message() -> str:
+    return (
+        "Apple Music streams use FairPlay DRM. The file may download but the audio is encrypted "
+        "and will not play (players jump to the end). Stuff Grabber cannot decrypt FairPlay. "
+        "Use Apple Music's official offline downloads, or grab non-DRM audio (previews on open "
+        "sources, SoundCloud, etc.)."
+    )
+
+
+def _apple_music_youtube_query(message: dict, page_url: str = "", stream_url: str = "") -> Optional[str]:
+    """Build a ytsearch query from Apple Music page title / filename when the page itself is DRM."""
+    for key in ("pageTitle", "title", "filename"):
+        raw = (message.get(key) or "").strip() if message else ""
+        if not raw:
+            continue
+        q = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", raw)
+        q = re.sub(r"\s*[-–—]\s*Apple Music\s*$", "", q, flags=re.I)
+        q = re.sub(r"\s+Album by\s+", " ", q, flags=re.I)
+        q = re.sub(r"\s+", " ", q).strip(" -–—")
+        if len(q) >= 3 and q.lower() not in ("stream", "video", "audio", "download", "track"):
+            return q
+    for u in (page_url, stream_url):
+        low = (u or "").lower()
+        if "music.apple.com" not in low:
+            continue
+        try:
+            parts = [x for x in (urlparse(u).path or "").split("/") if x]
+            # /us/album/the-difference/… or /us/song/…
+            for i, p in enumerate(parts):
+                if p in ("album", "song", "playlist") and i + 1 < len(parts):
+                    slug = parts[i + 1].replace("-", " ").strip()
+                    if len(slug) >= 3:
+                        return slug
+        except Exception:
+            pass
+    return None
+
+
+def _hls_playlist_drm_error(playlist_text: str) -> Optional[str]:
+    """Return a user-facing error if the media playlist uses unsupported DRM."""
+    if not playlist_text:
+        return None
+    up = playlist_text.upper()
+    if "COM.APPLE.STREAMINGKEYDELIVERY" in up or "SKD://" in up:
+        return _apple_music_drm_error_message()
+    if "SAMPLE-AES" in up:
+        return (
+            "This HLS stream uses SAMPLE-AES DRM encryption. Segments can be saved but the "
+            "audio/video will not play. Stuff Grabber only supports clear or AES-128 HLS."
+        )
+    if "WIDEVINE" in up or "URN:UUID:EDEF8BA9" in up:
+        return (
+            "This HLS stream uses Widevine DRM. Stuff Grabber cannot decrypt it. "
+            "Use the service's official offline feature, or a non-DRM source."
+        )
+    return None
+
+
+def _combine_dual_try_errors(
+    ytdlp_err: str,
+    ffmpeg_err: str,
+    *,
+    drm_hint: Optional[str] = None,
+) -> str:
+    """Final error after yt-dlp and ffmpeg both failed."""
+    parts: List[str] = []
+    if (ytdlp_err or "").strip():
+        parts.append("yt-dlp: " + ytdlp_err.strip()[-500:])
+    if (ffmpeg_err or "").strip():
+        parts.append("ffmpeg: " + ffmpeg_err.strip()[-500:])
+    body = " | ".join(parts) if parts else "Download failed"
+    if drm_hint:
+        return drm_hint.rstrip() + " Tried yt-dlp then ffmpeg — both failed. " + body
+    return "Tried yt-dlp then ffmpeg — both failed. " + body
+
+
+def _hls_playlist_is_fmp4(playlist_text: str) -> bool:
+    """True when media playlist uses fMP4/CMAF (EXT-X-MAP), not MPEG-TS segments."""
+    if not playlist_text:
+        return False
+    for line in playlist_text.splitlines():
+        if line.strip().upper().startswith("#EXT-X-MAP:"):
+            return True
+    return False
+
+
+def _hls_playlist_likely_has_video(playlist_text: str) -> bool:
+    """Best-effort: False for audio-only variants (no RESOLUTION / video codec in CODECS)."""
+    if not playlist_text:
+        return True
+    saw_stream_inf = False
+    any_video_hint = False
+    for raw in playlist_text.splitlines():
+        line = raw.strip()
+        up = line.upper()
+        if up.startswith("#EXT-X-STREAM-INF:") or up.startswith("#EXT-X-MEDIA:"):
+            saw_stream_inf = True
+            if re.search(r"RESOLUTION\s*=", line, re.I):
+                any_video_hint = True
+            m = re.search(r'CODECS\s*=\s*"([^"]+)"', line, re.I)
+            if m:
+                codecs = m.group(1).lower()
+                if any(
+                    c in codecs
+                    for c in ("avc1", "avc3", "hvc1", "hev1", "vp09", "av01", "dvh1", "dvhe")
+                ):
+                    any_video_hint = True
+            if up.startswith("#EXT-X-MEDIA:") and re.search(
+                r"TYPE\s*=\s*VIDEO", line, re.I
+            ):
+                any_video_hint = True
+        if up.startswith("#EXT-X-STREAM-INF:") and re.search(
+            r"RESOLUTION\s*=", line, re.I
+        ):
+            any_video_hint = True
+    # Media playlists often omit CODECS; assume video unless master clearly audio-only.
+    if saw_stream_inf and not any_video_hint:
+        # Master/audio rendition list with only audio codecs (mp4a) and no video hints.
+        if re.search(r'CODECS\s*=\s*"[^"]*mp4a', playlist_text, re.I) and not re.search(
+            r"RESOLUTION\s*=", playlist_text, re.I
+        ):
+            return False
+    return True
 
 
 _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
@@ -819,6 +1013,17 @@ _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
     ("Bilibili", ("bilibili.com", "bilivideo.com", "bilibiliapi.net")),
     ("SoundCloud", ("soundcloud.com",)),
     ("Spotify", ("spotify.com", "open.spotify.com", "scdn.co")),
+    (
+        "Apple Music",
+        (
+            "music.apple.com",
+            "itunes.apple.com",
+            "audio-ssl.itunes.apple.com",
+            "audio.itunes.apple.com",
+            "aod.itunes.apple.com",
+            "aod-ssl.itunes.apple.com",
+        ),
+    ),
     ("Bandcamp", ("bandcamp.com",)),
     ("Crunchyroll", ("crunchyroll.com", "vrv.co")),
     ("Rumble", ("rumble.com",)),
@@ -916,9 +1121,13 @@ def _social_platform_for_yt_dlp(stream_url: str, page_url: str, message: Any) ->
     Exceptions (use ffmpeg instead):
     - HLS from SoundCloud's media CDN (signed m3u8 URLs).
     - HLS from TikTok-like CDNs when the tab is not a TikTok page (obfuscated HLS, etc.).
+    Apple Music song/album pages (and their CDNs) always go to yt-dlp with the page URL —
+    never FairPlay m3u8 via ffmpeg.
     """
     sh = _netloc_host(stream_url)
     ph = _netloc_host(page_url)
+    if _is_apple_music_drm_context(stream_url, page_url):
+        return "Apple Music"
     if _is_hls_input(stream_url, message):
         if _host_matches_any(sh, _SOUNDCLOUD_CDN_STREAM_HOSTS):
             return None
@@ -929,6 +1138,17 @@ def _social_platform_for_yt_dlp(stream_url: str, page_url: str, message: Any) ->
         if _host_matches_any(sh, domains) or _host_matches_any(ph, domains):
             return label
     return None
+
+
+def _wants_yt_dlp_audio_extract(message: dict, target_url: str = "") -> bool:
+    if message and message.get("ytDlpAudioOnly"):
+        return True
+    page_url = (message.get("pageUrl") or message.get("referer") or "").strip() if message else ""
+    if _is_spotify_url(target_url) or _is_spotify_url(page_url):
+        return True
+    if _is_apple_music_drm_context(target_url, page_url):
+        return True
+    return False
 
 
 def _is_spotify_url(url: str) -> bool:
@@ -1198,8 +1418,7 @@ def _yt_dlp_format_string(message: dict, target_url: str) -> str:
     custom = (message.get("ytDlpFormat") or "").strip()
     if custom:
         return custom
-    page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
-    if _is_spotify_url(target_url) or _is_spotify_url(page_url):
+    if _wants_yt_dlp_audio_extract(message, target_url):
         return "bestaudio/best"
     try:
         cap_h = int(message.get("ytDlpMaxHeight") if message.get("ytDlpMaxHeight") is not None else 4320)
@@ -1217,8 +1436,7 @@ def _yt_dlp_build_cmd(prefix: List[str], message: dict, output_path: str, target
         "--merge-output-format",
         "mp4",
     ]
-    page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
-    if _is_spotify_url(target_url) or _is_spotify_url(page_url):
+    if _wants_yt_dlp_audio_extract(message, target_url):
         cmd.extend(["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"])
     if not message.get("ytDlpDownloadPlaylist"):
         cmd.append("--no-playlist")
@@ -1405,8 +1623,14 @@ def run_yt_dlp_with_updates(
     output_path: str,
     job_id: str,
     platform_label: str,
-) -> None:
-    """Download with yt-dlp using page URL first, then stream URL on failure."""
+    *,
+    emit_done_on_failure: bool = True,
+) -> Tuple[bool, str]:
+    """
+    Download with yt-dlp using page URL first, then stream URL on failure.
+    Returns (True, "") when the job finished successfully or was canceled (done already sent).
+    Returns (False, error) on failure; sends done only when emit_done_on_failure is True.
+    """
     page_url = (message.get("pageUrl") or message.get("referer") or "").strip()
     run_message = dict(message or {})
     cookie_file = _write_netscape_cookie_file(run_message.get("cookieJar"))
@@ -1482,15 +1706,25 @@ def run_yt_dlp_with_updates(
         return code, stderr_lines
 
     primary = _yt_dlp_primary_input_url(page_url, stream_url)
-    spotify_flow = platform_label.strip().lower() == "spotify"
-    if spotify_flow:
+    plat = (platform_label or "").strip().lower()
+    spotify_flow = plat == "spotify"
+    apple_flow = plat in ("apple music", "apple") or _is_apple_music_drm_context(
+        stream_url, page_url
+    )
+    audio_flow = spotify_flow or apple_flow or bool(run_message.get("ytDlpAudioOnly"))
+    if audio_flow:
         run_message["ytDlpAudioOnly"] = True
+    start_detail = f"yt-dlp - {platform_label}"
+    if spotify_flow:
+        start_detail = "Attempting Spotify extraction…"
+    elif apple_flow:
+        start_detail = "Attempting Apple Music via yt-dlp…"
     send_message(
         with_job_id(
             {
                 "type": "progress",
                 "phase": "starting",
-                "detail": "Attempting Spotify extraction…" if spotify_flow else f"yt-dlp - {platform_label}",
+                "detail": start_detail,
                 "output": output_path,
             },
             job_id,
@@ -1533,6 +1767,22 @@ def run_yt_dlp_with_updates(
             yt_target = "ytsearch1:" + q
             code, err_lines = run_one(yt_target)
 
+    if code != 0 and apple_flow:
+        q = _apple_music_youtube_query(run_message, page_url, stream_url)
+        if q:
+            send_message(
+                with_job_id(
+                    {
+                        "type": "progress",
+                        "phase": "downloading",
+                        "detail": "Apple Music blocked; searching YouTube fallback…",
+                        "output": output_path,
+                    },
+                    job_id,
+                )
+            )
+            code, err_lines = run_one("ytsearch1:" + q)
+
     _remove_temp_file_quietly(cookie_file)
 
     if _CANCEL_EVENT.is_set():
@@ -1547,11 +1797,11 @@ def run_yt_dlp_with_updates(
                 job_id,
             )
         )
-        return
+        return True, ""
 
     tail = "".join(err_lines[-35:]).strip()
     if code == 0:
-        if spotify_flow:
+        if audio_flow:
             ok_v, verr = _verify_yt_dlp_audio_output(output_path)
         else:
             ok_v, verr = _verify_yt_dlp_output(output_path)
@@ -1559,10 +1809,11 @@ def run_yt_dlp_with_updates(
             err = verr or "Download validation failed"
             if tail:
                 err = err + " | " + tail[-600:]
-            send_message(
-                with_job_id({"type": "done", "success": False, "error": err}, job_id)
-            )
-            return
+            if emit_done_on_failure:
+                send_message(
+                    with_job_id({"type": "done", "success": False, "error": err}, job_id)
+                )
+            return False, err
         out_report = output_path
         detail_done = "Finished"
         if message.get("ytDlpDownloadPlaylist"):
@@ -1579,18 +1830,27 @@ def run_yt_dlp_with_updates(
                 job_id,
             )
         )
-    else:
-        err = f"yt-dlp exited with code {code}"
-        if tail:
-            err = err + ": " + tail[-600:]
-        if spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
-            err = (
-                "Spotify source protected (DRM/unsupported). "
-                "Direct full-audio extraction is blocked for many Spotify URLs. "
-                f"Details: {tail[-420:]}" if tail else
-                "Spotify source protected (DRM/unsupported). Direct full-audio extraction is blocked."
-            )
+        return True, ""
+
+    err = f"yt-dlp exited with code {code}"
+    if tail:
+        err = err + ": " + tail[-600:]
+    if spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
+        err = (
+            "Spotify source protected (DRM/unsupported). "
+            "Direct full-audio extraction is blocked for many Spotify URLs. "
+            f"Details: {tail[-420:]}" if tail else
+            "Spotify source protected (DRM/unsupported). Direct full-audio extraction is blocked."
+        )
+    if apple_flow and _looks_like_spotify_drm_or_unsupported(tail):
+        err = (
+            "Apple Music page extraction failed (often FairPlay DRM). "
+            f"Details: {tail[-420:]}" if tail else
+            "Apple Music page extraction failed (often FairPlay DRM)."
+        )
+    if emit_done_on_failure:
         send_message(with_job_id({"type": "done", "success": False, "error": err}, job_id))
+    return False, err
 
 
 # --- Obfuscated HLS (image-wrapped .ts segments) ---
@@ -2294,25 +2554,31 @@ def _ffmpeg_remux_combined_to_output(
     """ffmpeg mux combined TS/fMP4 to MP4; default re-encodes video for stable PTS/GOP."""
     global _active_ffmpeg
     out_mp4 = output_path.lower().endswith(".mp4")
-    transcoding = out_mp4 and not _ffmpeg_force_stream_copy_hls_mp4()
+    has_video = bool(_ffprobe_first_video_codec(combined_path))
+    audio_only = not has_video
+    # Audio-only: re-encode AAC (stream-copy of DRM/corrupt AAC looks "done" but won't play).
+    # Video: re-encode for stable PTS unless stream-copy forced.
+    transcoding = out_mp4 and (
+        audio_only or (has_video and not _ffmpeg_force_stream_copy_hls_mp4())
+    )
     preset = ""
-    if transcoding:
+    if transcoding and has_video:
         ld, ls = _local_file_format_hints(combined_path)
         preset = _ffmpeg_resolve_x264_preset(message, ld, ls)
+    if audio_only:
+        detail = "Re-encoding audio to MP4 (ffmpeg)…"
+    elif transcoding and preset:
+        detail = f"Re-encoding video to MP4 (x264 preset {preset})…"
+    elif transcoding:
+        detail = "Re-encoding video to MP4 (ffmpeg)…"
+    else:
+        detail = "Remuxing to MP4 (ffmpeg)…"
     send_message(
         with_job_id(
             {
                 "type": "progress",
                 "phase": "encoding",
-                "detail": (
-                    f"Re-encoding video to MP4 (x264 preset {preset})…"
-                    if transcoding and preset
-                    else (
-                        "Re-encoding video to MP4 (ffmpeg)…"
-                        if transcoding
-                        else "Remuxing to MP4 (ffmpeg)…"
-                    )
-                ),
+                "detail": detail,
                 "output": output_path,
             },
             job_id,
@@ -2329,13 +2595,19 @@ def _ffmpeg_remux_combined_to_output(
         "-i",
         combined_path,
     ]
-    if transcoding:
+    if audio_only and out_mp4:
+        cmd.extend(_ffmpeg_audio_only_encode_args())
+    elif transcoding:
         if not preset:
             ld, ls = _local_file_format_hints(combined_path)
             preset = _ffmpeg_resolve_x264_preset(message, ld, ls)
-        cmd.extend(_ffmpeg_transcode_stable_mp4_from_combined_file(container, preset=preset))
+        cmd.extend(
+            _ffmpeg_transcode_stable_mp4_from_combined_file(
+                container, preset=preset, audio_only=False
+            )
+        )
     else:
-        cmd.extend(["-c", "copy"])
+        cmd.extend(["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy"])
         if container == "ts":
             cmd.extend(["-bsf:a", "aac_adtstoasc"])
     cmd.extend(_ffmpeg_copy_mux_fixup_args(for_mp4=out_mp4))
@@ -2424,6 +2696,12 @@ def _ffmpeg_remux_combined_to_output(
         return
     tail = "".join(stderr_lines[-30:]).strip()
     if code == 0:
+        ok_p, perr = _verify_ffmpeg_output_playable(output_path)
+        if not ok_p:
+            send_message(
+                with_job_id({"type": "done", "success": False, "error": perr}, job_id)
+            )
+            return
         send_message(
             with_job_id(
                 {
@@ -2944,7 +3222,14 @@ def _download_obfuscated_hls(
 
 
 def _build_ffmpeg_cmd_list(
-    url, message, output_path, header_block, *, resume_from_sec: float = 0.0
+    url,
+    message,
+    output_path,
+    header_block,
+    *,
+    resume_from_sec: float = 0.0,
+    playlist_text: Optional[str] = None,
+    playlist_url: Optional[str] = None,
 ):
     pre = [
         "ffmpeg",
@@ -2956,11 +3241,37 @@ def _build_ffmpeg_cmd_list(
     ]
     seek_after_input = False
     seek_sec = 0.0
+    is_hls = _is_hls_input(url, message)
+    is_fmp4: Optional[bool] = None
+    audio_only = False
+    effective_playlist = playlist_text
+    if is_hls and effective_playlist is None:
+        try:
+            _pu, effective_playlist = _resolve_variant_playlist_url(url, header_block)
+            playlist_url = playlist_url or _pu
+        except (urllib.error.URLError, OSError, ValueError, UnicodeError):
+            effective_playlist = None
+    if effective_playlist:
+        is_fmp4 = _hls_playlist_is_fmp4(effective_playlist)
+        # Audio-only media playlists: no RESOLUTION and CODECS only mp4a, or EXT-X-MAP
+        # without video — also treat missing video codec + fMP4 audio CDNs as audio-only
+        # when the page/title looks like music (handled by caller DRM checks too).
+        if not _hls_playlist_likely_has_video(effective_playlist):
+            audio_only = True
+        elif is_fmp4 and not re.search(r"RESOLUTION\s*=", effective_playlist, re.I):
+            # Variant media playlist often has no CODECS; fMP4 without RESOLUTION is
+            # commonly audio-only (Apple Music, podcasts). Prefer audio encode path.
+            if not re.search(
+                r'CODECS\s*=\s*"[^"]*(?:avc|hvc|hev|vp09|av01)',
+                effective_playlist,
+                re.I,
+            ):
+                audio_only = True
     # HLS: default live_start_index is -3 (near live edge) which can make ffmpeg only
     # follow a short sliding window. Force start from the first listed segment, reload
     # playlists longer, and retry flaky segments (without TCP reconnect flags  they
     # destabilize some CDNs).
-    if _is_hls_input(url, message):
+    if is_hls:
         if resume_from_sec and resume_from_sec > 0.05:
             seek_after_input = True
             seek_sec = float(resume_from_sec)
@@ -3000,22 +3311,35 @@ def _build_ffmpeg_cmd_list(
     cmd = list(pre)
     if seek_after_input:
         cmd.extend(["-ss", f"{seek_sec:.3f}"])
-    out_mp4 = output_path.lower().endswith(".mp4")
+    out_mp4 = output_path.lower().endswith((".mp4", ".m4a", ".aac"))
     preset = ""
-    if (
-        (_is_hls_input(url, message) or _is_dash_input(url, message))
+    if audio_only and out_mp4:
+        cmd.extend(_ffmpeg_audio_only_encode_args())
+    elif (
+        (is_hls or _is_dash_input(url, message))
         and out_mp4
         and not _ffmpeg_force_stream_copy_hls_mp4()
     ):
         preset = _ffmpeg_probe_transcode_preset(url, message, header_block)
-        cmd.extend(_ffmpeg_transcode_stable_mp4_from_url(url, message, preset=preset))
+        cmd.extend(
+            _ffmpeg_transcode_stable_mp4_from_url(
+                url,
+                message,
+                preset=preset,
+                playlist_text=effective_playlist,
+                audio_only=False,
+                is_fmp4=is_fmp4,
+            )
+        )
     else:
-        cmd.extend(["-c", "copy"])
-        if _use_hls_aac_bsf(url, message):
+        cmd.extend(["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy"])
+        if _use_hls_aac_bsf(
+            url, message, playlist_text=effective_playlist, is_fmp4=is_fmp4
+        ):
             cmd.extend(["-bsf:a", "aac_adtstoasc"])
     cmd.extend(_ffmpeg_copy_mux_fixup_args(for_mp4=out_mp4))
     cmd.append(output_path)
-    return cmd, preset if "preset" in locals() else ""
+    return cmd, preset
 
 
 def _handle_ffmpeg_encode_preset_probe(message: dict) -> None:
@@ -3261,6 +3585,95 @@ def _ffprobe_video_validation(path: str) -> Tuple[float, bool]:
         OSError,
     ):
         return 0.0, False
+
+
+def _verify_ffmpeg_output_playable(path: str) -> Tuple[bool, str]:
+    """
+    Ensure ffmpeg output actually decodes. DRM/corrupt AAC often muxes with a full
+    duration but every packet fails to decode (players jump straight to the end).
+    """
+    if not path or not os.path.isfile(path):
+        return False, "Output file missing after ffmpeg"
+    try:
+        sz = os.path.getsize(path)
+    except OSError as e:
+        return False, str(e)
+    if sz < 4096:
+        return False, f"Output too small ({sz} bytes) — download likely failed"
+    if not shutil.which("ffmpeg"):
+        return True, ""
+    # Decode a short window; count samples. Corrupt/DRM audio yields ~0 samples.
+    try:
+        r = subprocess.run(
+            [
+                "ffmpeg",
+                "-v",
+                "error",
+                "-i",
+                path,
+                "-t",
+                "3",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError) as e:
+        return False, str(e)
+    err = (r.stderr or "") + (r.stdout or "")
+    # Count occurrences — ffmpeg often exits 0 while logging hundreds of AAC decode errors
+    # on FairPlay/SAMPLE-AES (players then jump straight to the end).
+    decode_fail_n = err.count("Error submitting packet to decoder")
+    invalid_data_n = err.count("Invalid data found when processing input")
+    aac_garbage_n = (
+        err.count("Reserved bit set")
+        + err.count("Prediction is not allowed in AAC-LC")
+        + err.count("Number of bands")
+        + err.count("channel element")
+    )
+    if decode_fail_n >= 15 or invalid_data_n >= 15 or aac_garbage_n >= 40:
+        return (
+            False,
+            "Downloaded media is encrypted or corrupt and will not play "
+            "(players jump to the end). This is usually DRM (e.g. Apple Music FairPlay) "
+            "which Stuff Grabber cannot decrypt.",
+        )
+    if r.returncode != 0 and (decode_fail_n + invalid_data_n) >= 2:
+        return (
+            False,
+            "Downloaded media failed decode checks — likely DRM or a corrupt remux. "
+            "Try a non-DRM source.",
+        )
+    dur, has_video = _ffprobe_video_validation(path)
+    has_audio = False
+    try:
+        rp = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        types = (rp.stdout or "").lower()
+        has_audio = "audio" in types
+    except (subprocess.SubprocessError, OSError):
+        pass
+    if dur < 0.05 and sz < 64 * 1024:
+        return False, "Output has no usable duration — remux produced an empty file"
+    if not has_video and not has_audio:
+        return False, "Output has no audio or video streams"
+    return True, ""
 
 
 def _yt_dlp_output_is_playlist_template(output_path: str) -> bool:
@@ -3830,16 +4243,28 @@ def run_ffmpeg_with_updates(url, filename, message):
                     )
                 )
                 return
-            ytdlp_out = _yt_dlp_output_target(message, out_dir, effective_filename)
-            _JOB_LIVE[job_id] = _job_live_from_message(ytdlp_out, url, message)
-            run_yt_dlp_with_updates(url, message, ytdlp_out, job_id, platform_label)
+            y_msg = dict(message or {})
+            # Apple Music: always hand yt-dlp the music.apple.com page URL (never FairPlay m3u8).
+            if platform_label == "Apple Music" or _is_apple_music_drm_context(
+                url, page_for_social
+            ):
+                y_msg["ytDlpAudioOnly"] = True
+                page_u = page_for_social
+                if page_u and "music.apple.com" in page_u.lower():
+                    url = page_u
+                elif "music.apple.com" in (url or "").lower():
+                    page_u = url
+                    y_msg["pageUrl"] = url
+                    y_msg["referer"] = url
+            ytdlp_out = _yt_dlp_output_target(y_msg, out_dir, effective_filename)
+            _JOB_LIVE[job_id] = _job_live_from_message(ytdlp_out, url, y_msg)
+            run_yt_dlp_with_updates(url, y_msg, ytdlp_out, job_id, platform_label)
             return
 
         header_block = build_ffmpeg_header_block(message, url)
-        cmd, x264_preset = _build_ffmpeg_cmd_list(
-            url, message, output_path, header_block, resume_from_sec=0.0
-        )
 
+        var_pair: Optional[Tuple[str, str]] = None
+        var_url_r, var_text_r = "", ""
         if _is_hls_input(url, message):
             send_message(
                 with_job_id(
@@ -3852,15 +4277,61 @@ def run_ffmpeg_with_updates(url, filename, message):
                     job_id,
                 )
             )
-            var_pair: Optional[Tuple[str, str]] = None
             try:
                 var_pair = _resolve_variant_playlist_url(url, header_block)
             except Exception:
                 var_pair = None
-
             var_url_r, var_text_r = (
                 var_pair if var_pair is not None else ("", "")
             )
+            drm_err = _hls_playlist_drm_error(var_text_r)
+            if drm_err:
+                # Last resort: if we somehow got FairPlay HLS without an Apple page route,
+                # still try yt-dlp against pageUrl when present.
+                if page_for_social and _yt_dlp_available():
+                    y_msg = dict(message or {})
+                    y_msg["ytDlpAudioOnly"] = True
+                    ytdlp_out = _yt_dlp_output_target(
+                        y_msg, out_dir, effective_filename
+                    )
+                    _JOB_LIVE[job_id] = _job_live_from_message(
+                        ytdlp_out, page_for_social, y_msg
+                    )
+                    run_yt_dlp_with_updates(
+                        page_for_social,
+                        y_msg,
+                        ytdlp_out,
+                        job_id,
+                        "Apple Music",
+                    )
+                    return
+                send_message(
+                    with_job_id(
+                        {"type": "done", "success": False, "error": drm_err},
+                        job_id,
+                    )
+                )
+                return
+
+        def _fail_both(ffmpeg_err: str) -> None:
+            send_message(
+                with_job_id(
+                    {"type": "done", "success": False, "error": ffmpeg_err},
+                    job_id,
+                )
+            )
+
+        cmd, x264_preset = _build_ffmpeg_cmd_list(
+            url,
+            message,
+            output_path,
+            header_block,
+            resume_from_sec=0.0,
+            playlist_text=var_text_r or None,
+            playlist_url=var_url_r or None,
+        )
+
+        if _is_hls_input(url, message):
             if var_text_r and _hls_uses_misleading_extensions(var_url_r or url, var_text_r):
                 clean_kind: Optional[str] = None
                 try:
@@ -3926,19 +4397,10 @@ def run_ffmpeg_with_updates(url, filename, message):
                 stderr=subprocess.PIPE,
             )
         except FileNotFoundError:
-            send_message(
-                with_job_id(
-                    {
-                        "type": "done",
-                        "success": False,
-                        "error": "ffmpeg not found in PATH",
-                    },
-                    job_id,
-                )
-            )
+            _fail_both("ffmpeg not found in PATH")
             return
         except Exception as e:
-            send_message(with_job_id({"type": "done", "success": False, "error": str(e)}, job_id))
+            _fail_both(str(e))
             return
 
         with _PROC_LOCK:
@@ -4013,22 +4475,26 @@ def run_ffmpeg_with_updates(url, filename, message):
             _send_done_canceled(job_id)
             return
         if code == 0:
-            send_message(
-                with_job_id(
-                    {
-                        "type": "done",
-                        "success": True,
-                        "output": output_path,
-                        "detail": "Finished",
-                    },
-                    job_id,
+            ok_p, perr = _verify_ffmpeg_output_playable(output_path)
+            if not ok_p:
+                _fail_both(perr)
+            else:
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": True,
+                            "output": output_path,
+                            "detail": "Finished",
+                        },
+                        job_id,
+                    )
                 )
-            )
         else:
             err = f"ffmpeg exited with code {code}"
             if tail:
                 err = err + ": " + tail[-500:]
-            send_message(with_job_id({"type": "done", "success": False, "error": err}, job_id))
+            _fail_both(err)
     finally:
         _clear_active_if(proc)
         _CANCEL_EVENT.clear()
