@@ -212,7 +212,7 @@ python python/setup_browser_roots.py
 
 Firefox will unload the add-on when you quit the browser. Load it again the same way next time. That is the supported personal Firefox path. The Firefox id is fixed as `stuff-grabber@local`, so you do not paste a Firefox id into the installer.
 
-How the folders work: `public/`, `asset/`, and `style/` stay at the repo root. The setup script links those into `chromium/` and `firefox/` (junctions on Windows, symlinks elsewhere), so Chrome Load unpacked on `chromium/` and Firefox temporary load on `firefox/` both see the same scripts and icons without duplicating the tree.
+How the folders work: `public/`, `asset/`, and `style/` stay at the repo root. Setup links them into `chromium/` (live junctions/symlinks — Chrome is fine with that). Firefox gets real copies of those folders, because Firefox often cannot load popup CSS/JS through Windows junctions (blank popup / Quirks Mode). After you edit shared extension files, run `python python/setup_browser_roots.py` again before reloading the Firefox temporary add-on.
 
 
 Install the helper

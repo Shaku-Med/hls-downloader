@@ -32,7 +32,7 @@ package-lock.json
 *.zip
 *.xpi
 
-# Shared asset junctions/symlinks under browser roots (real files live at repo root)
+# Browser-root mounts (chromium = junctions/symlinks; firefox = local copies)
 /chromium/public/
 /chromium/asset/
 /chromium/style/

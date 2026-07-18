@@ -4,15 +4,19 @@ const CTX_IMG_ROOT = 'sg_ctx_img_root';
 const CTX_IMG_FMT_PREFIX = 'sg_ctx_img_fmt_';
 const CTX_IMG_FMTS = ['png', 'jpg', 'jpeg', 'webp'];
 
-try {
-  importScripts('zip-store.js');
-} catch (e) {
-  console.warn('Stuff Grabber: zip-store failed to load', e);
-}
-try {
-  importScripts('social-post-urls.js');
-} catch (e) {
-  console.warn('Stuff Grabber: social-post-urls failed to load', e);
+// Service worker (Chromium): pull in helpers. Firefox uses background.scripts
+// in firefox/manifest.json instead — importScripts is not available there.
+if (typeof importScripts === 'function') {
+  try {
+    importScripts('zip-store.js');
+  } catch (e) {
+    console.warn('Stuff Grabber: zip-store failed to load', e);
+  }
+  try {
+    importScripts('social-post-urls.js');
+  } catch (e) {
+    console.warn('Stuff Grabber: social-post-urls failed to load', e);
+  }
 }
 
 /** @type {Record<number, ReturnType<typeof setTimeout>>} */

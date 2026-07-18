@@ -1,17 +1,25 @@
 ﻿"""
 Create chromium/ and firefox/ extension roots.
 
-Each folder has its own manifest.json. Shared assets (public, asset, style)
-are linked from the repo root so we do not duplicate files.
+Each folder has its own manifest.json.
 
   Chrome / Edge / Brave:  Load unpacked -> select the chromium/ folder
-  Firefox:                Load Temporary Add-on -> pick any file inside firefox/
+  Firefox:                Load Temporary Add-on -> pick firefox/manifest.json
+
+Chromium uses directory junctions/symlinks to the shared public/, asset/, and
+style/ folders (Chrome follows them fine).
+
+Firefox gets real copies of those folders. Firefox's sandbox often fails to
+load popup/options/CSS through Windows junctions, which shows up as a blank
+popup and Quirks Mode warnings. Re-run this script after editing shared files
+before reloading the Firefox temporary add-on.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -20,7 +28,14 @@ ROOT = os.path.dirname(SCRIPT_DIR)
 SHARED_DIRS = ("public", "asset", "style")
 
 CHROMIUM_BACKGROUND = {"service_worker": "public/scripts/background.js"}
-FIREFOX_BACKGROUND = {"scripts": ["public/scripts/background.js"]}
+# Classic background scripts (not a service worker): list deps explicitly.
+FIREFOX_BACKGROUND = {
+    "scripts": [
+        "public/scripts/zip-store.js",
+        "public/scripts/social-post-urls.js",
+        "public/scripts/background.js",
+    ]
+}
 FIREFOX_GECKO = {
     "gecko": {
         "id": "stuff-grabber@local",
@@ -28,7 +43,6 @@ FIREFOX_GECKO = {
     }
 }
 
-# Root-level manifests are legacy; browser folders are the load targets.
 LEGACY_ROOT_MANIFESTS = (
     "manifest.json",
     "manifest.firefox.json",
@@ -81,18 +95,20 @@ def _is_reparse_point(path: str) -> bool:
     return False
 
 
-def _remove_link(path: str) -> None:
-    if not (os.path.isdir(path) or os.path.islink(path)):
+def _remove_shared_mount(path: str) -> None:
+    """Remove a junction, symlink, or real copied directory."""
+    if not (os.path.isdir(path) or os.path.islink(path) or os.path.isfile(path)):
         return
-    if os.name == "nt" and _is_reparse_point(path):
-        os.rmdir(path)
+    if _is_reparse_point(path) or os.path.islink(path):
+        if os.name == "nt" and os.path.isdir(path) and not os.path.islink(path):
+            os.rmdir(path)
+        else:
+            os.unlink(path)
         return
-    if os.path.islink(path):
-        os.unlink(path)
+    if os.path.isdir(path):
+        shutil.rmtree(path)
         return
-    raise SystemExit(
-        f"{path} exists as a real directory (not a link). Move it aside and re-run."
-    )
+    os.remove(path)
 
 
 def _link_shared(browser_dir: str, name: str) -> None:
@@ -101,8 +117,7 @@ def _link_shared(browser_dir: str, name: str) -> None:
     if not os.path.isdir(target):
         raise SystemExit(f"Missing shared folder: {target}")
 
-    if os.path.isdir(link_path) or os.path.islink(link_path):
-        _remove_link(link_path)
+    _remove_shared_mount(link_path)
 
     if os.name == "nt":
         r = subprocess.run(
@@ -116,6 +131,15 @@ def _link_shared(browser_dir: str, name: str) -> None:
             )
     else:
         os.symlink(target, link_path, target_is_directory=True)
+
+
+def _copy_shared(browser_dir: str, name: str) -> None:
+    target = os.path.join(ROOT, name)
+    dest = os.path.join(browser_dir, name)
+    if not os.path.isdir(target):
+        raise SystemExit(f"Missing shared folder: {target}")
+    _remove_shared_mount(dest)
+    shutil.copytree(target, dest)
 
 
 def setup() -> None:
@@ -135,19 +159,18 @@ def setup() -> None:
     firefox_manifest["browser_specific_settings"] = dict(FIREFOX_GECKO)
     _write_json(os.path.join(firefox_dir, "manifest.json"), firefox_manifest)
 
-    for browser_dir in (chromium_dir, firefox_dir):
-        for name in SHARED_DIRS:
-            _link_shared(browser_dir, name)
+    for name in SHARED_DIRS:
+        _link_shared(chromium_dir, name)
+        _copy_shared(firefox_dir, name)
 
-    # Remove root manifests so nobody loads the wrong browser from the repo root.
     for name in LEGACY_ROOT_MANIFESTS:
         path = os.path.join(ROOT, name)
         if os.path.isfile(path):
             os.remove(path)
 
     print("Browser roots ready:")
-    print(f"  Chromium -> {chromium_dir}")
-    print(f"  Firefox  -> {firefox_dir}")
+    print(f"  Chromium -> {chromium_dir}  (live links to shared folders)")
+    print(f"  Firefox  -> {firefox_dir}  (copied folders; re-run this after edits)")
     print("")
     print("Chrome/Edge: Load unpacked -> select the chromium folder")
     print("Firefox:     about:debugging -> Load Temporary Add-on -> pick firefox/manifest.json")

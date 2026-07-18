@@ -18,6 +18,8 @@
   ],
   "background": {
     "scripts": [
+      "public/scripts/zip-store.js",
+      "public/scripts/social-post-urls.js",
       "public/scripts/background.js"
     ]
   },
