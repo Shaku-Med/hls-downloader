@@ -43,14 +43,19 @@
     <section id="download-banner" class="jobs-panel" hidden></section>
 
     <main id="content" class="streams-panel">
-      <div class="empty">Loading</div>
+      <div id="streams-root">
+        <div class="empty"><strong>Loading</strong>Hang tight…</div>
+      </div>
+      <div id="images-root" class="images-root" hidden></div>
     </main>
 
-    <footer class="footer">I run up to 4 downloads at once. The rest wait their turn, shared across all your tabs.</footer>
+    <footer class="footer">Up to 4 downloads at once. The rest wait their turn across your tabs.</footer>
   </div>
+  <script src="scripts/ios-select.js"></script>
   <script src="scripts/theme-helpers.js"></script>
   <script src="scripts/yt-page-helpers.js"></script>
   <script src="scripts/ffmpeg-preset-helpers.js"></script>
+  <script src="scripts/image-panel.js"></script>
   <script src="scripts/popup.js"></script>
 </body>
 </html>

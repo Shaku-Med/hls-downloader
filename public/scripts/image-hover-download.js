@@ -11,9 +11,14 @@
   // moves to it. Stops neighbouring grid thumbnails from stealing focus while
   // you're just on your way to click Download.
   const SWITCH_DELAY_MS = 220;
-  const MAX_LIST = 80;
-  const MAX_HOVER_SCAN = 220;
+  const MAX_LIST_PAGE = 200;
+  const MAX_LIST_VISIBLE = 120;
+  const MAX_HOVER_SCAN = 320;
+  const LIST_SCOPE_KEY = 'imageListScope'; // 'page' | 'visible'
   const BOX_REFRESH_MS = 450;
+  // If the cursor is not exactly on an image box (overlays / pe:none stacks),
+  // still pick the nearest image within this many CSS pixels.
+  const PROXIMITY_PX = 36;
 
   const st = {
     enabled: false,
@@ -21,6 +26,8 @@
     hoveringImg: false,
     activeImg: null,
     hideTimer: null,
+    /** Image the user closed; ignore until the pointer leaves it. */
+    dismissedImg: null,
   };
 
   const host = document.createElement('div');
@@ -29,36 +36,83 @@
 
   shadow.innerHTML = `
     <style>
-      :host { all: initial; }
+      :host {
+        all: initial;
+        --sg-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+          "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+        --sg-bg: #000000;
+        --sg-surface: #1c1c1e;
+        --sg-text: #ffffff;
+        --sg-muted: #8e8e93;
+        --sg-line: rgba(84, 84, 88, 0.65);
+        --sg-accent: #0a84ff;
+        --sg-accent-2: #409cff;
+        --sg-btnText: #ffffff;
+        --sg-fill: rgba(120, 120, 128, 0.32);
+        --sg-fill-2: rgba(120, 120, 128, 0.24);
+        --font: var(--sg-font);
+        --surface: var(--sg-surface);
+        --text: var(--sg-text);
+        --muted: var(--sg-muted);
+        --line: var(--sg-line);
+        --accent: var(--sg-accent);
+        --fill: var(--sg-fill);
+        --fill-secondary: var(--sg-fill-2);
+        --radius-lg: 16px;
+        --radius-ctrl: 10px;
+        --shadow: 0 16px 48px rgba(0, 0, 0, 0.45);
+        --transition: 220ms cubic-bezier(0.25, 0.1, 0.25, 1);
+        --spring: 320ms cubic-bezier(0.34, 1.2, 0.64, 1);
+      }
+      :host([data-theme="light"]) {
+        --sg-bg: #f2f2f7;
+        --sg-surface: #ffffff;
+        --sg-text: #000000;
+        --sg-muted: #8e8e93;
+        --sg-line: rgba(60, 60, 67, 0.18);
+        --sg-accent: #007aff;
+        --sg-accent-2: #0a84ff;
+        --sg-fill: rgba(120, 120, 128, 0.16);
+        --sg-fill-2: rgba(120, 120, 128, 0.12);
+        --shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
+      }
+      * { box-sizing: border-box; font-family: var(--sg-font); }
       .hl {
         position: fixed;
         pointer-events: none;
         z-index: 2147483646;
-        border: 2px solid var(--sg-accent, #2563eb);
-        box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
-        border-radius: 10px;
+        border: 2px solid var(--sg-accent);
+        box-shadow: 0 0 0 3px color-mix(in srgb, var(--sg-accent) 22%, transparent);
+        border-radius: 12px;
         display: none;
       }
       .pop {
         position: fixed;
-        z-index: 2147483647;
+        z-index: 2147483646;
         display: none;
-        padding: 12px 12px;
-        border-radius: 14px;
-        background: var(--sg-surface, rgba(15, 23, 42, 0.92));
-        color: var(--sg-text, #fff);
-        font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-        box-shadow: 0 18px 48px rgba(0,0,0,.28), 0 6px 18px rgba(0,0,0,.18);
-        min-width: 220px;
+        padding: 14px;
+        border-radius: 18px;
+        background: color-mix(in srgb, var(--sg-surface) 88%, transparent);
+        color: var(--sg-text);
+        box-shadow: var(--shadow);
+        min-width: 240px;
         max-width: 320px;
-        backdrop-filter: blur(10px);
-        border: 1px solid var(--sg-line, rgba(255,255,255,.16));
+        backdrop-filter: blur(28px) saturate(180%);
+        -webkit-backdrop-filter: blur(28px) saturate(180%);
+        border: 0.5px solid var(--sg-line);
       }
-      .row1 { display:flex; align-items:center; justify-content:space-between; gap: 10px; margin-bottom: 10px; }
+      .row1 {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 12px;
+      }
       .t {
-        font-size: 12px;
-        color: var(--sg-text, #fff);
+        font-size: 15px;
+        color: var(--sg-text);
         font-weight: 650;
+        letter-spacing: -0.02em;
         max-width: 240px;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -66,56 +120,90 @@
       }
       .x {
         border: none;
-        background: transparent;
-        color: var(--sg-muted, rgba(255,255,255,.78));
-        font-size: 16px;
+        background: var(--sg-fill);
+        color: var(--sg-muted);
+        width: 28px;
+        height: 28px;
+        font-size: 18px;
         line-height: 1;
         cursor: pointer;
-        padding: 4px 8px;
-        border-radius: 8px;
+        border-radius: 50%;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        transition: background var(--transition), transform 120ms ease;
       }
-      .x:hover { background: rgba(255,255,255,.12); color: var(--sg-text, #fff); }
-      .row2 { display:flex; gap: 8px; align-items: center; }
-      select {
-        flex: 1;
-        padding: 9px 10px;
-        border-radius: 12px;
-        border: 1px solid var(--sg-line, rgba(255,255,255,.16));
-        background: rgba(255,255,255,.08);
-        color: var(--sg-text, #fff);
-        font-size: 12px;
-        outline: none;
-      }
-      :host([data-theme-mode="page"]) select {
-        background: var(--sg-accent);
-        color: var(--sg-btnText);
-        border-color: color-mix(in srgb, var(--sg-accent) 72%, var(--sg-line) 28%);
-      }
-      :host([data-theme-mode="page"]) select option {
-        background: var(--sg-accent);
-        color: var(--sg-btnText);
-      }
+      .x:hover { background: var(--sg-fill-2); color: var(--sg-text); }
+      .x:active { transform: scale(0.94); }
+      .row2 { display: flex; gap: 8px; align-items: stretch; }
+      .row2 .ios-select { flex: 1; min-width: 0; }
       button.dl {
-        padding: 9px 12px;
-        border-radius: 12px;
-        border: 1px solid color-mix(in srgb, var(--sg-accent) 70%, transparent 30%);
-        background: linear-gradient(180deg, var(--sg-accent, #2563eb) 0%, var(--sg-accent-2, #1d4ed8) 100%);
-        color: var(--sg-btnText, #fff);
+        padding: 0 16px;
+        min-height: 40px;
+        border-radius: 980px;
+        border: none;
+        background: var(--sg-accent);
+        color: var(--sg-btnText);
         cursor: pointer;
-        font-size: 12px;
-        font-weight: 700;
+        font-size: 14px;
+        font-weight: 600;
+        letter-spacing: -0.01em;
+        transition: filter var(--transition), transform 120ms ease;
+        white-space: nowrap;
       }
-      button.dl:disabled { opacity: .6; cursor: default; }
+      button.dl:hover { filter: brightness(1.06); }
+      button.dl:active { transform: scale(0.97); }
+      button.dl:disabled { opacity: .45; cursor: default; filter: none; }
       .sub {
-        margin-top: 8px;
-        font-size: 11px;
-        color: var(--sg-muted, rgba(255,255,255,.72));
+        margin-top: 10px;
+        font-size: 12px;
+        color: var(--sg-muted);
         line-height: 1.35;
+        letter-spacing: -0.01em;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
       }
-      a, a:visited { color: rgba(147, 197, 253, 1); }
+      /* iOS select (inlined for shadow) */
+      .ios-select { position: relative; display: block; width: 100%; min-width: 0; }
+      .ios-select-native {
+        position: absolute !important; width: 1px !important; height: 1px !important;
+        padding: 0 !important; margin: -1px !important; overflow: hidden !important;
+        clip: rect(0,0,0,0) !important; border: 0 !important; opacity: 0 !important;
+        pointer-events: none !important;
+      }
+      .ios-select-trigger {
+        width: 100%; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        min-height: 40px; padding: 8px 12px; border: none; border-radius: 10px;
+        background: var(--sg-fill); color: var(--sg-text); font: inherit; font-size: 14px;
+        letter-spacing: -0.01em; text-align: left; cursor: pointer;
+      }
+      .ios-select-trigger:hover { background: var(--sg-fill-2); }
+      .ios-select-value { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .ios-select-chevron { width: 16px; height: 16px; color: var(--sg-muted); transition: transform var(--spring); }
+      .ios-select.is-open .ios-select-chevron { transform: rotate(180deg); }
+      .ios-select-menu {
+        position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 80;
+        max-height: 220px; overflow: auto; overscroll-behavior: contain; padding: 6px;
+        border-radius: 14px; background: color-mix(in srgb, var(--sg-surface) 92%, transparent);
+        backdrop-filter: blur(24px) saturate(160%); -webkit-backdrop-filter: blur(24px) saturate(160%);
+        border: 0.5px solid var(--sg-line); box-shadow: var(--shadow); box-sizing: border-box;
+      }
+      .ios-select-menu.ios-select-menu--fixed {
+        position: fixed !important; right: auto !important; bottom: auto !important;
+        margin: 0; z-index: 2147483647 !important;
+      }
+      .ios-select-menu[hidden] { display: none !important; }
+      .ios-select-option {
+        display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        width: 100%; border: none; border-radius: 10px; background: transparent;
+        color: var(--sg-text); font: inherit; font-size: 14px; text-align: left;
+        padding: 10px 12px; cursor: pointer;
+      }
+      .ios-select-option:hover { background: var(--sg-fill); }
+      .ios-select-option.is-selected { color: var(--sg-accent); font-weight: 600; }
+      .ios-select-check { width: 14px; height: 14px; opacity: 0; color: var(--sg-accent); }
+      .ios-select-option.is-selected .ios-select-check { opacity: 1; }
     </style>
     <div class="hl" part="highlight"></div>
     <div class="pop" part="popover" role="dialog" aria-label="Download image">
@@ -164,13 +252,15 @@
   }
 
   function updateImageHoverChrome(resolved, mode) {
-    elHL.style.borderColor = 'var(--sg-accent, #2563eb)';
-    elHL.style.boxShadow =
-      mode === 'page'
-        ? '0 0 0 3px color-mix(in srgb, var(--sg-accent) 22%, transparent)'
-        : resolved === 'dark'
-          ? '0 0 0 3px rgba(255,255,255,.08)'
-          : '0 0 0 3px rgba(37,99,235,.18)';
+    elHL.style.borderColor = 'var(--sg-accent, #0a84ff)';
+    elHL.style.boxShadow = '0 0 0 3px color-mix(in srgb, var(--sg-accent) 24%, transparent)';
+    if (mode === 'page' || resolved) {
+      // keep accent ring; host CSS vars already applied by theme helper
+    }
+  }
+
+  if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+    HLS_IOS_SELECT.enhance(elFmt, { compact: true });
   }
 
   let unbindImageTheme = null;
@@ -205,20 +295,133 @@
     });
   }
 
-  function isImgGood(img) {
-    if (!img) return false;
-    if (img.tagName !== 'IMG') return false;
-    const r = img.getBoundingClientRect();
-    if (!Number.isFinite(r.width) || !Number.isFinite(r.height)) return false;
-    if (r.width < MIN_SIZE || r.height < MIN_SIZE) return false;
+  function isInViewport(r) {
+    if (!r) return false;
     if (r.bottom < 0 || r.right < 0) return false;
     if (r.top > window.innerHeight || r.left > window.innerWidth) return false;
     return true;
   }
 
+  /**
+   * @param {HTMLImageElement} img
+   * @param {{ requireVisible?: boolean }} [opts]
+   *   requireVisible true  → only images in the current scroll viewport (hover)
+   *   requireVisible false → any laid-out image on the page (full-page list)
+   */
+  function isImgGood(img, opts) {
+    if (!img) return false;
+    if (!(img instanceof HTMLImageElement) && img.tagName !== 'IMG') return false;
+    const requireVisible = !opts || opts.requireVisible !== false;
+    const r = img.getBoundingClientRect();
+    if (!Number.isFinite(r.width) || !Number.isFinite(r.height)) return false;
+    if (r.width < MIN_SIZE || r.height < MIN_SIZE) return false;
+    if (requireVisible && !isInViewport(r)) return false;
+    // Still accept pointer-events:none / invisible hit targets — geometry only.
+    return true;
+  }
+
   function pickImgUrl(img) {
-    const u = (img.currentSrc || img.src || '').trim();
-    return u;
+    if (!img) return '';
+    const srcset = (img.currentSrc || '').trim();
+    if (srcset) return srcset;
+    const u = (img.src || '').trim();
+    if (u) return u;
+    try {
+      const source = img.parentElement && img.parentElement.tagName === 'PICTURE'
+        ? img.parentElement.querySelector('source[srcset], source[src]')
+        : null;
+      if (source) {
+        const ss = (source.getAttribute('srcset') || '').split(',')[0]?.trim().split(/\s+/)[0];
+        if (ss) return new URL(ss, location.href).href;
+        const s = (source.getAttribute('src') || '').trim();
+        if (s) return new URL(s, location.href).href;
+      }
+    } catch (_) {
+      // ignore
+    }
+    return '';
+  }
+
+  function collectPageImages(opts) {
+    const requireVisible = !opts || opts.requireVisible !== false;
+    const out = [];
+    const seen = new Set();
+    const add = (img) => {
+      if (!(img instanceof HTMLImageElement)) return;
+      if (seen.has(img)) return;
+      seen.add(img);
+      if (!isImgGood(img, { requireVisible })) return;
+      out.push(img);
+    };
+    try {
+      for (const img of Array.from(document.images || [])) add(img);
+    } catch (_) {
+      // ignore
+    }
+    try {
+      document.querySelectorAll('img').forEach(add);
+    } catch (_) {
+      // ignore
+    }
+    return out;
+  }
+
+  function normalizeListScope(scope) {
+    return scope === 'visible' ? 'visible' : 'page';
+  }
+
+  function pointInRect(x, y, r, pad) {
+    const p = pad || 0;
+    return x >= r.left - p && x <= r.right + p && y >= r.top - p && y <= r.bottom + p;
+  }
+
+  function distToRect(x, y, r) {
+    const dx = x < r.left ? r.left - x : x > r.right ? x - r.right : 0;
+    const dy = y < r.top ? r.top - y : y > r.bottom ? y - r.bottom : 0;
+    return Math.hypot(dx, dy);
+  }
+
+  function imgFromStack(x, y) {
+    // elementsFromPoint skips pointer-events:none nodes, but overlays on top
+    // still appear — walk them and look for contained <img> geometry.
+    let stack = [];
+    try {
+      stack = document.elementsFromPoint(x, y) || [];
+    } catch (_) {
+      stack = [];
+    }
+    let best = null;
+    let bestArea = Infinity;
+    for (const el of stack) {
+      if (!el || el === host || (host.contains && host.contains(el))) continue;
+      if (el instanceof HTMLImageElement && isImgGood(el) && pointInRect(x, y, el.getBoundingClientRect(), 0)) {
+        const r = el.getBoundingClientRect();
+        const area = Math.max(1, r.width) * Math.max(1, r.height);
+        if (area < bestArea) {
+          bestArea = area;
+          best = el;
+        }
+        continue;
+      }
+      if (!el.querySelectorAll) continue;
+      let imgs;
+      try {
+        imgs = el.querySelectorAll('img');
+      } catch (_) {
+        continue;
+      }
+      for (const img of imgs) {
+        if (!isImgGood(img)) continue;
+        const r = img.getBoundingClientRect();
+        if (!pointInRect(x, y, r, 2)) continue;
+        const area = Math.max(1, r.width) * Math.max(1, r.height);
+        if (area < bestArea) {
+          bestArea = area;
+          best = img;
+        }
+      }
+    }
+    return best;
   }
 
   function sanitizeFileStem(s) {
@@ -461,23 +664,25 @@
     }
   }
 
-  function listImages() {
+  function listImages(options) {
+    const scope = normalizeListScope(options && options.scope);
+    const requireVisible = scope === 'visible';
+    const max = requireVisible ? MAX_LIST_VISIBLE : MAX_LIST_PAGE;
     const out = [];
     const seen = new Set();
-    for (const img of Array.from(document.images || [])) {
-      if (!(img instanceof HTMLImageElement)) continue;
-      if (!isImgGood(img)) continue;
+    for (const img of collectPageImages({ requireVisible })) {
       const url = pickImgUrl(img);
       if (!url || !/^https?:|^data:/i.test(url)) continue;
       if (seen.has(url)) continue;
       seen.add(url);
+      const r = img.getBoundingClientRect();
       out.push({
         url,
         alt: (img.getAttribute('alt') || '').trim(),
-        w: img.naturalWidth || Math.round(img.getBoundingClientRect().width),
-        h: img.naturalHeight || Math.round(img.getBoundingClientRect().height),
+        w: img.naturalWidth || Math.round(r.width),
+        h: img.naturalHeight || Math.round(r.height),
       });
-      if (out.length >= MAX_LIST) break;
+      if (out.length >= max) break;
     }
     return out;
   }
@@ -514,10 +719,13 @@
     _lastBoxesAt = now;
     const next = [];
     let count = 0;
-    for (const img of Array.from(document.images || [])) {
-      if (!(img instanceof HTMLImageElement)) continue;
-      if (!isImgGood(img)) continue;
-      next.push({ img, rect: img.getBoundingClientRect() });
+    for (const img of collectPageImages()) {
+      const rect = img.getBoundingClientRect();
+      next.push({
+        img,
+        rect,
+        area: Math.max(1, rect.width) * Math.max(1, rect.height),
+      });
       count++;
       if (count >= MAX_HOVER_SCAN) break;
     }
@@ -543,31 +751,106 @@
   }
 
   function boxHit(x, y) {
+    // 1) Pure geometry over all known <img> boxes — works even when the image
+    //    (or a covering layer) has pointer-events: none.
     let best = null;
     let bestArea = Infinity;
     for (const b of _boxes) {
       const r = b.rect;
-      if (x < r.left || x > r.right || y < r.top || y > r.bottom) continue;
-      const area = Math.max(1, r.width) * Math.max(1, r.height);
+      if (!pointInRect(x, y, r, 0)) continue;
+      const area = b.area || Math.max(1, r.width) * Math.max(1, r.height);
       if (area < bestArea) {
         bestArea = area;
         best = b.img;
       }
     }
-    return best;
+    if (best) return best;
+
+    // 2) Walk the element stack / overlay parents for nested images.
+    const fromStack = imgFromStack(x, y);
+    if (fromStack) return fromStack;
+
+    // 3) Soft proximity — cursor near an image still counts.
+    let near = null;
+    let nearDist = PROXIMITY_PX;
+    for (const b of _boxes) {
+      const d = distToRect(x, y, b.rect);
+      if (d < nearDist) {
+        nearDist = d;
+        near = b.img;
+      }
+    }
+    return near;
+  }
+
+  function isOurUiNode(n) {
+    if (!n || n === window || n === document || n === document.documentElement) return false;
+    if (n === elPop || n === host) return true;
+    if (n.nodeType === 1 && n.classList) {
+      return (
+        n.classList.contains('pop') ||
+        n.classList.contains('ios-select') ||
+        n.classList.contains('ios-select-menu') ||
+        n.classList.contains('ios-select-trigger') ||
+        n.classList.contains('ios-select-option')
+      );
+    }
+    // Portaled menu lives under document; walk parents.
+    try {
+      let cur = n.parentNode || n.host || null;
+      while (cur && cur !== document && cur !== window) {
+        if (cur === elPop || cur === host) return true;
+        if (cur.nodeType === 1 && cur.classList && cur.classList.contains('ios-select-menu')) {
+          return true;
+        }
+        cur = cur.parentNode || cur.host || null;
+      }
+    } catch (_) {
+      // ignore
+    }
+    return false;
+  }
+
+  function pointerOverOurUi(ev) {
+    const path = typeof ev.composedPath === 'function' ? ev.composedPath() : [];
+    return path.some((n) => isOurUiNode(n));
+  }
+
+  /** Where the pointer is going (leave/out) — do not use composedPath (includes the element being left). */
+  function pointerGoingToOurUi(ev) {
+    const to = ev.relatedTarget;
+    if (!to) return false;
+    return isOurUiNode(to);
+  }
+
+  function dismissPopover(fromImg) {
+    st.hoveringUi = false;
+    st.hoveringImg = false;
+    st.dismissedImg = fromImg || st.activeImg || null;
+    st.activeImg = null;
+    clearPendingSwitch();
+    if (st.hideTimer) {
+      clearTimeout(st.hideTimer);
+      st.hideTimer = null;
+    }
+    setVisible(false);
   }
 
   function onPointerMove(ev) {
     if (!st.enabled) return;
-    // While the pointer sits on the popover itself, don't switch or hide — the
-    // user is reaching for the Download button, so leave everything where it is.
-    if (st.hoveringUi) {
+    // Popover / iOS dropdown (including portaled menu) — keep UI stable.
+    // Only treat as "over UI" when the popover is actually visible; otherwise a
+    // stale hoveringUi / leave race after Close would block all future hovers.
+    const popOpen = elPop.style.display !== 'none';
+    if (popOpen && (st.hoveringUi || pointerOverOurUi(ev))) {
+      st.hoveringUi = true;
       if (st.hideTimer) {
         clearTimeout(st.hideTimer);
         st.hideTimer = null;
       }
       return;
     }
+    st.hoveringUi = false;
     const x = ev.clientX;
     const y = ev.clientY;
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
@@ -575,9 +858,19 @@
     const img = boxHit(x, y);
     if (!(img instanceof HTMLImageElement) || !isImgGood(img)) {
       st.hoveringImg = false;
+      st.dismissedImg = null;
       clearPendingSwitch();
       scheduleHide();
       return;
+    }
+    // User closed while on this image — wait until they leave it.
+    if (st.dismissedImg && img === st.dismissedImg) {
+      st.hoveringImg = false;
+      clearPendingSwitch();
+      return;
+    }
+    if (st.dismissedImg && img !== st.dismissedImg) {
+      st.dismissedImg = null;
     }
     st.hoveringImg = true;
     if (st.hideTimer) {
@@ -611,6 +904,7 @@
         _pendingImg = null;
         if (!st.enabled || st.hoveringUi) return;
         if (!(target instanceof HTMLImageElement) || !isImgGood(target)) return;
+        if (st.dismissedImg && target === st.dismissedImg) return;
         _lastHoverUrl = pickImgUrl(target) || '';
         showFor(target);
       }, SWITCH_DELAY_MS);
@@ -618,9 +912,13 @@
   }
 
   function onScrollReposition() {
+    _lastBoxesAt = 0;
+    if (st.enabled) recomputeBoxes();
     if (st.enabled && st.activeImg && isImgGood(st.activeImg)) positionUi(st.activeImg);
   }
   function onResizeReposition() {
+    _lastBoxesAt = 0;
+    if (st.enabled) recomputeBoxes();
     if (st.enabled && st.activeImg && isImgGood(st.activeImg)) positionUi(st.activeImg);
   }
 
@@ -638,6 +936,9 @@
   function unmount() {
     setVisible(false);
     st.activeImg = null;
+    st.dismissedImg = null;
+    st.hoveringUi = false;
+    st.hoveringImg = false;
     clearPendingSwitch();
     window.removeEventListener('pointermove', onPointerMove, true);
     window.removeEventListener('scroll', onScrollReposition, true);
@@ -653,17 +954,21 @@
       st.hideTimer = null;
     }
   });
-  elPop.addEventListener('pointerleave', () => {
+  elPop.addEventListener('pointerleave', (ev) => {
+    // Moving into the portaled format menu still counts as our UI.
+    // Must use relatedTarget — composedPath always includes the element being left.
+    if (pointerGoingToOurUi(ev)) {
+      st.hoveringUi = true;
+      return;
+    }
     st.hoveringUi = false;
     scheduleHide();
   });
 
-  elClose.addEventListener('click', () => {
-    st.hoveringUi = false;
-    st.hoveringImg = false;
-    st.activeImg = null;
-    clearPendingSwitch();
-    setVisible(false);
+  elClose.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    dismissPopover(st.activeImg);
   });
   elDl.addEventListener('click', () => void handleDownloadClick());
 
@@ -684,7 +989,35 @@
   });
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (!msg || msg.type !== 'CONTEXT_IMAGE_DOWNLOAD_AS') return;
+    if (!msg || !msg.type) return;
+
+    if (msg.type === 'LIST_PAGE_IMAGES') {
+      try {
+        const scope = normalizeListScope(msg.scope);
+        refreshScan();
+        const images = listImages({ scope }) || [];
+        sendResponse({ ok: true, images, scope });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e), images: [] });
+      }
+      return true;
+    }
+
+    if (msg.type === 'DOWNLOAD_PAGE_IMAGE') {
+      const url = String(msg.url || '').trim();
+      const fmt = String(msg.fmt || 'png').toLowerCase();
+      const stem = String(msg.stem || 'image');
+      if (!url) {
+        sendResponse({ ok: false, error: 'Missing URL' });
+        return true;
+      }
+      Promise.resolve(downloadUrlAs(url, fmt, stem))
+        .then(() => sendResponse({ ok: true }))
+        .catch((e) => sendResponse({ ok: false, error: String(e) }));
+      return true;
+    }
+
+    if (msg.type !== 'CONTEXT_IMAGE_DOWNLOAD_AS') return;
     const p = msg.payload || {};
     const url = (p.url || '').toString().trim();
     const fmt = (p.format || 'png').toString().toLowerCase();
@@ -700,9 +1033,17 @@
     void downloadUrlAs(url, fmt, stem);
   });
 
+  function refreshScan() {
+    _lastBoxesAt = 0;
+    recomputeBoxes();
+  }
+
   window.HLS_IMAGE_DL = {
     listImages,
     downloadUrlAs,
+    refreshScan,
+    normalizeListScope,
+    LIST_SCOPE_KEY,
   };
 })();
 

@@ -1,0 +1,185 @@
+/* Custom iOS-style dropdown */
+.ios-select {
+  position: relative;
+  display: block;
+  width: 100%;
+  min-width: 0;
+}
+
+.ios-select-native {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+  opacity: 0 !important;
+  pointer-events: none !important;
+}
+
+.ios-select-trigger {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 40px;
+  padding: 9px 12px 9px 14px;
+  border: none;
+  border-radius: var(--radius-ctrl, 10px);
+  background: var(--fill, rgba(120, 120, 128, 0.2));
+  color: var(--text, #fff);
+  font: inherit;
+  font-size: 15px;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--transition, 220ms ease), transform 120ms ease;
+  -webkit-tap-highlight-color: transparent;
+}
+
+.ios-select-trigger:hover {
+  background: var(--fill-secondary, rgba(120, 120, 128, 0.28));
+}
+
+.ios-select-trigger:active {
+  transform: scale(0.985);
+}
+
+.ios-select-trigger:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent, #0a84ff) 35%, transparent);
+}
+
+.ios-select-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ios-select-chevron {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  color: var(--muted, #8e8e93);
+  opacity: 0.85;
+  transition: transform var(--spring, 320ms cubic-bezier(0.34, 1.2, 0.64, 1));
+}
+
+.ios-select.is-open .ios-select-chevron {
+  transform: rotate(180deg);
+}
+
+.ios-select-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% + 6px);
+  z-index: 80;
+  max-height: min(260px, 48vh);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 6px;
+  border-radius: var(--radius-lg, 16px);
+  background: color-mix(in srgb, var(--surface, #1c1c1e) 92%, transparent);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  border: 1px solid var(--line, rgba(84, 84, 88, 0.65));
+  box-shadow: var(--shadow, 0 12px 40px rgba(0, 0, 0, 0.35));
+  animation: ios-dd-in 180ms cubic-bezier(0.25, 0.1, 0.25, 1);
+  box-sizing: border-box;
+}
+
+/* Portaled + viewport-clamped menus (set by JS) */
+.ios-select-menu.ios-select-menu--fixed {
+  position: fixed !important;
+  right: auto !important;
+  bottom: auto !important;
+  margin: 0;
+  z-index: 2147483647 !important;
+  animation: ios-dd-in 160ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.ios-select-menu.ios-select-menu--fixed.ios-select-menu--above {
+  animation-name: ios-dd-in-up;
+}
+
+.ios-select-menu[hidden] {
+  display: none !important;
+}
+
+@keyframes ios-dd-in {
+  from { opacity: 0; transform: translateY(-6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes ios-dd-in-up {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.ios-select-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--text, #fff);
+  font: inherit;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  text-align: left;
+  padding: 11px 12px;
+  cursor: pointer;
+  transition: background 120ms ease;
+}
+
+.ios-select-option:hover,
+.ios-select-option:focus-visible {
+  background: var(--fill, rgba(120, 120, 128, 0.24));
+  outline: none;
+}
+
+.ios-select-option.is-selected {
+  color: var(--accent, #0a84ff);
+  font-weight: 510;
+}
+
+.ios-select-check {
+  width: 16px;
+  height: 16px;
+  flex: 0 0 auto;
+  opacity: 0;
+  color: var(--accent, #0a84ff);
+}
+
+.ios-select-option.is-selected .ios-select-check {
+  opacity: 1;
+}
+
+/* Compact variant for job cards / FAB rows */
+.ios-select--compact .ios-select-trigger {
+  min-height: 34px;
+  padding: 6px 10px 6px 12px;
+  font-size: 13px;
+  border-radius: 9px;
+}
+
+.ios-select--compact .ios-select-option {
+  font-size: 13px;
+  padding: 9px 10px;
+}
+
+.ios-select--compact .ios-select-menu {
+  border-radius: 12px;
+  max-height: 220px;
+}

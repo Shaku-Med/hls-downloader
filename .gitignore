@@ -12,6 +12,11 @@ env/
 !.env.example
 pip-log.txt
 pip-wheel-metadata/
+*.egg
+*.egg-info/
+.eggs/
+*.manifest
+*.spec
 
 # Node
 node_modules/
@@ -19,42 +24,68 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-store/
+package-lock.json
 
 # Chrome extension  never commit private keys or packed builds
 *.pem
 *.crx
 *.zip
+*.xpi
 
 # OS
 .DS_Store
+.AppleDouble
+.LSOverride
 Thumbs.db
 ehthumbs.db
 Desktop.ini
+$RECYCLE.BIN/
 
 # Editors / IDEs
 .idea/
+.vscode/
 *.sublime-project
 *.sublime-workspace
 *.swp
 *.swo
 *~
+.cursor/
 
 # Logs and temp
 *.log
 tmp/
 temp/
 *.tmp
+*.temp
+*.bak
+*.orig
+*.old
 .cache/
+*.stackdump
 
 # Test / coverage
 .coverage
+coverage.xml
 htmlcov/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.tox/
+.nox/
 dist/
 build/
-*.egg-info/
+out/
 
+# Local machine helper wrappers (paths are machine specific)
 host_wrapper.bat
 host_wrapper.ps1
+
+# Local dumps / redis / misc junk
+dump.rdb
+*.sqlite
+*.sqlite3
+*.db
+
+# Auto download / local run noise
+auto_download/**/__pycache__/
+*.pyo

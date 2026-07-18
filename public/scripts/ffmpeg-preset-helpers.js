@@ -288,6 +288,9 @@
       row.appendChild(sel);
       row.appendChild(btn);
       card.appendChild(row);
+      if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+        HLS_IOS_SELECT.enhance(sel, { compact: true });
+      }
     }
 
     if (job.status === 'canceled' && job.outputPath) {
@@ -569,6 +572,9 @@
     box.appendChild(select);
     box.appendChild(trade);
     box.appendChild(btnRow);
+    if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+      HLS_IOS_SELECT.enhance(select);
+    }
     document.body.appendChild(overlay);
     updateTrade();
   }

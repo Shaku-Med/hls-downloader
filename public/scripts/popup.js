@@ -1,4 +1,134 @@
 const JOBS_KEY = 'hlsGrabJobsState';
+const STREAMS_REV_KEY = 'hlsGrabStreamsRev';
+
+/** Signature of stream list so live refresh can skip no-op re-renders. */
+let _lastStreamsSig = '';
+
+function streamsSignature(streams) {
+  return (streams || [])
+    .map((s) => {
+      if (typeof s === 'string') return s;
+      return `${s.urlSource || ''}|${s.cleanedUrl || s.url || ''}|${s.streamKind || ''}`;
+    })
+    .join('\n');
+}
+
+/**
+ * Ask once before Get all: include thumbnails for every link?
+ * Prefers the on-page extension sheet; falls back to the same themed UI in the popup.
+ * @param {number} count
+ * @param {(choice: boolean | null) => void} onDone — true=with thumbs, false=without, null=cancel
+ */
+function askThumbnailsForAllLocal(count, onDone) {
+  if (window.HGR_THEME && typeof window.HGR_THEME.showBatchThumbnailPrompt === 'function') {
+    window.HGR_THEME.showBatchThumbnailPrompt(count, onDone, document.body);
+    return;
+  }
+  // Last-resort fallback if theme helpers failed to load
+  const pick = window.confirm(
+    `Queue ${count} page links?\n\nOK = with thumbnails for all\nCancel = cancel\n\n(Use Cancel then Get all again… or reload if this looks wrong.)`
+  );
+  onDone(pick ? true : null);
+}
+
+function askThumbnailsForAll(count, onDone) {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tabId = tabs && tabs[0] ? tabs[0].id : null;
+    if (tabId == null) {
+      askThumbnailsForAllLocal(count, onDone);
+      return;
+    }
+    chrome.tabs.sendMessage(
+      tabId,
+      { type: 'HLS_SHOW_BATCH_THUMB_PROMPT', count },
+      (res) => {
+        if (chrome.runtime.lastError || !res || typeof res.choice === 'undefined') {
+          askThumbnailsForAllLocal(count, onDone);
+          return;
+        }
+        onDone(res.choice);
+      }
+    );
+  });
+}
+
+/**
+ * Queue page-link downloads with defaults (no per-item format/ffmpeg prompts).
+ * @param {Array<{url:string, kind:string, filename:string, capturedHeaders:object}>} items
+ * @param {{ writeThumbnail: boolean }} opts
+ * @param {(queued: number, failed: number) => void} [onDone]
+ */
+function queuePageLinkBatch(items, opts, onDone) {
+  const writeThumbnail = !!(opts && opts.writeThumbnail);
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const tab = tabs[0];
+    const tabUrl = tab?.url || '';
+    const tabId = tab?.id;
+    let left = items.length;
+    let queued = 0;
+    let failed = 0;
+    if (!items.length) {
+      if (onDone) onDone(0, 0);
+      return;
+    }
+    const doneOne = () => {
+      left -= 1;
+      if (left <= 0 && onDone) onDone(queued, failed);
+    };
+    items.forEach((item) => {
+      const url = item.url;
+      const kind = item.kind || 'social';
+      const filename = item.filename || 'video';
+      const capturedHeaders = item.capturedHeaders || {};
+      const jobId = genJobId();
+      // Each link is its own download target. Tab URL is only the referer.
+      let effUrl = url;
+      let effPage = url;
+      let effRef = isHttpUrl(tabUrl) ? tabUrl : url;
+      let effOrigin = '';
+      try {
+        effOrigin = new URL(effUrl || url).origin;
+      } catch (_) {}
+      if (/music\.apple\.com/i.test(url)) {
+        effUrl = url;
+        effPage = url;
+        effRef = url;
+        try {
+          effOrigin = new URL(url).origin;
+        } catch (_) {}
+      }
+      buildCookieHeader(effUrl, effRef || tabUrl, (cookie) => {
+        const payload = {
+          jobId,
+          url: effUrl,
+          filename,
+          tabId: tabId != null ? tabId : undefined,
+          streamKind: kind || undefined,
+          cookie: cookie || undefined,
+          userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : undefined,
+          capturedHeaders,
+        };
+        if (effPage && isHttpUrl(effPage)) {
+          payload.pageUrl = effPage;
+          payload.referer = effRef || effPage;
+          if (effOrigin) payload.origin = effOrigin;
+        }
+        if (/music\.apple\.com/i.test(effUrl || '')) {
+          payload.ytDlpAudioOnly = true;
+          payload.streamKind = 'social';
+        }
+        const cookieBrowser = cookieBrowserFromUa();
+        if (cookieBrowser) payload.ytDlpCookiesFromBrowser = cookieBrowser;
+        if (writeThumbnail) payload.ytDlpWriteThumbnail = true;
+        chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload }, (r) => {
+          if (chrome.runtime.lastError || !r?.ok) failed += 1;
+          else queued += 1;
+          doneOne();
+        });
+      });
+    });
+  });
+}
 
 function isHttpUrl(u) {
   return u && (u.startsWith('http:') || u.startsWith('https:'));
@@ -167,13 +297,17 @@ function renderJobsBanner(jobs, meta) {
   host.hidden = false;
   host.textContent = '';
   const sub = document.createElement('div');
+  const section = document.createElement('div');
+  section.className = 'section-label';
+  section.textContent = 'Downloads';
+  host.appendChild(section);
   sub.className = 'queue-meta';
   const r = meta?.running ?? 0;
   const q = meta?.queueLength ?? 0;
   const m = meta?.max ?? 4;
   setReadyActive(r + q);
-  let line = `${r} of ${m} slots busy`;
-  if (q > 0) line += `. ${q} in queue`;
+  let line = `${r} of ${m} downloading`;
+  if (q > 0) line += `. ${q} queued`;
   sub.textContent = line;
   host.appendChild(sub);
   for (const job of list) {
@@ -196,6 +330,9 @@ function renderJobsBanner(jobs, meta) {
       d.textContent = job.error || 'Canceled';
     } else {
       let detail = job.detail || job.error || '';
+      if (job.mediaId && !String(detail).includes(String(job.mediaId))) {
+        detail = detail ? `${detail} · ${job.mediaId}` : String(job.mediaId);
+      }
       if (job.ffmpegPreset && ['queued', 'connecting', 'downloading'].includes(job.status)) {
         detail = detail ? `${detail} · preset ${job.ffmpegPreset}` : `preset ${job.ffmpegPreset}`;
       }
@@ -203,6 +340,28 @@ function renderJobsBanner(jobs, meta) {
     }
     card.appendChild(t);
     card.appendChild(d);
+    if (['queued', 'connecting', 'downloading'].includes(job.status)) {
+      const track = document.createElement('div');
+      track.className = 'job-progress';
+      const fill = document.createElement('div');
+      fill.className = 'job-progress-fill';
+      const pct = job.percent != null ? Number(job.percent) : NaN;
+      if (Number.isFinite(pct)) {
+        fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+      } else {
+        fill.classList.add('is-indeterminate');
+      }
+      track.appendChild(fill);
+      card.appendChild(track);
+      if (job.playlistIndex != null && job.playlistCount != null) {
+        const pl = document.createElement('div');
+        pl.className = 'job-playlist';
+        pl.textContent = `Playlist item ${job.playlistIndex} of ${job.playlistCount}${
+          job.mediaId ? ` · ${job.mediaId}` : ''
+        }`;
+        card.appendChild(pl);
+      }
+    }
     if (typeof HLS_FFMPEG !== 'undefined' && HLS_FFMPEG.enhanceJobCard) {
       HLS_FFMPEG.enhanceJobCard(job, card, {
         onRefresh: () => {
@@ -234,6 +393,25 @@ function renderJobsBanner(jobs, meta) {
       });
       row.appendChild(cancel);
     } else if (['completed', 'canceled', 'error'].includes(job.status)) {
+      if (job.status === 'completed' && job.outputPath) {
+        const openBtn = document.createElement('button');
+        openBtn.type = 'button';
+        openBtn.className = 'btn-primary';
+        openBtn.textContent = 'Open';
+        openBtn.title = 'Open this file in a new browser tab';
+        openBtn.addEventListener('click', () => {
+          openBtn.disabled = true;
+          chrome.runtime.sendMessage({ type: 'OPEN_JOB_FILE', jobId: job.id }, (r) => {
+            openBtn.disabled = false;
+            if (chrome.runtime.lastError || !r?.ok) {
+              window.alert(
+                chrome.runtime.lastError?.message || r?.error || 'Could not open file'
+              );
+            }
+          });
+        });
+        row.appendChild(openBtn);
+      }
       const dismiss = document.createElement('button');
       dismiss.type = 'button';
       dismiss.className = 'btn-ghost';
@@ -433,9 +611,85 @@ function setContextLine(pageTitle) {
   }
 }
 
+function enhanceIosSelect(sel) {
+  if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+    HLS_IOS_SELECT.enhance(sel, { compact: true });
+  }
+}
+
+const IMAGE_GRABBER_KEY = 'imageHoverDownloadEnabled';
+
+function clearPageImages() {
+  const host = document.getElementById('images-root');
+  if (!host) return;
+  host.textContent = '';
+  host.hidden = true;
+}
+
+function renderPageImages(hasPath) {
+  const host = document.getElementById('images-root');
+  if (!host || !window.HLS_IMAGE_PANEL) return;
+  chrome.storage.local.get([IMAGE_GRABBER_KEY], (data) => {
+    if (chrome.runtime.lastError) {
+      clearPageImages();
+      return;
+    }
+    if (data[IMAGE_GRABBER_KEY] !== true) {
+      clearPageImages();
+      return;
+    }
+    host.hidden = false;
+    void HLS_IMAGE_PANEL.render(host, {
+      hasPath: !!hasPath,
+      enhanceSelect: enhanceIosSelect,
+    });
+  });
+}
+
+function streamUrlSource(stream) {
+  if (!stream) return 'traffic';
+  if (stream.pageDownload === true) {
+    return stream.urlSource === 'tab' ? 'tab' : 'link';
+  }
+  return 'traffic';
+}
+
+function streamSourceSectionLabel(src, count) {
+  if (src === 'tab') return 'This page';
+  if (src === 'link') {
+    const n = typeof count === 'number' ? count : null;
+    return n != null ? `From page links (${n})` : 'From page links';
+  }
+  return 'From network';
+}
+
+function streamSourceBadge(stream, kind) {
+  const src = streamUrlSource(stream);
+  if (src === 'link') return { text: 'page link', mod: 'link' };
+  if (src === 'tab') return { text: kind === 'yt' ? 'yt page' : 'this page', mod: 'tab' };
+  return { text: kind || 'stream', mod: 'traffic' };
+}
+
+function shortStreamUrl(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    const path = (u.pathname || '/').replace(/\/$/, '') || '/';
+    const keep = [];
+    if (u.searchParams.get('v')) keep.push(`v=${u.searchParams.get('v')}`);
+    if (u.searchParams.get('list')) keep.push('list=…');
+    const q = keep.length ? `?${keep.join('&')}` : '';
+    const s = `${u.host}${path}${q}`;
+    return s.length > 56 ? s.slice(0, 54) + '…' : s;
+  } catch (_) {
+    return raw.length > 56 ? raw.slice(0, 54) + '…' : raw;
+  }
+}
+
 function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
   setContextLine(pageTitle);
-  const content = document.getElementById('content');
+  const content = document.getElementById('streams-root') || document.getElementById('content');
 
   const visibleStreams = (streams || []).map((raw) => (typeof raw === 'string' ? { url: raw } : raw)).filter(Boolean);
 
@@ -455,61 +709,131 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
     list.appendChild(buildSpotifyPromptCard(spotifyCtx, hasPath));
   }
 
+  const sourceTypes = new Set(visibleStreams.map((s) => streamUrlSource(typeof s === 'string' ? { url: s } : s)));
+  const linkStreamEntries = visibleStreams
+    .map((raw, i) => {
+      const stream = typeof raw === 'string' ? { url: raw } : raw;
+      return { stream, i };
+    })
+    .filter(({ stream }) => stream.pageDownload === true && streamUrlSource(stream) === 'link');
+  const linkCount = linkStreamEntries.length;
+  // Always label page-links (shows count + Get all). Other sections when mixed.
+  const showSourceSections = sourceTypes.size > 1 || linkCount > 0;
+  let lastSource = '';
+  /** @type {HTMLElement | null} */
+  let linkGrid = null;
+  /** @type {HTMLButtonElement | null} */
+  let getAllBtn = null;
+
   visibleStreams.forEach((raw, i) => {
     const stream = typeof raw === 'string' ? { url: raw, capturedHeaders: {} } : raw;
-    const url = stream.url || '';
+    const cleanedUrl = stream.cleanedUrl || '';
+    const urlSource = streamUrlSource(stream);
+    // Page links: always use cleaned URL. Only the main tab item can opt into cleaning.
+    let url =
+      urlSource === 'link' && cleanedUrl
+        ? cleanedUrl
+        : stream.url || '';
     const defaultName = defaultFileName(i, n, pageTitle, url);
-
-    const item = document.createElement('div');
-    item.className = 'stream-item';
-
     const kind = stream.streamKind ? String(stream.streamKind) : '';
     const pageOnly = stream.pageDownload === true;
     const isAppleMusicPage = /music\.apple\.com/i.test(String(url || ''));
-    const top = document.createElement('div');
-    top.className = 'stream-top';
-    const h = document.createElement('div');
-    h.className = 'stream-label';
-    h.textContent = pageOnly
-      ? isAppleMusicPage
-        ? 'Download this track'
-        : 'Download this video'
-      : n > 1
-        ? `Stream ${i + 1} of ${n}` + (kind ? ` (${kind})` : '')
-        : kind
-          ? `Stream (${kind})`
-          : 'Stream';
-    const badge = document.createElement('span');
-    badge.className = 'stream-kind-badge';
-    badge.textContent = kind || 'stream';
-    top.appendChild(h);
-    top.appendChild(badge);
+    const isLinkCard = pageOnly && urlSource === 'link';
 
-    const urlEl = document.createElement('div');
-    urlEl.className = 'stream-url';
-    if (pageOnly) {
-      const intro = document.createElement('div');
-      intro.className = 'stream-page-intro';
-      intro.textContent = isAppleMusicPage
-        ? 'Apple Music: yt-dlp uses the song page URL below (not the FairPlay m3u8 stream).'
-        : 'This one grabs straight from the page link below, not a separate stream URL.';
-      const link = document.createElement('div');
-      link.className = 'stream-page-link';
-      link.textContent = url;
-      urlEl.appendChild(intro);
-      urlEl.appendChild(link);
-    } else {
-      urlEl.textContent = url;
+    if (showSourceSections && urlSource !== lastSource) {
+      lastSource = urlSource;
+      if (urlSource === 'link') {
+        const sec = document.createElement('div');
+        sec.className = 'stream-source-row';
+        const lab = document.createElement('div');
+        lab.className = 'stream-source-label';
+        lab.textContent = streamSourceSectionLabel('link', linkCount);
+        getAllBtn = document.createElement('button');
+        getAllBtn.type = 'button';
+        getAllBtn.className = 'get-all-links-btn';
+        getAllBtn.textContent = 'Get all';
+        if (!hasPath) {
+          getAllBtn.disabled = true;
+          getAllBtn.title = 'Add a save folder in Options first';
+        } else {
+          getAllBtn.title = `Queue all ${linkCount} page links (up to 4 download at once)`;
+        }
+        getAllBtn.addEventListener('click', () => {
+          if (!hasPath) {
+            chrome.runtime.openOptionsPage();
+            return;
+          }
+          if (!linkCount || !getAllBtn) return;
+          const items = linkStreamEntries.map(({ stream: s, i: idx }) => {
+            const cleaned = s.cleanedUrl || '';
+            const u = cleaned || s.url || '';
+            return {
+              url: u,
+              kind: s.streamKind ? String(s.streamKind) : 'social',
+              filename: defaultFileName(idx, n, pageTitle, u),
+              capturedHeaders: s.capturedHeaders || {},
+            };
+          });
+          // Hand off to the page so the themed sheet + float panel are visible.
+          chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+            const tabId = tabs && tabs[0] ? tabs[0].id : null;
+            if (tabId == null) {
+              askThumbnailsForAllLocal(linkCount, (choice) => {
+                if (choice === null) return;
+                queuePageLinkBatch(items, { writeThumbnail: choice === true }, () =>
+                  refreshJobsBannerOnly()
+                );
+              });
+              return;
+            }
+            getAllBtn.disabled = true;
+            getAllBtn.textContent = 'Opening…';
+            chrome.tabs.sendMessage(
+              tabId,
+              { type: 'HLS_GET_ALL_PAGE_LINKS', items, count: linkCount },
+              (res) => {
+                if (chrome.runtime.lastError || !res?.ok) {
+                  getAllBtn.disabled = false;
+                  getAllBtn.textContent = 'Get all';
+                  askThumbnailsForAllLocal(linkCount, (choice) => {
+                    if (choice === null) {
+                      getAllBtn.disabled = false;
+                      getAllBtn.textContent = 'Get all';
+                      return;
+                    }
+                    queuePageLinkBatch(items, { writeThumbnail: choice === true }, () =>
+                      refreshJobsBannerOnly()
+                    );
+                  });
+                  return;
+                }
+                // Page sheet is up — close popup so the dialog is visible.
+                try {
+                  window.close();
+                } catch (_) {
+                  getAllBtn.disabled = false;
+                  getAllBtn.textContent = 'Get all';
+                }
+              }
+            );
+          });
+        });
+        sec.appendChild(lab);
+        sec.appendChild(getAllBtn);
+        list.appendChild(sec);
+        linkGrid = null;
+      } else {
+        const sec = document.createElement('div');
+        sec.className = 'stream-source-label';
+        sec.textContent = streamSourceSectionLabel(urlSource);
+        list.appendChild(sec);
+        linkGrid = null;
+      }
     }
 
-    const field = document.createElement('div');
-    field.className = 'field';
-    const isSubtitle = kind === 'subtitle';
-    const lab = document.createElement('label');
-    lab.setAttribute('for', `name-${i}`);
-    lab.textContent = isSubtitle ? 'File name (no .vtt)' : 'File name (no .mp4)';
-    const row = document.createElement('div');
-    row.className = 'row';
+    const item = document.createElement('div');
+    item.dataset.urlSource = urlSource;
+
     const input = document.createElement('input');
     input.className = 'filename-input';
     input.type = 'text';
@@ -517,6 +841,7 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
     input.value = defaultName;
     input.setAttribute('placeholder', 'e.g. My video');
     if (!hasPath) input.readOnly = true;
+
     const btn = document.createElement('button');
     btn.className = 'dl-btn';
     btn.type = 'button';
@@ -525,34 +850,135 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
       btn.disabled = true;
       btn.title = 'Add a save folder in Options first';
     }
-    btn.textContent = pageOnly ? 'Download this' : 'Download';
-    row.appendChild(input);
-    row.appendChild(btn);
-    field.appendChild(lab);
-    field.appendChild(row);
-    if (pageOnly) {
-      const thumbLab = document.createElement('label');
-      thumbLab.className = 'stream-thumb-label';
-      const tcb = document.createElement('input');
-      tcb.type = 'checkbox';
-      tcb.id = `thumb-${i}`;
-      thumbLab.appendChild(tcb);
-      const tsp = document.createElement('span');
-      tsp.textContent = 'Also save thumbnail (jpg next to the video)';
-      thumbLab.appendChild(tsp);
-      field.appendChild(thumbLab);
-    }
+    btn.textContent = isLinkCard ? 'Download' : pageOnly ? 'Download this' : 'Download';
 
     const statusEl = document.createElement('div');
     statusEl.className = 'status';
     statusEl.id = `status-${i}`;
     statusEl.style.display = 'none';
 
-    item.appendChild(top);
-    item.appendChild(urlEl);
-    item.appendChild(field);
-    item.appendChild(statusEl);
-    list.appendChild(item);
+    if (isLinkCard) {
+      item.className = 'stream-item stream-item--link';
+      const main = document.createElement('div');
+      main.className = 'link-card-main';
+      const titleRow = document.createElement('div');
+      titleRow.className = 'link-card-title-row';
+      const badge = document.createElement('span');
+      badge.className = 'stream-kind-badge stream-kind-badge--link';
+      badge.textContent = 'page link';
+      titleRow.appendChild(badge);
+      titleRow.appendChild(input);
+      const urlLine = document.createElement('div');
+      urlLine.className = 'link-card-url';
+      urlLine.textContent = shortStreamUrl(url);
+      urlLine.title = url;
+      main.appendChild(titleRow);
+      main.appendChild(urlLine);
+      const thumbLab = document.createElement('label');
+      thumbLab.className = 'stream-thumb-label link-card-thumb';
+      const tcb = document.createElement('input');
+      tcb.type = 'checkbox';
+      tcb.id = `thumb-${i}`;
+      thumbLab.appendChild(tcb);
+      const tsp = document.createElement('span');
+      tsp.textContent = 'Also save thumbnail';
+      thumbLab.appendChild(tsp);
+      main.appendChild(thumbLab);
+      item.appendChild(main);
+      item.appendChild(btn);
+      item.appendChild(statusEl);
+      if (!linkGrid) {
+        linkGrid = document.createElement('div');
+        linkGrid.className = 'link-stream-grid';
+        list.appendChild(linkGrid);
+      }
+      linkGrid.appendChild(item);
+    } else {
+      linkGrid = null;
+      item.className = 'stream-item';
+      const top = document.createElement('div');
+      top.className = 'stream-top';
+      const h = document.createElement('div');
+      h.className = 'stream-label';
+      h.textContent = pageOnly
+        ? isAppleMusicPage
+          ? 'Download this track'
+          : 'Download this video'
+        : n > 1
+          ? `Stream ${i + 1} of ${n}` + (kind ? ` (${kind})` : '')
+          : kind
+            ? `Stream (${kind})`
+            : 'Stream';
+      const badgeInfo = streamSourceBadge(stream, kind);
+      const badge = document.createElement('span');
+      badge.className = `stream-kind-badge stream-kind-badge--${badgeInfo.mod}`;
+      badge.textContent = badgeInfo.text;
+      top.appendChild(h);
+      top.appendChild(badge);
+
+      const urlEl = document.createElement('div');
+      urlEl.className = 'stream-url';
+      const link = document.createElement('div');
+      link.className = 'stream-page-link';
+      link.textContent = url;
+      if (pageOnly) {
+        const intro = document.createElement('div');
+        intro.className = 'stream-page-intro';
+        intro.textContent = isAppleMusicPage
+          ? 'Apple Music: yt-dlp uses the song page URL below (not the FairPlay m3u8 stream).'
+          : 'This tab’s post URL. Playlist params are kept — use Clean URL to strip tracking.';
+        urlEl.appendChild(intro);
+        urlEl.appendChild(link);
+        // Clean URL only on the main tab item (not page links).
+        if (urlSource === 'tab' && cleanedUrl && cleanedUrl !== url) {
+          const cleanBtn = document.createElement('button');
+          cleanBtn.type = 'button';
+          cleanBtn.className = 'url-clean-btn';
+          cleanBtn.textContent = 'Clean URL';
+          cleanBtn.title = 'Strip tracking junk (keeps playlist list= / video id)';
+          cleanBtn.addEventListener('click', () => {
+            url = cleanedUrl;
+            link.textContent = url;
+            cleanBtn.disabled = true;
+            cleanBtn.textContent = 'Cleaned';
+          });
+          urlEl.appendChild(cleanBtn);
+        }
+      } else {
+        urlEl.appendChild(link);
+      }
+
+      const field = document.createElement('div');
+      field.className = 'field';
+      const isSubtitle = kind === 'subtitle';
+      const lab = document.createElement('label');
+      lab.setAttribute('for', `name-${i}`);
+      lab.textContent = isSubtitle ? 'File name (no .vtt)' : 'File name (no .mp4)';
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.appendChild(input);
+      row.appendChild(btn);
+      field.appendChild(lab);
+      field.appendChild(row);
+      if (pageOnly) {
+        const thumbLab = document.createElement('label');
+        thumbLab.className = 'stream-thumb-label';
+        const tcb = document.createElement('input');
+        tcb.type = 'checkbox';
+        tcb.id = `thumb-${i}`;
+        thumbLab.appendChild(tcb);
+        const tsp = document.createElement('span');
+        tsp.textContent = 'Also save thumbnail (jpg next to the video)';
+        thumbLab.appendChild(tsp);
+        field.appendChild(thumbLab);
+      }
+
+      item.appendChild(top);
+      item.appendChild(urlEl);
+      item.appendChild(field);
+      item.appendChild(statusEl);
+      list.appendChild(item);
+    }
 
     btn.addEventListener('click', () => {
       if (!hasPath) {
@@ -581,7 +1007,7 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
 
         const resetDlUi = () => {
           btn.disabled = false;
-          btn.textContent = pageOnly ? 'Download this' : 'Download';
+          btn.textContent = isLinkCard ? 'Download' : pageOnly ? 'Download this' : 'Download';
           statusEl.removeAttribute('data-bg-run');
         };
 
@@ -591,14 +1017,22 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
           let effRef = '';
           let effOrigin = '';
           let plDl = false;
-          if (isHttpUrl(tabUrl)) {
+          if (isLinkCard) {
+            // Page-link row: download THIS link, not the tab feed/playlist page.
+            effUrl = url;
+            effPage = url;
+            effRef = isHttpUrl(tabUrl) ? tabUrl : url;
+            try {
+              effOrigin = new URL(effUrl).origin;
+            } catch (_) {}
+          } else if (isHttpUrl(tabUrl)) {
             effPage = tabUrl;
             effRef = tabUrl;
             try {
               effOrigin = new URL(tabUrl).origin;
             } catch (_) {}
           }
-          if (pageOnly && kind === 'yt' && YT && YT.isYoutubePage(tabUrl)) {
+          if (!isLinkCard && pageOnly && kind === 'yt' && YT && YT.isYoutubePage(tabUrl)) {
             const yChoice = plPick === 'playlist' ? 'playlist' : 'single';
             const a = YT.applyYoutubeChoice(tabUrl, yChoice);
             effUrl = a.targetUrl;
@@ -606,7 +1040,7 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
             effRef = a.referer;
             effOrigin = a.origin || effOrigin;
             plDl = !!a.ytDlpDownloadPlaylist;
-          } else if (pageOnly && /music\.apple\.com/i.test(tabUrl || url || '')) {
+          } else if (!isLinkCard && pageOnly && /music\.apple\.com/i.test(tabUrl || url || '')) {
             const appleUrl = /music\.apple\.com/i.test(tabUrl || '') ? tabUrl : url;
             effUrl = appleUrl;
             effPage = appleUrl;
@@ -614,7 +1048,7 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
             try {
               effOrigin = new URL(appleUrl).origin;
             } catch (_) {}
-          } else if (!isHttpUrl(tabUrl)) {
+          } else if (!isLinkCard && !isHttpUrl(tabUrl)) {
             effPage = effUrl;
             effRef = effUrl;
             try {
@@ -789,12 +1223,15 @@ function loadUi() {
     chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
       const hasPath = !!(response && response.userDownloadPath);
       setPathBar(response && response.userDownloadPath);
-      renderStreams(response?.streams || [], response?.pageTitle || '', hasPath, spotifyCtx);
+      const streams = response?.streams || [];
+      _lastStreamsSig = streamsSignature(streams);
+      renderStreams(streams, response?.pageTitle || '', hasPath, spotifyCtx);
       renderJobsBanner(response?.jobs || [], {
         running: response?.running,
         queueLength: response?.queueLength,
         max: response?.maxParallel,
       });
+      renderPageImages(hasPath);
     });
   });
 }
@@ -811,7 +1248,65 @@ function refreshJobsBannerOnly() {
   });
 }
 
+/** Re-fetch streams when the page gathers more while the popup stays open. */
+function refreshStreamsIfChanged() {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    const activeUrl = tabs && tabs[0] ? tabs[0].url || '' : '';
+    const spotifyCtx = spotifyContextFromTabUrl(activeUrl);
+    chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
+      if (chrome.runtime.lastError || !response) return;
+      const streams = response.streams || [];
+      const sig = streamsSignature(streams);
+      if (sig === _lastStreamsSig) {
+        refreshJobsBannerOnly();
+        return;
+      }
+      _lastStreamsSig = sig;
+      const hasPath = !!(response.userDownloadPath || '').trim();
+      setPathBar(response.userDownloadPath);
+      renderStreams(streams, response.pageTitle || '', hasPath, spotifyCtx);
+      renderJobsBanner(response.jobs || [], {
+        running: response.running,
+        queueLength: response.queueLength,
+        max: response.maxParallel,
+      });
+      renderPageImages(hasPath);
+    });
+  });
+}
+
 loadUi();
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'HLS_GRABBER_LIVE_UPDATE') return;
+  const kind = msg.kind || 'jobs';
+  if (kind === 'streams' || kind === 'all') refreshStreamsIfChanged();
+  else refreshJobsBannerOnly();
+});
+
+chrome.runtime.onMessage.addListener((msg) => {
+  if (!msg || msg.type !== 'HLS_GET_ALL_RESULT') return;
+  // If popup is somehow still open when user cancels the page sheet, reset Get all.
+  if (msg.canceled || msg.choice == null) {
+    document.querySelectorAll('.get-all-links-btn').forEach((btn) => {
+      btn.disabled = false;
+      btn.textContent = 'Get all';
+    });
+  } else {
+    refreshJobsBannerOnly();
+  }
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes[IMAGE_GRABBER_KEY]) return;
+  if (changes[IMAGE_GRABBER_KEY].newValue === true) {
+    chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
+      renderPageImages(!!(response && response.userDownloadPath));
+    });
+  } else {
+    clearPageImages();
+  }
+});
 
 document.getElementById('open-options')?.addEventListener('click', (e) => {
   e.preventDefault();
@@ -933,9 +1428,17 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
         setStatus(`⏸ Paused (${why})`);
         return;
       }
-      let txt = `● Recording ${act.length} video${act.length > 1 ? 's' : ''}`;
-      if (act.length === 1) txt += ` · ${fmt(act[0].elapsed)}`;
-      setStatus(txt);
+      const total = res.total || res.queueTotal || act.length;
+      const pos = res.position || 1;
+      if (res.sequential && total > 1) {
+        const label = act[0] ? act[0].label : 'video';
+        const elapsed = act[0] ? fmt(act[0].elapsed) : '';
+        setStatus(`● Recording ${pos} of ${total}${elapsed ? ` · ${elapsed}` : ''} · ${label}`);
+      } else {
+        let txt = `● Recording ${act.length} video${act.length > 1 ? 's' : ''}`;
+        if (act.length === 1) txt += ` · ${fmt(act[0].elapsed)}`;
+        setStatus(txt);
+      }
     });
   }
 
@@ -981,10 +1484,18 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
         btn.disabled = false;
         if (res && res.ok) {
           enterRecordingUi();
-          const fail = (res.details || []).filter((d) => !d.ok);
-          let msg = `● Recording ${res.count} of ${res.total} video${res.total > 1 ? 's' : ''}`;
-          if (fail.length) msg += ` · ${fail.length} skipped`;
-          setStatus(msg);
+          if (res.sequential && res.total > 1) {
+            setStatus(
+              `● Recording 1 of ${res.total} (one at a time` +
+                (res.remaining ? `, ${res.remaining} queued` : '') +
+                ')'
+            );
+          } else {
+            const fail = (res.details || []).filter((d) => !d.ok);
+            let msg = `● Recording ${res.count} of ${res.total} video${res.total > 1 ? 's' : ''}`;
+            if (fail.length) msg += ` · ${fail.length} skipped`;
+            setStatus(msg);
+          }
         } else {
           setStatus(res?.error || 'Could not start recording');
         }
@@ -998,6 +1509,10 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && changes.userDownloadPath) {
     loadUi();
+    return;
+  }
+  if (area === 'session' && changes[STREAMS_REV_KEY]) {
+    refreshStreamsIfChanged();
     return;
   }
   if (area === 'session' && changes[JOBS_KEY]) {

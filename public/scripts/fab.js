@@ -6,6 +6,7 @@
   const THEME_MODE_KEY = 'uiThemeMode';
   const THEME_ACCENT_KEY = 'uiThemeAccent';
   const JOBS_KEY = 'hlsGrabJobsState';
+  const STREAMS_REV_KEY = 'hlsGrabStreamsRev';
   const FAB_POS_KEY = 'hlsGrabFabPos';
   const FAB_SIZE = 52;
   const FAB_MARGIN = 14;
@@ -13,16 +14,58 @@
 
   const fabCtl = {
     closePanel: () => {},
+    openPanel: () => {},
     liveRefresh: () => {},
+    showBatchThumbPrompt: null,
+    runGetAllPageLinks: null,
   };
 
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg && msg.type === 'HLS_GRABBER_CLOSE_FLOAT_PANEL') {
       fabCtl.closePanel();
       return;
     }
     if (msg && msg.type === 'HLS_GRABBER_LIVE_UPDATE') {
-      fabCtl.liveRefresh();
+      fabCtl.liveRefresh(msg.kind || 'jobs');
+      return;
+    }
+    if (msg && msg.type === 'HLS_SHOW_BATCH_THUMB_PROMPT') {
+      const run =
+        typeof fabCtl.showBatchThumbPrompt === 'function'
+          ? fabCtl.showBatchThumbPrompt
+          : null;
+      if (!run) {
+        sendResponse({ choice: null, error: 'Grabber UI not ready' });
+        return true;
+      }
+      fabCtl.openPanel();
+      run(msg.count || 0, (choice) => {
+        sendResponse({ choice });
+      });
+      return true;
+    }
+    if (msg && msg.type === 'HLS_GET_ALL_PAGE_LINKS') {
+      const run =
+        typeof fabCtl.runGetAllPageLinks === 'function' ? fabCtl.runGetAllPageLinks : null;
+      if (!run) {
+        sendResponse({ ok: false, error: 'Grabber UI not ready' });
+        return true;
+      }
+      // Ack immediately so the popup can close and reveal this page sheet.
+      sendResponse({ ok: true, opened: true });
+      setTimeout(() => {
+        run(msg.items || [], msg.count || (msg.items || []).length, (result) => {
+          try {
+            chrome.runtime.sendMessage({
+              type: 'HLS_GET_ALL_RESULT',
+              ...(result || { canceled: true, choice: null }),
+            });
+          } catch (_) {
+            // ignore
+          }
+        });
+      }, 60);
+      return true;
     }
   });
 
@@ -37,7 +80,10 @@
       }
     }
     fabCtl.closePanel = () => {};
+    fabCtl.openPanel = () => {};
     fabCtl.liveRefresh = () => {};
+    fabCtl.showBatchThumbPrompt = null;
+    fabCtl.runGetAllPageLinks = null;
     h.remove();
   }
 
@@ -214,6 +260,16 @@
   const fabImages = shadow.getElementById('fab-images');
   const closeBtn = shadow.querySelector('.close-p');
 
+  let _fabStreamsSig = '';
+  function fabStreamsSignature(streams) {
+    return (streams || [])
+      .map((s) => {
+        if (typeof s === 'string') return s;
+        return `${s.urlSource || ''}|${s.cleanedUrl || s.url || ''}|${s.streamKind || ''}`;
+      })
+      .join('\n');
+  }
+
   function applyFabTheme(mode, accent) {
     const themeApi = window.HGR_THEME;
     if (themeApi) {
@@ -268,13 +324,95 @@
     }
   }
 
-  function applyFabPixels(left, top, withTransition) {
-    fab.classList.toggle('dragging', !withTransition);
+  let snapTrackRaf = 0;
+
+  function stopSnapTracking() {
+    if (snapTrackRaf) {
+      cancelAnimationFrame(snapTrackRaf);
+      snapTrackRaf = 0;
+    }
+  }
+
+  function trackPanelDuringSnap() {
+    stopSnapTracking();
+    if (!panel.classList.contains('open')) return;
+    const tick = () => {
+      positionPanel();
+      if (fab.classList.contains('snapping')) {
+        snapTrackRaf = requestAnimationFrame(tick);
+      } else {
+        snapTrackRaf = 0;
+      }
+    };
+    snapTrackRaf = requestAnimationFrame(tick);
+  }
+
+  function applyFabPixels(left, top, mode) {
+    // mode: false/'drag' = no transition, true/'snap' = spring snap, 'soft' = gentle move
+    const isDrag = mode === false || mode === 'drag';
+    const isSnap = mode === true || mode === 'snap';
+    fab.classList.toggle('dragging', isDrag);
+    if (!isSnap) fab.classList.remove('snapping');
     fab.style.setProperty('--fab-left', `${Math.round(left)}px`);
     fab.style.setProperty('--fab-top', `${Math.round(top)}px`);
     fab.style.setProperty('--fab-right', 'auto');
     fab.style.setProperty('--fab-bottom', 'auto');
-    fab.style.setProperty('--fab-transform', 'none');
+    if (isDrag) {
+      fab.style.setProperty('--fab-transform', 'scale(1.08)');
+    } else if (!isSnap) {
+      fab.style.setProperty('--fab-transform', 'none');
+    }
+  }
+
+  function animateSnapTo(left, top) {
+    const from = fab.getBoundingClientRect();
+    const dx = left - from.left;
+    const dy = top - from.top;
+    const dist = Math.hypot(dx, dy);
+
+    fab.classList.remove('dragging');
+    fab.classList.add('snapping');
+
+    // Stretch slightly along the travel direction, then settle.
+    if (dist > 12) {
+      const nx = dx / dist;
+      const ny = dy / dist;
+      const stretchX = 1 + Math.min(0.14, Math.abs(nx) * 0.14);
+      const stretchY = 1 + Math.min(0.14, Math.abs(ny) * 0.14);
+      fab.style.setProperty(
+        '--fab-transform',
+        `scale(${stretchX.toFixed(3)}, ${stretchY.toFixed(3)})`
+      );
+    } else {
+      fab.style.setProperty('--fab-transform', 'scale(1.06)');
+    }
+
+    // Force style flush so the next left/top change animates from here.
+    void fab.offsetWidth;
+
+    fab.style.setProperty('--fab-left', `${Math.round(left)}px`);
+    fab.style.setProperty('--fab-top', `${Math.round(top)}px`);
+    fab.style.setProperty('--fab-right', 'auto');
+    fab.style.setProperty('--fab-bottom', 'auto');
+
+    requestAnimationFrame(() => {
+      fab.style.setProperty('--fab-transform', 'scale(1)');
+    });
+
+    trackPanelDuringSnap();
+
+    const finish = (ev) => {
+      if (ev && ev.target !== fab) return;
+      if (ev && ev.propertyName !== 'left' && ev.propertyName !== 'top') return;
+      fab.removeEventListener('transitionend', finish);
+      window.clearTimeout(fallbackTimer);
+      fab.classList.remove('snapping');
+      fab.style.setProperty('--fab-transform', 'none');
+      stopSnapTracking();
+      if (panel.classList.contains('open')) positionPanel();
+    };
+    fab.addEventListener('transitionend', finish);
+    const fallbackTimer = window.setTimeout(() => finish(null), 700);
   }
 
   function snapCornerFromPosition(left, top) {
@@ -481,11 +619,11 @@
     drag = null;
     if (moved >= MOVE_TOLERANCE) {
       const s = snapCornerFromPosition(left, top);
-      applyFabPixels(s.left, s.top, true);
+      animateSnapTo(s.left, s.top);
       persistPos(s.left, s.top);
       setPanelTransformOrigin();
-      if (panel.classList.contains('open')) positionPanel();
     } else {
+      fab.style.setProperty('--fab-transform', 'none');
       const wasOpen = panel.classList.contains('open');
       setPanelOpen(!wasOpen);
       if (!wasOpen) refreshAll();
@@ -494,12 +632,6 @@
 
   fab.addEventListener('pointerup', endDrag);
   fab.addEventListener('pointercancel', endDrag);
-
-  fab.addEventListener('transitionend', (ev) => {
-    if (ev.target !== fab) return;
-    if (ev.propertyName !== 'left' && ev.propertyName !== 'top') return;
-    if (panel.classList.contains('open')) positionPanel();
-  });
 
   closeBtn.addEventListener('click', () => setPanelOpen(false));
 
@@ -534,8 +666,43 @@
           fabPath.classList.add('bad');
         }
       }
+      const streams = response.streams || [];
+      _fabStreamsSig = fabStreamsSignature(streams);
       renderJobs(response.jobs || [], response);
-      renderStreams(response.streams || [], response.pageTitle || '', hasPath);
+      renderStreams(streams, response.pageTitle || '', hasPath);
+      renderImages(hasPath);
+      updateQueueBadge(response);
+      if (panel.classList.contains('open')) positionPanel();
+    });
+  }
+
+  function refreshStreamsIfChanged() {
+    chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
+      if (chrome.runtime.lastError || !response) return;
+      const streams = response.streams || [];
+      const sig = fabStreamsSignature(streams);
+      if (sig === _fabStreamsSig) {
+        renderJobs(response.jobs || [], response);
+        updateQueueBadge(response);
+        return;
+      }
+      _fabStreamsSig = sig;
+      const hasPath = !!(response.userDownloadPath || '').trim();
+      if (fabPath) {
+        if (response.userDownloadPath) {
+          const short =
+            response.userDownloadPath.length > 40
+              ? response.userDownloadPath.slice(0, 38) + '…'
+              : response.userDownloadPath;
+          fabPath.textContent = `Saves to: ${short}`;
+          fabPath.classList.remove('bad');
+        } else {
+          fabPath.textContent = 'No save folder. Use extension Options.';
+          fabPath.classList.add('bad');
+        }
+      }
+      renderJobs(response.jobs || [], response);
+      renderStreams(streams, response.pageTitle || '', hasPath);
       renderImages(hasPath);
       updateQueueBadge(response);
       if (panel.classList.contains('open')) positionPanel();
@@ -561,7 +728,7 @@
     const r = meta?.running ?? 0;
     const q = meta?.queueLength ?? 0;
     const m = meta?.maxParallel ?? 4;
-    let line = `${r} of ${m} busy`;
+    let line = `${r} of ${m} downloading`;
     if (q > 0) line += ` · ${q} queued`;
     metaEl.textContent = line;
     fabJobs.appendChild(metaEl);
@@ -581,6 +748,9 @@
         d.textContent = job.error || 'Canceled';
       } else {
         let detail = job.detail || job.error || '';
+        if (job.mediaId && !String(detail).includes(String(job.mediaId))) {
+          detail = detail ? `${detail} · ${job.mediaId}` : String(job.mediaId);
+        }
         if (job.ffmpegPreset && ['queued', 'connecting', 'downloading'].includes(job.status)) {
           detail = detail ? `${detail} · preset ${job.ffmpegPreset}` : `preset ${job.ffmpegPreset}`;
         }
@@ -588,6 +758,28 @@
       }
       card.appendChild(t);
       card.appendChild(d);
+      if (['queued', 'connecting', 'downloading'].includes(job.status)) {
+        const track = document.createElement('div');
+        track.className = 'job-progress';
+        const fill = document.createElement('div');
+        fill.className = 'job-progress-fill';
+        const pct = job.percent != null ? Number(job.percent) : NaN;
+        if (Number.isFinite(pct)) {
+          fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+        } else {
+          fill.classList.add('is-indeterminate');
+        }
+        track.appendChild(fill);
+        card.appendChild(track);
+        if (job.playlistIndex != null && job.playlistCount != null) {
+          const pl = document.createElement('div');
+          pl.className = 'job-playlist';
+          pl.textContent = `Item ${job.playlistIndex}/${job.playlistCount}${
+            job.mediaId ? ` · ${job.mediaId}` : ''
+          }`;
+          card.appendChild(pl);
+        }
+      }
       if (typeof HLS_FFMPEG !== 'undefined' && HLS_FFMPEG.enhanceJobCard) {
         HLS_FFMPEG.enhanceJobCard(job, card, { onRefresh: refreshPanelJobsOnly });
       }
@@ -603,6 +795,25 @@
         );
         row.appendChild(b);
       } else if (['completed', 'canceled', 'error'].includes(job.status)) {
+        if (job.status === 'completed' && job.outputPath) {
+          const openBtn = document.createElement('button');
+          openBtn.type = 'button';
+          openBtn.className = 'btn btn-pri';
+          openBtn.textContent = 'Open';
+          openBtn.title = 'Open this file in a new browser tab';
+          openBtn.addEventListener('click', () => {
+            openBtn.disabled = true;
+            chrome.runtime.sendMessage({ type: 'OPEN_JOB_FILE', jobId: job.id }, (r) => {
+              openBtn.disabled = false;
+              if (chrome.runtime.lastError || !r?.ok) {
+                window.alert(
+                  chrome.runtime.lastError?.message || r?.error || 'Could not open file'
+                );
+              }
+            });
+          });
+          row.appendChild(openBtn);
+        }
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'btn btn-ghost';
@@ -629,6 +840,111 @@
     fabJobs.appendChild(clr);
   }
 
+  function fabStreamUrlSource(stream) {
+    if (!stream) return 'traffic';
+    if (stream.pageDownload === true) {
+      return stream.urlSource === 'tab' ? 'tab' : 'link';
+    }
+    return 'traffic';
+  }
+
+  function fabSourceSectionLabel(src, count) {
+    if (src === 'tab') return 'This page';
+    if (src === 'link') {
+      const n = typeof count === 'number' ? count : null;
+      return n != null ? `From page links (${n})` : 'From page links';
+    }
+    return 'From network';
+  }
+
+  function askFabThumbnailsForAll(count, onDone) {
+    if (window.HGR_THEME && typeof window.HGR_THEME.showBatchThumbnailPrompt === 'function') {
+      // Page-level sheet so it matches quality / ffmpeg dialogs.
+      window.HGR_THEME.showBatchThumbnailPrompt(count, onDone, document.body);
+      return;
+    }
+    onDone(null);
+  }
+
+  function queueFabPageLinkBatch(items, opts, onDone) {
+    const writeThumbnail = !!(opts && opts.writeThumbnail);
+    const tabUrl = window.location.href || '';
+    const isHttpUrl = (x) => x && (x.startsWith('http:') || x.startsWith('https:'));
+    let left = items.length;
+    let queued = 0;
+    let failed = 0;
+    if (!items.length) {
+      if (onDone) onDone(0, 0);
+      return;
+    }
+    const doneOne = () => {
+      left -= 1;
+      if (left <= 0 && onDone) onDone(queued, failed);
+    };
+    items.forEach((item) => {
+      const url = item.url;
+      const kind = item.kind || 'social';
+      const filename = item.filename || 'video';
+      const jobId = genJobId();
+      // Each link is its own download target. Tab URL is only the referer.
+      let effUrl = url;
+      let effPage = url;
+      let effRef = isHttpUrl(tabUrl) ? tabUrl : url;
+      let effOrigin = '';
+      try {
+        effOrigin = new URL(effUrl || url).origin;
+      } catch (_) {}
+      if (/music\.apple\.com/i.test(url)) {
+        effUrl = url;
+        effPage = url;
+        effRef = url;
+        try {
+          effOrigin = new URL(url).origin;
+        } catch (_) {}
+      }
+      const payload = {
+        jobId,
+        url: effUrl,
+        filename,
+        streamKind: kind || undefined,
+        capturedHeaders: item.capturedHeaders || {},
+        userAgent: typeof navigator !== 'undefined' ? navigator.userAgent : undefined,
+      };
+      if (effPage && isHttpUrl(effPage)) {
+        payload.pageUrl = effPage;
+        payload.referer = effRef || effPage;
+        if (effOrigin) payload.origin = effOrigin;
+      }
+      if (/music\.apple\.com/i.test(effUrl || '')) {
+        payload.ytDlpAudioOnly = true;
+        payload.streamKind = 'social';
+      }
+      if (writeThumbnail) payload.ytDlpWriteThumbnail = true;
+      chrome.runtime.sendMessage({ type: 'START_DOWNLOAD', payload }, (r) => {
+        if (chrome.runtime.lastError || !r?.ok) failed += 1;
+        else queued += 1;
+        doneOne();
+      });
+    });
+  }
+
+  function fabShortStreamUrl(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return '';
+    try {
+      const u = new URL(raw);
+      const path = (u.pathname || '/').replace(/\/$/, '') || '/';
+      const keep = [];
+      if (u.searchParams.get('v')) keep.push(`v=${u.searchParams.get('v')}`);
+      if (u.searchParams.get('list')) keep.push('list=…');
+      const q = keep.length ? `?${keep.join('&')}` : '';
+      const s = `${u.host}${path}${q}`;
+      return s.length > 56 ? s.slice(0, 54) + '…' : s;
+    } catch (_) {
+      return raw.length > 56 ? raw.slice(0, 54) + '…' : raw;
+    }
+  }
+
   function renderStreams(streams, pageTitle, hasPath) {
     fabStreams.textContent = '';
     if (!streams.length) {
@@ -639,43 +955,105 @@
       return;
     }
     const n = streams.length;
+    const sourceTypes = new Set(streams.map((s) => fabStreamUrlSource(typeof s === 'string' ? { url: s } : s)));
+    const linkStreamEntries = streams
+      .map((raw, i) => {
+        const stream = typeof raw === 'string' ? { url: raw } : raw;
+        return { stream, i };
+      })
+      .filter(({ stream }) => stream.pageDownload === true && fabStreamUrlSource(stream) === 'link');
+    const linkCount = linkStreamEntries.length;
+    const showSourceSections = sourceTypes.size > 1 || linkCount > 0;
+    let lastSource = '';
+    /** @type {HTMLElement | null} */
+    let linkGrid = null;
+    /** @type {HTMLButtonElement | null} */
+    let getAllBtn = null;
+
     streams.forEach((raw, i) => {
       const stream = typeof raw === 'string' ? { url: raw, capturedHeaders: {} } : raw;
-      const url = stream.url || '';
+      const cleanedUrl = stream.cleanedUrl || '';
       const kind = stream.streamKind ? String(stream.streamKind) : '';
       const pageOnly = stream.pageDownload === true;
+      const urlSource = fabStreamUrlSource(stream);
+      // Page links: always cleaned. Only the main tab item can opt into cleaning.
+      let url =
+        urlSource === 'link' && cleanedUrl
+          ? cleanedUrl
+          : stream.url || '';
       const defaultName = defaultFileName(i, n, pageTitle, url);
       const isAppleMusicPage = /music\.apple\.com/i.test(String(url || ''));
+      const isLinkCard = pageOnly && urlSource === 'link';
+
+      if (showSourceSections && urlSource !== lastSource) {
+        lastSource = urlSource;
+        if (urlSource === 'link') {
+          const sec = document.createElement('div');
+          sec.className = 'stream-source-row';
+          const lab = document.createElement('div');
+          lab.className = 'stream-source-label';
+          lab.textContent = fabSourceSectionLabel('link', linkCount);
+          getAllBtn = document.createElement('button');
+          getAllBtn.type = 'button';
+          getAllBtn.className = 'get-all-links-btn';
+          getAllBtn.textContent = 'Get all';
+          if (!hasPath) {
+            getAllBtn.disabled = true;
+            getAllBtn.title = 'Add a save folder in Options first';
+          } else {
+            getAllBtn.title = `Queue all ${linkCount} page links (up to 4 download at once)`;
+          }
+          getAllBtn.addEventListener('click', () => {
+            if (!hasPath) {
+              chrome.runtime.openOptionsPage();
+              return;
+            }
+            if (!linkCount || !getAllBtn) return;
+            askFabThumbnailsForAll(linkCount, (choice) => {
+              if (choice === null) {
+                getAllBtn.disabled = false;
+                getAllBtn.textContent = 'Get all';
+                return;
+              }
+              getAllBtn.disabled = true;
+              getAllBtn.textContent = 'Queueing…';
+              const items = linkStreamEntries.map(({ stream: s, i: idx }) => {
+                const cleaned = s.cleanedUrl || '';
+                const u = cleaned || s.url || '';
+                return {
+                  url: u,
+                  kind: s.streamKind ? String(s.streamKind) : 'social',
+                  filename: defaultFileName(idx, n, pageTitle, u),
+                  capturedHeaders: s.capturedHeaders || {},
+                };
+              });
+              queueFabPageLinkBatch(items, { writeThumbnail: choice === true }, (queued, failed) => {
+                getAllBtn.disabled = false;
+                getAllBtn.textContent =
+                  failed > 0 ? `Queued ${queued} (${failed} failed)` : `Queued ${queued}`;
+                setTimeout(() => {
+                  if (getAllBtn) getAllBtn.textContent = 'Get all';
+                }, 2400);
+                refreshPanelJobsOnly();
+              });
+            });
+          });
+          sec.appendChild(lab);
+          sec.appendChild(getAllBtn);
+          fabStreams.appendChild(sec);
+          linkGrid = null;
+        } else {
+          const sec = document.createElement('div');
+          sec.className = 'stream-source-label';
+          sec.textContent = fabSourceSectionLabel(urlSource);
+          fabStreams.appendChild(sec);
+          linkGrid = null;
+        }
+      }
 
       const card = document.createElement('div');
-      card.className = 'stream-card';
-      const h = document.createElement('div');
-      h.className = 'kind';
-      h.textContent = pageOnly
-        ? isAppleMusicPage
-          ? 'Download this track'
-          : 'Download this video'
-        : n > 1
-          ? `Stream ${i + 1} of ${n}${kind ? ` (${kind})` : ''}`
-          : kind || 'Stream';
-      const u = document.createElement('div');
-      u.className = 'url';
-      if (pageOnly) {
-        const intro = document.createElement('div');
-        intro.className = 'stream-page-intro';
-        intro.textContent = isAppleMusicPage
-          ? 'Apple Music: yt-dlp uses the song page URL below (not the FairPlay m3u8 stream).'
-          : 'Social media: yt-dlp uses the page URL below (not a separate stream link).';
-        const link = document.createElement('div');
-        link.className = 'stream-page-link';
-        link.textContent = url;
-        u.appendChild(intro);
-        u.appendChild(link);
-      } else {
-        u.textContent = url;
-      }
-      const row = document.createElement('div');
-      row.className = 'fn-row';
+      card.dataset.urlSource = urlSource;
+
       const input = document.createElement('input');
       input.type = 'text';
       input.value = defaultName;
@@ -684,7 +1062,7 @@
       btn.type = 'button';
       btn.className = 'dl';
       if (!hasPath) btn.disabled = true;
-      btn.textContent = pageOnly ? 'Download this' : 'Download';
+      btn.textContent = isLinkCard ? 'Download' : pageOnly ? 'Download this' : 'Download';
       btn.addEventListener('click', () => {
         if (!hasPath) {
           chrome.runtime.openOptionsPage();
@@ -699,7 +1077,7 @@
 
         const resetFabDlBtn = () => {
           btn.disabled = false;
-          btn.textContent = pageOnly ? 'Download this' : 'Download';
+          btn.textContent = isLinkCard ? 'Download' : pageOnly ? 'Download this' : 'Download';
         };
 
         const startCookieAndDl = (plPick) => {
@@ -708,14 +1086,22 @@
           let effRef = '';
           let effOrigin = '';
           let plDl = false;
-          if (isHttpUrl(tabUrl)) {
+          if (isLinkCard) {
+            // Page-link row: download THIS link, not the tab feed/playlist page.
+            effUrl = url;
+            effPage = url;
+            effRef = isHttpUrl(tabUrl) ? tabUrl : url;
+            try {
+              effOrigin = new URL(effUrl).origin;
+            } catch (_) {}
+          } else if (isHttpUrl(tabUrl)) {
             effPage = tabUrl;
             effRef = tabUrl;
             try {
               effOrigin = new URL(tabUrl).origin;
             } catch (_) {}
           }
-          if (pageOnly && kind === 'yt' && YT && YT.isYoutubePage(tabUrl)) {
+          if (!isLinkCard && pageOnly && kind === 'yt' && YT && YT.isYoutubePage(tabUrl)) {
             const yChoice = plPick === 'playlist' ? 'playlist' : 'single';
             const a = YT.applyYoutubeChoice(tabUrl, yChoice);
             effUrl = a.targetUrl;
@@ -723,7 +1109,7 @@
             effRef = a.referer;
             effOrigin = a.origin || effOrigin;
             plDl = !!a.ytDlpDownloadPlaylist;
-          } else if (pageOnly && /music\.apple\.com/i.test(tabUrl || url || '')) {
+          } else if (!isLinkCard && pageOnly && /music\.apple\.com/i.test(tabUrl || url || '')) {
             // Always send the Apple Music song page URL — never a CDN m3u8.
             const appleUrl = /music\.apple\.com/i.test(tabUrl || '') ? tabUrl : url;
             effUrl = appleUrl;
@@ -732,7 +1118,7 @@
             try {
               effOrigin = new URL(appleUrl).origin;
             } catch (_) {}
-          } else if (!isHttpUrl(tabUrl)) {
+          } else if (!isLinkCard && !isHttpUrl(tabUrl)) {
             effPage = effUrl;
             effRef = effUrl;
             try {
@@ -866,112 +1252,392 @@
         }
         startCookieAndDl('single');
       });
-      row.appendChild(input);
-      row.appendChild(btn);
-      card.appendChild(h);
-      card.appendChild(u);
-      if (pageOnly) {
+
+      if (isLinkCard) {
+        card.className = 'stream-card stream-card--link';
+        const main = document.createElement('div');
+        main.className = 'link-card-main';
+        const titleRow = document.createElement('div');
+        titleRow.className = 'link-card-title-row';
+        const tag = document.createElement('span');
+        tag.className = 'source-tag source-tag--link';
+        tag.textContent = 'page link';
+        titleRow.appendChild(tag);
+        titleRow.appendChild(input);
+        const urlLine = document.createElement('div');
+        urlLine.className = 'link-card-url';
+        urlLine.textContent = fabShortStreamUrl(url);
+        urlLine.title = url;
+        main.appendChild(titleRow);
+        main.appendChild(urlLine);
         const thumbRow = document.createElement('label');
-        thumbRow.className = 'thumb-row';
+        thumbRow.className = 'thumb-row link-card-thumb';
         const tcb = document.createElement('input');
         tcb.type = 'checkbox';
         tcb.id = `fab-thumb-${i}`;
         thumbRow.appendChild(tcb);
         const tspan = document.createElement('span');
-        tspan.textContent = 'Also save thumbnail (jpg next to the video)';
+        tspan.textContent = 'Also save thumbnail';
         thumbRow.appendChild(tspan);
-        card.appendChild(thumbRow);
+        main.appendChild(thumbRow);
+        card.appendChild(main);
+        card.appendChild(btn);
+        if (!linkGrid) {
+          linkGrid = document.createElement('div');
+          linkGrid.className = 'link-stream-grid';
+          fabStreams.appendChild(linkGrid);
+        }
+        linkGrid.appendChild(card);
+      } else {
+        linkGrid = null;
+        card.className = 'stream-card';
+        const h = document.createElement('div');
+        h.className = 'kind';
+        h.appendChild(
+          document.createTextNode(
+            pageOnly
+              ? isAppleMusicPage
+                ? 'Download this track'
+                : 'Download this video'
+              : n > 1
+                ? `Stream ${i + 1} of ${n}${kind ? ` (${kind})` : ''}`
+                : kind || 'Stream'
+          )
+        );
+        if (pageOnly && urlSource === 'tab') {
+          const tag = document.createElement('span');
+          tag.className = 'source-tag source-tag--tab';
+          tag.textContent = 'this page';
+          h.appendChild(tag);
+        }
+        const u = document.createElement('div');
+        u.className = 'url';
+        const link = document.createElement('div');
+        link.className = 'stream-page-link';
+        link.textContent = url;
+        if (pageOnly) {
+          const intro = document.createElement('div');
+          intro.className = 'stream-page-intro';
+          intro.textContent = isAppleMusicPage
+            ? 'Apple Music: yt-dlp uses the song page URL below (not the FairPlay m3u8 stream).'
+            : 'This tab’s post URL. Playlist params are kept — use Clean URL to strip tracking.';
+          u.appendChild(intro);
+          u.appendChild(link);
+          // Clean URL only on the main tab item (not page links).
+          if (urlSource === 'tab' && cleanedUrl && cleanedUrl !== url) {
+            const cleanBtn = document.createElement('button');
+            cleanBtn.type = 'button';
+            cleanBtn.className = 'url-clean-btn';
+            cleanBtn.textContent = 'Clean URL';
+            cleanBtn.title = 'Strip tracking junk (keeps playlist list= / video id)';
+            cleanBtn.addEventListener('click', () => {
+              url = cleanedUrl;
+              link.textContent = url;
+              cleanBtn.disabled = true;
+              cleanBtn.textContent = 'Cleaned';
+            });
+            u.appendChild(cleanBtn);
+          }
+        } else {
+          u.appendChild(link);
+        }
+        const row = document.createElement('div');
+        row.className = 'fn-row';
+        row.appendChild(input);
+        row.appendChild(btn);
+        card.appendChild(h);
+        card.appendChild(u);
+        if (pageOnly) {
+          const thumbRow = document.createElement('label');
+          thumbRow.className = 'thumb-row';
+          const tcb = document.createElement('input');
+          tcb.type = 'checkbox';
+          tcb.id = `fab-thumb-${i}`;
+          thumbRow.appendChild(tcb);
+          const tspan = document.createElement('span');
+          tspan.textContent = 'Also save thumbnail (jpg next to the video)';
+          thumbRow.appendChild(tspan);
+          card.appendChild(thumbRow);
+        }
+        card.appendChild(row);
+        fabStreams.appendChild(card);
       }
-      card.appendChild(row);
-      fabStreams.appendChild(card);
     });
   }
 
-  function renderImages(hasPath) {
+  function shortImgUrl(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return '';
+    if (raw.startsWith('data:')) return 'data:image';
+    try {
+      const u = new URL(raw, location.href);
+      const last = (u.pathname.split('/').filter(Boolean).pop() || '').slice(0, 42);
+      const s = `${u.host}${last ? '/' + last : ''}`;
+      return s.length > 52 ? s.slice(0, 50) + '…' : s;
+    } catch (_) {
+      return raw.length > 52 ? raw.slice(0, 50) + '…' : raw;
+    }
+  }
+
+  const IMAGE_SCOPE_KEY = 'imageListScope';
+  const IMAGE_GRABBER_KEY = 'imageHoverDownloadEnabled';
+
+  function clearFabImages() {
     if (!fabImages) return;
     fabImages.textContent = '';
+  }
+
+  function readImageListScope(cb) {
+    chrome.storage.local.get([IMAGE_SCOPE_KEY], (data) => {
+      if (chrome.runtime.lastError) {
+        cb('page');
+        return;
+      }
+      const scope = data && data[IMAGE_SCOPE_KEY] === 'visible' ? 'visible' : 'page';
+      cb(scope);
+    });
+  }
+
+  function renderImages(hasPath, preferredScope) {
+    if (!fabImages) return;
+    chrome.storage.local.get([IMAGE_GRABBER_KEY], (cfg) => {
+      if (chrome.runtime.lastError || cfg[IMAGE_GRABBER_KEY] !== true) {
+        clearFabImages();
+        return;
+      }
+      renderImagesEnabled(hasPath, preferredScope);
+    });
+  }
+
+  function renderImagesEnabled(hasPath, preferredScope) {
+    if (!fabImages) return;
     const api = typeof window !== 'undefined' ? window.HLS_IMAGE_DL : null;
-    if (!api || typeof api.listImages !== 'function' || typeof api.downloadUrlAs !== 'function') return;
+    if (!api || typeof api.listImages !== 'function' || typeof api.downloadUrlAs !== 'function') {
+      clearFabImages();
+      return;
+    }
 
-    const imgs = api.listImages() || [];
-    if (!imgs.length) return;
+    const finish = (scope) => {
+      const listScope = scope === 'visible' ? 'visible' : 'page';
+      fabImages.textContent = '';
 
-    const head = document.createElement('div');
-    head.className = 'kind';
-    head.style.cssText = 'font-size:9px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);font-weight:600;margin:6px 0 8px;';
-    head.textContent = `Images on page (${imgs.length})`;
-    fabImages.appendChild(head);
+      let imgs = [];
+      try {
+        if (typeof api.refreshScan === 'function') api.refreshScan();
+        imgs = api.listImages({ scope: listScope }) || [];
+      } catch (_) {
+        imgs = [];
+      }
 
-    const mkRow = (img, idx) => {
-      const card = document.createElement('div');
-      card.className = 'stream-card';
+      const head = document.createElement('div');
+      head.className = 'img-section-head';
 
-      const title = document.createElement('div');
-      title.className = 'kind';
-      const dim = img.w && img.h ? ` · ${img.w}×${img.h}` : '';
-      title.textContent = `Image ${idx + 1}${dim}`;
+      const label = document.createElement('div');
+      label.className = 'section-label';
+      label.textContent = imgs.length ? `Images · ${imgs.length}` : 'Images';
 
-      const line = document.createElement('div');
-      line.className = 'url';
-      line.textContent = img.url;
+      const tools = document.createElement('div');
+      tools.className = 'img-section-tools';
 
-      const preview = document.createElement('img');
-      preview.src = img.url;
-      preview.alt = img.alt || '';
-      preview.referrerPolicy = 'no-referrer';
-      preview.style.cssText =
-        'width:100%;max-height:140px;object-fit:contain;border-radius:8px;margin-top:8px;border:1px solid var(--line);background:var(--bg);';
-
-      const row = document.createElement('div');
-      row.className = 'fn-row';
-
-      const sel = document.createElement('select');
-      sel.className = 'img-fmt-select';
-      sel.innerHTML = `
-        <option value="png">PNG</option>
-        <option value="jpg">JPG</option>
-        <option value="jpeg">JPEG</option>
-        <option value="webp">WEBP</option>
+      const scopeSel = document.createElement('select');
+      scopeSel.className = 'img-scope-select';
+      scopeSel.setAttribute('aria-label', 'Image scan range');
+      scopeSel.innerHTML = `
+        <option value="page">Full page</option>
+        <option value="visible">Visible area</option>
       `;
+      scopeSel.value = listScope;
 
-      const btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'dl';
-      btn.textContent = 'Download';
-      if (!hasPath) btn.disabled = true;
-      btn.addEventListener('click', () => {
-        if (!hasPath) {
-          chrome.runtime.openOptionsPage();
-          return;
-        }
-        btn.disabled = true;
-        btn.textContent = '…';
-        const stem = (img.alt && img.alt.trim()) || `image_${idx + 1}`;
-        Promise.resolve(api.downloadUrlAs(img.url, sel.value, stem))
-          .catch(() => {})
-          .finally(() => {
-            btn.disabled = false;
-            btn.textContent = 'Download';
+      const refreshBtn = document.createElement('button');
+      refreshBtn.type = 'button';
+      refreshBtn.className = 'btn btn-pri img-refresh-btn';
+      refreshBtn.textContent = 'Refresh';
+      refreshBtn.title = 'Scan again using the selected range';
+
+      const zipBtn = document.createElement('button');
+      zipBtn.type = 'button';
+      zipBtn.className = 'btn btn-pri img-zip-btn';
+      zipBtn.textContent = 'Download all';
+      zipBtn.disabled = !imgs.length;
+      zipBtn.title = imgs.length
+        ? 'Save every listed image in one ZIP'
+        : 'No images to zip yet';
+
+      const runRefresh = (nextScope) => {
+        const useScope = nextScope === 'visible' ? 'visible' : 'page';
+        chrome.storage.local.set({ [IMAGE_SCOPE_KEY]: useScope }, () => {
+          refreshBtn.disabled = true;
+          refreshBtn.textContent = 'Scanning…';
+          try {
+            if (typeof api.refreshScan === 'function') api.refreshScan();
+          } catch (_) {
+            // ignore
+          }
+          window.requestAnimationFrame(() => {
+            renderImages(hasPath, useScope);
+            if (panel.classList.contains('open')) positionPanel();
           });
+        });
+      };
+
+      scopeSel.addEventListener('change', () => {
+        runRefresh(scopeSel.value);
+      });
+      refreshBtn.addEventListener('click', () => {
+        runRefresh(scopeSel.value);
+      });
+      zipBtn.addEventListener('click', () => {
+        if (!imgs.length) return;
+        zipBtn.disabled = true;
+        zipBtn.textContent = 'Zipping…';
+        chrome.runtime.sendMessage(
+          { type: 'DOWNLOAD_IMAGES_ZIP', images: imgs },
+          (res) => {
+            zipBtn.disabled = false;
+            zipBtn.textContent = 'Download all';
+            if (chrome.runtime.lastError || !res?.ok) {
+              window.alert(
+                chrome.runtime.lastError?.message || res?.error || 'Could not create ZIP'
+              );
+              return;
+            }
+            if (res.failed) {
+              window.alert(
+                `Saved ZIP with ${res.count} image(s). ${res.failed} could not be fetched.`
+              );
+            }
+          }
+        );
       });
 
-      row.appendChild(sel);
-      row.appendChild(btn);
+      tools.appendChild(scopeSel);
+      tools.appendChild(refreshBtn);
+      tools.appendChild(zipBtn);
+      if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+        HLS_IOS_SELECT.enhance(scopeSel, { compact: true });
+      }
 
-      card.appendChild(title);
-      card.appendChild(line);
-      card.appendChild(preview);
-      card.appendChild(row);
-      return card;
+      head.appendChild(label);
+      head.appendChild(tools);
+      fabImages.appendChild(head);
+
+      if (!imgs.length) {
+        const empty = document.createElement('div');
+        empty.className = 'img-empty';
+        empty.textContent =
+          listScope === 'visible'
+            ? 'No images in view. Scroll, or switch to Full page, then Refresh.'
+            : 'No images found on this page yet. Tap Refresh after more load in.';
+        fabImages.appendChild(empty);
+        return;
+      }
+
+      const list = document.createElement('div');
+      list.className = 'img-list';
+
+      imgs.forEach((img, idx) => {
+        const card = document.createElement('div');
+        card.className = 'img-card';
+
+        const thumb = document.createElement('img');
+        thumb.className = 'img-thumb';
+        thumb.src = img.url;
+        thumb.alt = img.alt || '';
+        thumb.referrerPolicy = 'no-referrer';
+        thumb.loading = 'lazy';
+
+        const body = document.createElement('div');
+        body.className = 'img-body';
+
+        const meta = document.createElement('div');
+        meta.className = 'img-meta';
+        const title = document.createElement('div');
+        title.className = 'img-title';
+        const dim = img.w && img.h ? `${img.w}×${img.h}` : '';
+        const name = (img.alt && img.alt.trim()) || `Image ${idx + 1}`;
+        title.textContent = dim ? `${name} · ${dim}` : name;
+        title.title = name;
+        const urlLine = document.createElement('div');
+        urlLine.className = 'img-url';
+        urlLine.textContent = shortImgUrl(img.url);
+        urlLine.title = img.url;
+        meta.appendChild(title);
+        meta.appendChild(urlLine);
+
+        const actions = document.createElement('div');
+        actions.className = 'img-actions';
+
+        const sel = document.createElement('select');
+        sel.className = 'img-fmt-select';
+        sel.setAttribute('aria-label', 'Format');
+        sel.innerHTML = `
+          <option value="png">PNG</option>
+          <option value="jpg">JPG</option>
+          <option value="jpeg">JPEG</option>
+          <option value="webp">WEBP</option>
+        `;
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'btn btn-pri';
+        btn.textContent = 'Save';
+        if (!hasPath) btn.disabled = true;
+        btn.addEventListener('click', () => {
+          if (!hasPath) {
+            chrome.runtime.openOptionsPage();
+            return;
+          }
+          btn.disabled = true;
+          btn.textContent = '…';
+          const stem = (img.alt && img.alt.trim()) || `image_${idx + 1}`;
+          Promise.resolve(api.downloadUrlAs(img.url, sel.value, stem))
+            .catch(() => {})
+            .finally(() => {
+              btn.disabled = false;
+              btn.textContent = 'Save';
+            });
+        });
+
+        actions.appendChild(sel);
+        actions.appendChild(btn);
+        if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+          HLS_IOS_SELECT.enhance(sel, { compact: true });
+        }
+
+        body.appendChild(meta);
+        body.appendChild(actions);
+        card.appendChild(thumb);
+        card.appendChild(body);
+        list.appendChild(card);
+      });
+
+      fabImages.appendChild(list);
     };
 
-    imgs.forEach((img, i) => fabImages.appendChild(mkRow(img, i)));
+    if (preferredScope === 'page' || preferredScope === 'visible') {
+      finish(preferredScope);
+      return;
+    }
+    readImageListScope(finish);
   }
 
   function onFabStorageChanged(changes, area) {
+    if (area === 'local' && changes[IMAGE_GRABBER_KEY]) {
+      if (changes[IMAGE_GRABBER_KEY].newValue === true) {
+        if (panel.classList.contains('open')) refreshAll();
+      } else {
+        clearFabImages();
+      }
+      return;
+    }
     if (area === 'local' && changes.userDownloadPath) {
       if (panel.classList.contains('open')) refreshAll();
       else refreshBadgeOnly();
+      return;
+    }
+    if (area === 'session' && changes[STREAMS_REV_KEY]) {
+      refreshBadgeOnly();
+      if (panel.classList.contains('open')) refreshStreamsIfChanged();
       return;
     }
     if (area === 'session' && changes[JOBS_KEY]) {
@@ -982,9 +1648,38 @@
   chrome.storage.onChanged.addListener(onFabStorageChanged);
 
   fabCtl.closePanel = () => setPanelOpen(false);
-  fabCtl.liveRefresh = () => {
+  fabCtl.openPanel = () => setPanelOpen(true);
+  fabCtl.showBatchThumbPrompt = askFabThumbnailsForAll;
+  fabCtl.runGetAllPageLinks = (items, count, onDone) => {
+    const list = Array.isArray(items) ? items : [];
+    const n = count || list.length;
+    const finish = (result) => {
+      if (typeof onDone === 'function') onDone(result);
+    };
+    if (!list.length) {
+      finish({ ok: false, canceled: true, choice: null });
+      return;
+    }
+    setPanelOpen(true);
+    refreshAll();
+    askFabThumbnailsForAll(n, (choice) => {
+      if (choice === null) {
+        // User canceled — close the float panel and tell the popup to stop.
+        setPanelOpen(false);
+        finish({ ok: false, canceled: true, choice: null });
+        return;
+      }
+      queueFabPageLinkBatch(list, { writeThumbnail: choice === true }, (queued, failed) => {
+        refreshPanelJobsOnly();
+        finish({ ok: true, choice, queued, failed });
+      });
+    });
+  };
+  fabCtl.liveRefresh = (kind) => {
     refreshBadgeOnly();
-    if (panel.classList.contains('open')) refreshPanelJobsOnly();
+    if (!panel.classList.contains('open')) return;
+    if (kind === 'streams' || kind === 'all') refreshStreamsIfChanged();
+    else refreshPanelJobsOnly();
   };
 
   host._hlsFabCleanup = () => {
@@ -1043,8 +1738,18 @@
         }
         return;
       }
-      const lines = (res.active || []).map((a) => `${a.label}: ${fabFormatElapsed(a.elapsed)}`);
-      fabRecStatus.textContent = lines.join(' · ') || 'Recording…';
+      const act = res.active || [];
+      const total = res.total || res.queueTotal || act.length;
+      const pos = res.position || 1;
+      if (res.sequential && total > 1) {
+        const a = act[0];
+        const elapsed = a ? fabFormatElapsed(a.elapsed) : '';
+        const label = a ? a.label : 'video';
+        fabRecStatus.textContent = `${pos} of ${total}${elapsed ? ` · ${elapsed}` : ''} · ${label}`;
+      } else {
+        const lines = act.map((a) => `${a.label}: ${fabFormatElapsed(a.elapsed)}`);
+        fabRecStatus.textContent = lines.join(' · ') || 'Recording…';
+      }
     });
   }
 
@@ -1094,10 +1799,17 @@
             fabIsRecording = true;
             fabRecBtn.classList.add('is-rec');
             fabRecLabel.textContent = 'Stop recording';
-            const fail = (res.details || []).filter((d) => !d.ok);
-            let m = `Recording ${res.count} of ${res.total} video${res.total > 1 ? 's' : ''}`;
-            if (fail.length) m += ` · ${fail.length} skipped`;
-            fabRecStatus.textContent = m;
+            if (res.sequential && res.total > 1) {
+              fabRecStatus.textContent =
+                `1 of ${res.total} (one at a time` +
+                (res.remaining ? `, ${res.remaining} queued` : '') +
+                ')';
+            } else {
+              const fail = (res.details || []).filter((d) => !d.ok);
+              let m = `Recording ${res.count} of ${res.total} video${res.total > 1 ? 's' : ''}`;
+              if (fail.length) m += ` · ${fail.length} skipped`;
+              fabRecStatus.textContent = m;
+            }
             if (!fabRecPoll) fabRecPoll = setInterval(fabUpdateRecStatus, 1000);
           } else {
             fabRecStatus.textContent = res?.error || 'No videos found';

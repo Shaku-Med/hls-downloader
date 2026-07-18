@@ -4,6 +4,17 @@ const CTX_IMG_ROOT = 'sg_ctx_img_root';
 const CTX_IMG_FMT_PREFIX = 'sg_ctx_img_fmt_';
 const CTX_IMG_FMTS = ['png', 'jpg', 'jpeg', 'webp'];
 
+try {
+  importScripts('zip-store.js');
+} catch (e) {
+  console.warn('Stuff Grabber: zip-store failed to load', e);
+}
+try {
+  importScripts('social-post-urls.js');
+} catch (e) {
+  console.warn('Stuff Grabber: social-post-urls failed to load', e);
+}
+
 /** @type {Record<number, ReturnType<typeof setTimeout>>} */
 const _ytdlpPageTimer = {};
 /** @type {Record<number, Record<string, string>>} */
@@ -235,10 +246,95 @@ function upsertStream(tabId, url, capturedHeaders, streamKind) {
   console.log('Video stream:', kind, url);
   chrome.action.setBadgeText({ text: String(list.length), tabId });
   chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
+  notifyStreamsChanged(tabId);
+}
+
+function socialPostApi() {
+  return typeof self !== 'undefined' && self.HLS_SOCIAL_POSTS ? self.HLS_SOCIAL_POSTS : null;
 }
 
 /**
- * Social + YouTube CDNs: yt-dlp uses the tab URL only, one list row, no raw stream URLs.
+ * Collect yt-dlp targets: real post URLs from the tab + <a href> scan.
+ * Never use bare home/feed URLs like https://www.facebook.com/
+ */
+async function collectYtdlpTargetUrls(tabId, pageUrl) {
+  const api = socialPostApi();
+  const targets = [];
+  const seen = new Map(); // key -> index in targets
+
+  const add = (raw, kindHint, urlSource) => {
+    const url = String(raw || '').trim();
+    if (!url) return;
+    let kind = kindHint;
+    let finalUrl = url;
+    let cleanedUrl = '';
+    if (api && typeof api.classifySocialPostUrl === 'function') {
+      const hit = api.classifySocialPostUrl(url);
+      if (!hit.ok) return;
+      finalUrl = hit.url;
+      cleanedUrl = hit.cleanedUrl || '';
+      kind = hit.kind;
+    } else {
+      // Fallback if helper failed to load: only allow obvious watch/post paths.
+      try {
+        const u = new URL(url);
+        const path = u.pathname || '/';
+        if (path === '/' || path === '') return;
+      } catch {
+        return;
+      }
+      const lower = url.toLowerCase();
+      kind =
+        kind ||
+        (lower.includes('youtube.com') || lower.includes('youtu.be') ? 'yt' : 'social');
+    }
+    const source = urlSource === 'tab' ? 'tab' : 'link';
+    const key = finalUrl.replace(/\/$/, '').toLowerCase();
+    if (seen.has(key)) {
+      // Prefer tab (opened page) over a duplicate link hit.
+      const idx = seen.get(key);
+      if (source === 'tab' && targets[idx] && targets[idx].urlSource !== 'tab') {
+        targets[idx].urlSource = 'tab';
+      }
+      if (cleanedUrl && targets[idx] && !targets[idx].cleanedUrl) {
+        targets[idx].cleanedUrl = cleanedUrl;
+      }
+      return;
+    }
+    seen.set(key, targets.length);
+    targets.push({
+      url: finalUrl,
+      cleanedUrl: cleanedUrl || finalUrl,
+      streamKind: kind,
+      urlSource: source,
+    });
+  };
+
+  // 1) Tab URL only if it is itself a post/watch URL.
+  if (api && typeof api.classifySocialPostUrl === 'function') {
+    const pageHit = api.classifySocialPostUrl(pageUrl);
+    if (pageHit.ok) add(pageHit.url, pageHit.kind, 'tab');
+  } else {
+    add(pageUrl, null, 'tab');
+  }
+
+  // 2) Scan <a href> (and canonical/og:url) in the page for post endpoints.
+  //    Relative paths like /reel/123 resolve against the page origin/hostname.
+  try {
+    const res = await tabsSend(tabId, { type: 'LIST_SOCIAL_POST_URLS' });
+    const urls = res && Array.isArray(res.urls) ? res.urls : [];
+    for (const u of urls) add(u, null, 'link');
+    if (res && res.pageIsPost && res.pagePostUrl) add(res.pagePostUrl, res.pageKind, 'tab');
+  } catch (_) {
+    // Content script may be missing on restricted pages.
+  }
+
+  return targets;
+}
+
+/**
+ * Social + YouTube CDNs: yt-dlp uses post/page URLs (not raw CDN blobs).
+ * Prefer concrete post links from the DOM when the tab is a feed/home root.
  */
 function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
   if (!tabId || tabId < 0) return;
@@ -254,33 +350,57 @@ function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
       if (chrome.runtime.lastError || !tab) return;
       const pageUrl = (tab.url || '').trim();
       if (!/^https?:/i.test(pageUrl)) return;
-      if (!detectedStreams[tabId]) detectedStreams[tabId] = [];
-      const list = detectedStreams[tabId];
-      let merged = { ...(capSnap || {}) };
-      for (const e of list) {
-        if ((e.streamKind === 'social' || e.streamKind === 'yt') && e.capturedHeaders) {
-          merged = { ...e.capturedHeaders, ...merged };
+
+      void (async () => {
+        if (!detectedStreams[tabId]) detectedStreams[tabId] = [];
+        const list = detectedStreams[tabId];
+        let merged = { ...(capSnap || {}) };
+        for (const e of list) {
+          if ((e.streamKind === 'social' || e.streamKind === 'yt') && e.capturedHeaders) {
+            merged = { ...e.capturedHeaders, ...merged };
+          }
         }
-      }
-      // Drop raw HLS/DASH rows on Apple Music — only the song page URL is usable with yt-dlp.
-      const rest = isAppleMusicPage(pageUrl)
-        ? []
-        : list.filter((e) => e.streamKind !== 'social' && e.streamKind !== 'yt');
-      const lower = pageUrl.toLowerCase();
-      const kind =
-        lower.includes('youtube.com') || lower.includes('youtu.be')
-          ? 'yt'
-          : 'social';
-      rest.push({
-        url: pageUrl,
-        streamKind: kind,
-        pageDownload: true,
-        capturedHeaders: merged,
-      });
-      detectedStreams[tabId] = rest;
-      console.log('yt-dlp page placeholder:', kind, pageUrl);
-      chrome.action.setBadgeText({ text: String(rest.length), tabId });
-      chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
+
+        const targets = await collectYtdlpTargetUrls(tabId, pageUrl);
+        // Drop raw HLS/DASH rows on Apple Music — only the song page URL is usable with yt-dlp.
+        const rest = isAppleMusicPage(pageUrl)
+          ? []
+          : list.filter((e) => e.streamKind !== 'social' && e.streamKind !== 'yt');
+
+        if (!targets.length) {
+          // Nothing usable (e.g. facebook.com/ with no post links found yet).
+          detectedStreams[tabId] = rest;
+          chrome.action.setBadgeText({
+            text: rest.length ? String(rest.length) : '',
+            tabId,
+          });
+          if (rest.length) {
+            chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
+          }
+          console.log('yt-dlp: no post URL on', pageUrl);
+          notifyStreamsChanged(tabId);
+          return;
+        }
+
+        for (const t of targets) {
+          rest.push({
+            url: t.url,
+            cleanedUrl: t.cleanedUrl || t.url,
+            streamKind: t.streamKind || 'social',
+            pageDownload: true,
+            urlSource: t.urlSource === 'tab' ? 'tab' : 'link',
+            capturedHeaders: { ...merged },
+          });
+        }
+        detectedStreams[tabId] = rest;
+        console.log(
+          'yt-dlp page placeholder(s):',
+          targets.map((t) => `${t.urlSource || 'link'} ${t.streamKind} ${t.url}`).join(' | ')
+        );
+        chrome.action.setBadgeText({ text: String(rest.length), tabId });
+        chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
+        notifyStreamsChanged(tabId);
+      })();
     });
   }, 140);
 }
@@ -289,6 +409,9 @@ function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
 function sortStreamsForUi(list) {
   if (!list || !list.length) return [];
   const score = (s) => {
+    // Opened post page first, then post links from <a> tags, then network streams.
+    if (s && s.pageDownload && s.urlSource === 'tab') return 170;
+    if (s && s.pageDownload && s.urlSource === 'link') return 160;
     if (s && s.pageDownload) return 150;
     const u = ((s && s.url) || '').toLowerCase();
     if (hlsMediaSegmentUrl(u)) return -1000;
@@ -330,6 +453,23 @@ function pickForwardHeaders(requestHeaders) {
   return out;
 }
 
+/** Chrome-only; including this on Firefox can prevent the listener from registering. */
+function isFirefoxBrowser() {
+  try {
+    const ua = String((typeof navigator !== 'undefined' && navigator.userAgent) || '');
+    return /\bFirefox\//i.test(ua);
+  } catch (_) {
+    return false;
+  }
+}
+
+const WEB_REQUEST_REQ_EXTRA = isFirefoxBrowser()
+  ? ['requestHeaders']
+  : ['requestHeaders', 'extraHeaders'];
+const WEB_REQUEST_RES_EXTRA = isFirefoxBrowser()
+  ? ['responseHeaders']
+  : ['responseHeaders', 'extraHeaders'];
+
 chrome.webRequest.onBeforeSendHeaders.addListener(
   (details) => {
     const url = details.url;
@@ -364,7 +504,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     });
   },
   { urls: ['<all_urls>'] },
-  ['requestHeaders', 'extraHeaders']
+  WEB_REQUEST_REQ_EXTRA
 );
 
 chrome.webRequest.onHeadersReceived.addListener(
@@ -406,8 +546,64 @@ chrome.webRequest.onHeadersReceived.addListener(
     upsertStream(tabId, url, {}, k);
   },
   { urls: ['<all_urls>'] },
-  ['responseHeaders', 'extraHeaders']
+  WEB_REQUEST_RES_EXTRA
 );
+
+function isSocialOrYtPageUrl(url) {
+  const api = socialPostApi();
+  if (api && typeof api.isSocialSiteHost === 'function') {
+    try {
+      return api.isSocialSiteHost(new URL(url).hostname);
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/** Merge post URLs from DOM scans without wiping unrelated traffic streams. */
+function mergeSocialPostTargets(tabId, targets, capturedHeaders) {
+  if (!tabId || tabId < 0 || !targets || !targets.length) return;
+  if (!detectedStreams[tabId]) detectedStreams[tabId] = [];
+  const list = detectedStreams[tabId];
+  const byUrl = new Map();
+  for (const e of list) {
+    if (e && e.url) byUrl.set(String(e.url).replace(/\/$/, '').toLowerCase(), e);
+  }
+  let added = 0;
+  for (const t of targets) {
+    const url = String((t && t.url) || '').trim();
+    if (!url) continue;
+    const key = url.replace(/\/$/, '').toLowerCase();
+    const existing = byUrl.get(key);
+    if (existing) {
+      if (t.urlSource === 'tab') existing.urlSource = 'tab';
+      if (t.streamKind) existing.streamKind = t.streamKind;
+      existing.pageDownload = true;
+      if (capturedHeaders) {
+        existing.capturedHeaders = { ...(existing.capturedHeaders || {}), ...capturedHeaders };
+      }
+      continue;
+    }
+    const row = {
+      url,
+      cleanedUrl: (t && t.cleanedUrl) || url,
+      streamKind: (t && t.streamKind) || 'social',
+      pageDownload: true,
+      urlSource: t.urlSource === 'tab' ? 'tab' : 'link',
+      capturedHeaders: { ...(capturedHeaders || {}) },
+    };
+    list.push(row);
+    byUrl.set(key, row);
+    added += 1;
+  }
+  if (added || targets.length) {
+    detectedStreams[tabId] = list;
+    chrome.action.setBadgeText({ text: String(list.length), tabId });
+    chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
+    notifyStreamsChanged(tabId);
+  }
+}
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'loading') {
@@ -418,12 +614,23 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     delete _ytdlpPageCap[tabId];
     detectedStreams[tabId] = [];
     chrome.action.setBadgeText({ text: '', tabId });
+    notifyStreamsChanged(tabId);
   }
   // Like YouTube: Apple Music song/album pages get a page-URL download for yt-dlp.
   if (
     (changeInfo.status === 'complete' || changeInfo.url) &&
     tab &&
     isAppleMusicTrackPage(tab.url || '')
+  ) {
+    upsertYtdlpPagePlaceholder(tabId, {});
+  }
+  // YouTube / Facebook / TikTok / etc.: scan for watch/shorts/reel/post links on load.
+  if (
+    changeInfo.status === 'complete' &&
+    tab &&
+    tab.url &&
+    /^https?:/i.test(tab.url) &&
+    isSocialOrYtPageUrl(tab.url)
   ) {
     upsertYtdlpPagePlaceholder(tabId, {});
   }
@@ -438,22 +645,62 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete detectedStreams[tabId];
 });
 
-function setupImageContextMenus() {
-  chrome.contextMenus.removeAll(() => {
-    chrome.contextMenus.create({
-      id: CTX_IMG_ROOT,
-      title: 'Stuff Grabber: Download image (PNG)',
-      contexts: ['image'],
-    });
-    for (const fmt of CTX_IMG_FMTS) {
-      chrome.contextMenus.create({
-        id: `${CTX_IMG_FMT_PREFIX}${fmt}`,
-        parentId: CTX_IMG_ROOT,
-        title: `Save as ${fmt.toUpperCase()}`,
-        contexts: ['image'],
+const IMAGE_GRABBER_KEY = 'imageHoverDownloadEnabled';
+
+/** Serialize menu rebuilds — overlapping removeAll/create causes duplicate-id errors. */
+let _ctxMenusChain = Promise.resolve();
+
+function ctxMenusRemoveAll() {
+  return new Promise((resolve) => {
+    try {
+      chrome.contextMenus.removeAll(() => {
+        void chrome.runtime.lastError;
+        resolve();
       });
+    } catch (_) {
+      resolve();
     }
   });
+}
+
+function ctxMenusCreate(createProperties) {
+  return new Promise((resolve) => {
+    try {
+      chrome.contextMenus.create(createProperties, () => {
+        void chrome.runtime.lastError;
+        resolve();
+      });
+    } catch (_) {
+      resolve();
+    }
+  });
+}
+
+function setupImageContextMenus() {
+  _ctxMenusChain = _ctxMenusChain
+    .then(async () => {
+      const data = await chrome.storage.local.get([IMAGE_GRABBER_KEY]);
+      const enabled = data && data[IMAGE_GRABBER_KEY] === true;
+      await ctxMenusRemoveAll();
+      if (!enabled) return;
+      await ctxMenusCreate({
+        id: CTX_IMG_ROOT,
+        title: 'Stuff Grabber: Download image (PNG)',
+        contexts: ['image'],
+      });
+      for (const fmt of CTX_IMG_FMTS) {
+        await ctxMenusCreate({
+          id: `${CTX_IMG_FMT_PREFIX}${fmt}`,
+          parentId: CTX_IMG_ROOT,
+          title: `Save as ${fmt.toUpperCase()}`,
+          contexts: ['image'],
+        });
+      }
+    })
+    .catch(() => {
+      // never break the chain
+    });
+  return _ctxMenusChain;
 }
 
 chrome.runtime.onInstalled.addListener(() => {
@@ -464,6 +711,13 @@ chrome.runtime.onStartup.addListener(() => {
   setupImageContextMenus();
 });
 
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes[IMAGE_GRABBER_KEY]) {
+    setupImageContextMenus();
+  }
+});
+
+// Single boot setup (onInstalled also fires on reload — chain serializes both).
 setupImageContextMenus();
 
 function ctxMimeFromFormat(fmt) {
@@ -531,21 +785,17 @@ async function ctxDownloadImageAs(url, fmt) {
   }
 
   if (blob) {
-    const blobUrl = URL.createObjectURL(blob);
-    try {
-      await chrome.downloads.download({
-        url: blobUrl,
-        filename: `${stem}.${ext || 'png'}`,
-        saveAs: false,
-        conflictAction: 'uniquify',
-      });
-    } finally {
-      setTimeout(() => URL.revokeObjectURL(blobUrl), 3000);
-    }
+    const dataUrl = await blobToDataUrl(blob);
+    await downloadUrlPromise({
+      url: dataUrl,
+      filename: `${stem}.${ext || 'png'}`,
+      saveAs: false,
+      conflictAction: 'uniquify',
+    });
     return;
   }
 
-  await chrome.downloads.download({
+  await downloadUrlPromise({
     url,
     filename: `${stem}.${ext || 'jpg'}`,
     saveAs: false,
@@ -608,20 +858,124 @@ async function readJobsState() {
   return data[JOBS_KEY] || defaultJobsState();
 }
 
-let _fabLiveNotifyTimer = null;
+const STREAMS_REV_KEY = 'hlsGrabStreamsRev';
+let _uiNotifyTimer = null;
+/** @type {'jobs' | 'streams' | 'all' | null} */
+let _uiNotifyKind = null;
 
-function scheduleFabContentBroadcast() {
-  if (_fabLiveNotifyTimer) return;
-  _fabLiveNotifyTimer = setTimeout(() => {
-    _fabLiveNotifyTimer = null;
+/** Broadcast to open FAB panels + popup so lists refresh without reopen. */
+function scheduleUiBroadcast(kind) {
+  const next = kind === 'jobs' || kind === 'streams' ? kind : 'all';
+  if (_uiNotifyKind && _uiNotifyKind !== next) _uiNotifyKind = 'all';
+  else if (!_uiNotifyKind) _uiNotifyKind = next;
+  if (_uiNotifyTimer) return;
+  _uiNotifyTimer = setTimeout(() => {
+    const k = _uiNotifyKind || 'jobs';
+    _uiNotifyTimer = null;
+    _uiNotifyKind = null;
+    const msg = { type: 'HLS_GRABBER_LIVE_UPDATE', kind: k };
     chrome.tabs.query({}, (tabs) => {
-      const msg = { type: 'HLS_GRABBER_LIVE_UPDATE' };
       for (const t of tabs || []) {
         if (t.id == null) continue;
         chrome.tabs.sendMessage(t.id, msg).catch(() => {});
       }
     });
+    try {
+      chrome.runtime.sendMessage(msg).catch(() => {});
+    } catch (_) {
+      // no open listeners (popup closed) — fine
+    }
   }, 48);
+}
+
+/** @deprecated use scheduleUiBroadcast */
+function scheduleFabContentBroadcast() {
+  scheduleUiBroadcast('jobs');
+}
+
+function notifyStreamsChanged(tabId) {
+  const list = (tabId != null && tabId >= 0 && detectedStreams[tabId]) || [];
+  const count = list.length;
+  const links = list.filter((s) => s && s.pageDownload && s.urlSource === 'link').length;
+  chrome.storage.session
+    .set({
+      [STREAMS_REV_KEY]: { tabId: tabId ?? null, count, links, at: Date.now() },
+    })
+    .catch(() => {});
+  scheduleUiBroadcast('streams');
+}
+
+function mediaIdFromUrl(url) {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  try {
+    const u = new URL(raw);
+    const v = u.searchParams.get('v');
+    if (v) return v;
+    const path = u.pathname || '';
+    let m = path.match(/\/(?:shorts|embed|live)\/([^/?#]+)/i);
+    if (m) return m[1];
+    m = path.match(/\/(?:reel|p|tv)\/([^/?#]+)/i);
+    if (m) return m[1];
+    m = path.match(/\/video\/(\d+)/i);
+    if (m) return m[1];
+    m = path.match(/\/status\/(\d+)/i);
+    if (m) return m[1];
+    const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+    if (host === 'youtu.be') {
+      const seg = path.replace(/^\//, '').split('/')[0];
+      if (seg) return seg;
+    }
+  } catch (_) {
+    // ignore
+  }
+  return '';
+}
+
+/**
+ * pageUrl for yt-dlp: use each job's own download URL (page-link jobs).
+ * Only fall back to the tab URL for raw CDN manifests that need the watch page.
+ */
+function resolveYtdlpPageUrl(downloadUrl, tabUrl, existingPageUrl) {
+  const u = String(downloadUrl || '').trim();
+  const tab = String(tabUrl || '').trim();
+  const existing = String(existingPageUrl || '').trim();
+  const looksLikeCdn =
+    /\.(m3u8|mpd|m4s)(\?|$)/i.test(u) ||
+    /googlevideo\.com|fbcdn\.net|cdninstagram\.com|tiktokcdn/i.test(u);
+  if (looksLikeCdn && /^https?:/i.test(tab)) return tab;
+  if (/^https?:/i.test(u)) return u;
+  if (/^https?:/i.test(existing) && existing !== tab) return existing;
+  if (/^https?:/i.test(tab)) return tab;
+  return existing || u || tab;
+}
+
+function notifyTabDownloadProgress(tabId, job) {
+  if (tabId == null || tabId < 0 || !job) return;
+  const streamUrl = job.streamUrl || (job.downloadPayload && job.downloadPayload.url) || '';
+  const pageUrl = (job.downloadPayload && job.downloadPayload.pageUrl) || '';
+  const mediaId = job.mediaId || mediaIdFromUrl(streamUrl) || mediaIdFromUrl(pageUrl) || null;
+  const payload = {
+    type: 'JOB_DOWNLOAD_PROGRESS',
+    job: {
+      id: job.id,
+      label: job.label || 'Download',
+      status: job.status,
+      detail: job.detail || '',
+      percent: job.percent,
+      playlistIndex: job.playlistIndex,
+      playlistCount: job.playlistCount,
+      mediaId,
+      streamUrl: streamUrl || null,
+      pageUrl: pageUrl || null,
+      error: job.error || null,
+    },
+  };
+  try {
+    chrome.tabs.sendMessage(tabId, payload).catch(() => {});
+  } catch (_) {
+    // ignore
+  }
 }
 
 function broadcastCloseFloatPanel() {
@@ -636,7 +990,7 @@ function broadcastCloseFloatPanel() {
 
 async function writeJobsState(jobs) {
   await chrome.storage.session.set({ [JOBS_KEY]: { jobs: [...jobs] } });
-  scheduleFabContentBroadcast();
+  scheduleUiBroadcast('jobs');
 }
 
 async function upsertJob(job) {
@@ -782,12 +1136,23 @@ function onHostMessage(msg, slotIndex) {
   if (!jobId) return;
   (async () => {
     if (msg.type === 'progress') {
-      await patchJob(jobId, {
+      const patch = {
         status: 'downloading',
         detail: msg.detail || msg.phase || 'Running',
         outputPath: msg.output || null,
         ffmpegPreset: msg.ffmpegPreset || undefined,
-      });
+      };
+      if (msg.percent != null && Number.isFinite(Number(msg.percent))) {
+        patch.percent = Math.max(0, Math.min(100, Number(msg.percent)));
+      }
+      if (msg.playlistIndex != null) patch.playlistIndex = Number(msg.playlistIndex) || msg.playlistIndex;
+      if (msg.playlistCount != null) patch.playlistCount = Number(msg.playlistCount) || msg.playlistCount;
+      if (msg.mediaId) patch.mediaId = String(msg.mediaId);
+      const jobs = await patchJob(jobId, patch);
+      const job = (jobs || []).find((j) => j && j.id === jobId);
+      if (job && job.tabId != null) {
+        notifyTabDownloadProgress(job.tabId, job);
+      }
       return;
     }
     if (msg.type !== 'done') {
@@ -807,19 +1172,24 @@ function onHostMessage(msg, slotIndex) {
         outputPath: msg.output || prev?.outputPath || null,
       });
     } else if (msg.success) {
-      await patchJob(jobId, {
+      const jobs = await patchJob(jobId, {
         status: 'completed',
         detail: (msg.detail && String(msg.detail).trim()) || 'Saved',
         error: null,
         outputPath: msg.output || null,
+        percent: 100,
       });
+      const job = (jobs || []).find((j) => j && j.id === jobId);
+      if (job && job.tabId != null) notifyTabDownloadProgress(job.tabId, job);
     } else {
-      await patchJob(jobId, {
+      const jobs = await patchJob(jobId, {
         status: 'error',
         error: msg.error || 'Failed',
         detail: '',
         outputPath: null,
       });
+      const job = (jobs || []).find((j) => j && j.id === jobId);
+      if (job && job.tabId != null) notifyTabDownloadProgress(job.tabId, job);
     }
     tryDispatch();
   })();
@@ -1011,17 +1381,17 @@ async function restartDownloadJob(jobId, { newPreset, deleteFile, payload }) {
   tryDispatch();
 }
 
-function deleteOutputFileViaNative(outputPath, outputDirectory) {
+function nativePathOp(type, resultType, outputPath, outputDirectory, timeoutError) {
   return new Promise((resolve) => {
     if (!outputPath || !outputDirectory) {
-      resolve({ ok: true, skipped: true });
+      resolve({ ok: false, error: 'Missing path or save folder' });
       return;
     }
     const requestId = genJobId();
     const timeoutMs = 30000;
     let settled = false;
     const port = chrome.runtime.connectNative(NATIVE);
-    const t = setTimeout(() => finish({ ok: false, error: 'Timed out deleting file' }), timeoutMs);
+    const t = setTimeout(() => finish({ ok: false, error: timeoutError }), timeoutMs);
     function finish(out) {
       if (settled) return;
       settled = true;
@@ -1035,7 +1405,7 @@ function deleteOutputFileViaNative(outputPath, outputDirectory) {
     }
     port.onMessage.addListener((msg) => {
       if (settled) return;
-      if (msg && msg.type === 'delete_output_file_result' && msg.requestId === requestId) {
+      if (msg && msg.type === resultType && msg.requestId === requestId) {
         finish({ ok: msg.success !== false, error: msg.error || null });
       }
     });
@@ -1045,7 +1415,7 @@ function deleteOutputFileViaNative(outputPath, outputDirectory) {
     });
     try {
       port.postMessage({
-        type: 'delete_output_file',
+        type,
         requestId,
         path: outputPath,
         outputDirectory,
@@ -1056,14 +1426,259 @@ function deleteOutputFileViaNative(outputPath, outputDirectory) {
   });
 }
 
+function deleteOutputFileViaNative(outputPath, outputDirectory) {
+  if (!outputPath || !outputDirectory) {
+    return Promise.resolve({ ok: true, skipped: true });
+  }
+  return nativePathOp(
+    'delete_output_file',
+    'delete_output_file_result',
+    outputPath,
+    outputDirectory,
+    'Timed out deleting file'
+  );
+}
+
+/** Turn a local disk path into a file:// URL the browser can open in a tab. */
+function localPathToFileUrl(filePath) {
+  let p = String(filePath || '').trim().replace(/\\/g, '/');
+  if (!p) return '';
+  if (/^[A-Za-z]:\//.test(p)) p = '/' + p;
+  else if (!p.startsWith('/')) p = '/' + p;
+  return 'file://' + encodeURI(p).replace(/#/g, '%23');
+}
+
+function openLocalFileInBrowserTab(filePath) {
+  return new Promise((resolve) => {
+    const fileUrl = localPathToFileUrl(filePath);
+    if (!fileUrl) {
+      resolve({ ok: false, error: 'Missing file path' });
+      return;
+    }
+
+    const openTab = () => {
+      chrome.tabs.create({ url: fileUrl }, () => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          resolve({
+            ok: false,
+            error:
+              err.message ||
+              'Could not open file in the browser. On the extensions page, enable “Allow access to file URLs” for Stuff Grabber.',
+          });
+          return;
+        }
+        resolve({ ok: true, url: fileUrl });
+      });
+    };
+
+    try {
+      if (chrome.extension && typeof chrome.extension.isAllowedFileSchemeAccess === 'function') {
+        chrome.extension.isAllowedFileSchemeAccess((allowed) => {
+          if (!allowed) {
+            resolve({
+              ok: false,
+              error:
+                'Turn on “Allow access to file URLs” for Stuff Grabber on the extensions page, then try Open again.',
+            });
+            return;
+          }
+          openTab();
+        });
+        return;
+      }
+    } catch (_) {
+      // fall through
+    }
+    openTab();
+  });
+}
+
 async function cancelJobAndWait(jobId) {
   await cancelDownloadById(jobId, { wait: true });
+}
+
+function resolveActiveTabId(tabIdFromMsg, sender) {
+  return new Promise((resolve) => {
+    if (tabIdFromMsg != null && tabIdFromMsg >= 0) {
+      resolve(tabIdFromMsg);
+      return;
+    }
+    if (sender && sender.tab && sender.tab.id >= 0) {
+      resolve(sender.tab.id);
+      return;
+    }
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      if (chrome.runtime.lastError || !tabs || !tabs[0] || tabs[0].id == null) {
+        resolve(null);
+        return;
+      }
+      resolve(tabs[0].id);
+    });
+  });
+}
+
+function tabsSend(tabId, payload) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, payload, (res) => {
+      if (chrome.runtime.lastError) {
+        resolve({ ok: false, error: chrome.runtime.lastError.message, images: [] });
+        return;
+      }
+      resolve(res || { ok: false, error: 'No response', images: [] });
+    });
+  });
+}
+
+function stampForFilename() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+function sanitizeZipStem(s) {
+  let t = String(s || '')
+    .replace(/[<>:"/\\|?*\x00-\x1f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  t = t.replace(/^\.+|\.+$/g, '');
+  if (t.length > 60) t = t.slice(0, 60).trim();
+  return t || 'image';
+}
+
+function extFromImageUrlOrMime(url, mime) {
+  const m = String(mime || '').toLowerCase();
+  if (m.includes('png')) return 'png';
+  if (m.includes('webp')) return 'webp';
+  if (m.includes('gif')) return 'gif';
+  if (m.includes('jpeg') || m.includes('jpg')) return 'jpg';
+  if (m.includes('svg')) return 'svg';
+  try {
+    const u = new URL(url, 'https://example.invalid');
+    const path = u.pathname || '';
+    const match = path.match(/\.([a-z0-9]{2,5})$/i);
+    if (match) {
+      const e = match[1].toLowerCase();
+      if (e === 'jpeg') return 'jpg';
+      if (['png', 'jpg', 'webp', 'gif', 'svg', 'avif', 'bmp'].includes(e)) return e;
+    }
+  } catch (_) {
+    // ignore
+  }
+  return 'jpg';
+}
+
+async function fetchImageBytes(url) {
+  if (String(url).startsWith('data:')) {
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = await res.arrayBuffer();
+    return { bytes: new Uint8Array(buf), mime: res.headers.get('content-type') || '' };
+  }
+  const res = await fetch(url, { credentials: 'omit', cache: 'no-cache' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const buf = await res.arrayBuffer();
+  return { bytes: new Uint8Array(buf), mime: res.headers.get('content-type') || '' };
+}
+
+/** MV3 service workers have no URL.createObjectURL — use data: URLs for chrome.downloads. */
+function uint8ToBase64(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  const chunk = 0x8000;
+  let binary = '';
+  for (let i = 0; i < u8.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, u8.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+function bytesToDataUrl(bytes, mime) {
+  const type = String(mime || 'application/octet-stream').split(';')[0] || 'application/octet-stream';
+  return `data:${type};base64,${uint8ToBase64(bytes)}`;
+}
+
+async function blobToDataUrl(blob) {
+  if (!blob) throw new Error('No blob');
+  if (typeof FileReader !== 'undefined') {
+    return await new Promise((resolve, reject) => {
+      const fr = new FileReader();
+      fr.onload = () => resolve(String(fr.result || ''));
+      fr.onerror = () => reject(fr.error || new Error('FileReader failed'));
+      fr.readAsDataURL(blob);
+    });
+  }
+  const buf = await blob.arrayBuffer();
+  return bytesToDataUrl(new Uint8Array(buf), blob.type || 'application/octet-stream');
+}
+
+function downloadUrlPromise(opts) {
+  return new Promise((resolve, reject) => {
+    chrome.downloads.download(opts, (downloadId) => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        reject(new Error(err.message || String(err)));
+        return;
+      }
+      resolve(downloadId);
+    });
+  });
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'POPUP_OPENED') {
     broadcastCloseFloatPanel();
     respond(sendResponse, { ok: true });
+    return true;
+  }
+
+  if (message.type === 'REPORT_SOCIAL_POST_URLS') {
+    (async () => {
+      try {
+        const tabId =
+          sender && sender.tab && sender.tab.id >= 0
+            ? sender.tab.id
+            : await resolveActiveTabId(message.tabId, sender);
+        if (tabId == null) {
+          respond(sendResponse, { ok: false, error: 'No tab' });
+          return;
+        }
+        const api = socialPostApi();
+        const targets = [];
+        const seen = new Set();
+        const push = (raw, kindHint, urlSource) => {
+          const url = String(raw || '').trim();
+          if (!url) return;
+          let finalUrl = url;
+          let cleanedUrl = '';
+          let kind = kindHint;
+          if (api && typeof api.classifySocialPostUrl === 'function') {
+            const hit = api.classifySocialPostUrl(url);
+            if (!hit.ok) return;
+            finalUrl = hit.url;
+            cleanedUrl = hit.cleanedUrl || '';
+            kind = hit.kind;
+          }
+          const key = finalUrl.replace(/\/$/, '').toLowerCase();
+          if (seen.has(key)) return;
+          seen.add(key);
+          targets.push({
+            url: finalUrl,
+            cleanedUrl: cleanedUrl || finalUrl,
+            streamKind: kind || 'social',
+            urlSource: urlSource === 'tab' ? 'tab' : 'link',
+          });
+        };
+        if (message.pageIsPost && message.pagePostUrl) {
+          push(message.pagePostUrl, message.pageKind, 'tab');
+        }
+        const urls = Array.isArray(message.urls) ? message.urls : [];
+        for (const u of urls) push(u, null, 'link');
+        mergeSocialPostTargets(tabId, targets, {});
+        respond(sendResponse, { ok: true, count: targets.length });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
+      }
+    })();
     return true;
   }
 
@@ -1088,6 +1703,123 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       respond(sendResponse, { ok: true, downloadId });
     });
+    return true;
+  }
+
+  if (message.type === 'DOWNLOAD_PAGE_IMAGE') {
+    (async () => {
+      try {
+        const tabId = await resolveActiveTabId(message.tabId, sender);
+        if (tabId == null) {
+          respond(sendResponse, { ok: false, error: 'No active tab' });
+          return;
+        }
+        const res = await tabsSend(tabId, {
+          type: 'DOWNLOAD_PAGE_IMAGE',
+          url: message.url,
+          fmt: message.fmt,
+          stem: message.stem,
+        });
+        respond(sendResponse, res || { ok: false, error: 'No response' });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'GET_PAGE_IMAGES') {
+    (async () => {
+      try {
+        const tabId = await resolveActiveTabId(message.tabId, sender);
+        if (tabId == null) {
+          respond(sendResponse, { ok: false, error: 'No active tab', images: [] });
+          return;
+        }
+        const scope = message.scope === 'visible' ? 'visible' : 'page';
+        const res = await tabsSend(tabId, { type: 'LIST_PAGE_IMAGES', scope });
+        respond(sendResponse, {
+          ok: !!(res && res.ok),
+          images: (res && res.images) || [],
+          error: (res && res.error) || null,
+          scope,
+        });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e), images: [] });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'DOWNLOAD_IMAGES_ZIP') {
+    (async () => {
+      try {
+        const images = Array.isArray(message.images) ? message.images : [];
+        if (!images.length) {
+          respond(sendResponse, { ok: false, error: 'No images to zip' });
+          return;
+        }
+        if (
+          !self.HLS_ZIP_STORE ||
+          (typeof self.HLS_ZIP_STORE.buildZipStoreBytes !== 'function' &&
+            typeof self.HLS_ZIP_STORE.buildZipStore !== 'function')
+        ) {
+          respond(sendResponse, { ok: false, error: 'Zip helper unavailable' });
+          return;
+        }
+        const zipApi = self.HLS_ZIP_STORE;
+        const used = new Set();
+        const files = [];
+        let failed = 0;
+        const max = Math.min(images.length, 200);
+        for (let i = 0; i < max; i++) {
+          const item = images[i] || {};
+          const url = String(item.url || '').trim();
+          if (!url) {
+            failed += 1;
+            continue;
+          }
+          try {
+            const data = await fetchImageBytes(url);
+            const ext = extFromImageUrlOrMime(url, data.mime) || 'jpg';
+            const stem = sanitizeZipStem(item.alt || item.stem || `image_${i + 1}`);
+            const name = zipApi.safeZipEntryName(`${stem}.${ext}`, used);
+            files.push({ name, data: data.bytes });
+          } catch (_) {
+            failed += 1;
+          }
+        }
+        if (!files.length) {
+          respond(sendResponse, {
+            ok: false,
+            error: 'Could not fetch any images (site may block downloads).',
+          });
+          return;
+        }
+        const zipBytes =
+          typeof zipApi.buildZipStoreBytes === 'function'
+            ? zipApi.buildZipStoreBytes(files)
+            : new Uint8Array(await zipApi.buildZipStore(files).arrayBuffer());
+        const zipName =
+          String(message.filename || '').trim() ||
+          `stuff-grabber-images-${stampForFilename()}.zip`;
+        const dataUrl = bytesToDataUrl(zipBytes, 'application/zip');
+        const downloadId = await downloadUrlPromise({
+          url: dataUrl,
+          filename: zipName.replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_'),
+          saveAs: false,
+          conflictAction: 'uniquify',
+        });
+        respond(sendResponse, {
+          ok: true,
+          downloadId,
+          count: files.length,
+          failed,
+        });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
+      }
+    })();
     return true;
   }
 
@@ -1165,31 +1897,67 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
-  if (message.type === 'DELETE_JOB_FILE' && message.jobId) {
+  if (message.type === 'DELETE_JOB_FILE') {
+    if (!message.jobId) {
+      respond(sendResponse, { ok: false, error: 'Missing job' });
+      return true;
+    }
     (async () => {
-      const jobId = message.jobId;
-      const outDir = await getUserDownloadPath();
-      if (!outDir) {
-        respond(sendResponse, { ok: false, error: 'Save folder not set' });
-        return;
+      try {
+        const jobId = message.jobId;
+        const outDir = await getUserDownloadPath();
+        if (!outDir) {
+          respond(sendResponse, { ok: false, error: 'Save folder not set' });
+          return;
+        }
+        const st = await readJobsState();
+        const job = (st.jobs || []).find((j) => j.id === jobId);
+        const outputPath = job && job.outputPath;
+        if (!outputPath) {
+          respond(sendResponse, { ok: false, error: 'No file to delete' });
+          return;
+        }
+        const del = await deleteOutputFileViaNative(outputPath, outDir);
+        if (!del.ok) {
+          respond(sendResponse, { ok: false, error: del.error || 'Could not delete file' });
+          return;
+        }
+        await patchJob(jobId, {
+          outputPath: null,
+          error: job.status === 'canceled' ? 'Canceled (file deleted)' : job.error,
+        });
+        respond(sendResponse, { ok: true });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
       }
-      const st = await readJobsState();
-      const job = (st.jobs || []).find((j) => j.id === jobId);
-      const outputPath = job && job.outputPath;
-      if (!outputPath) {
-        respond(sendResponse, { ok: false, error: 'No file to delete' });
-        return;
+    })();
+    return true;
+  }
+
+  if (message.type === 'OPEN_JOB_FILE') {
+    if (!message.jobId) {
+      respond(sendResponse, { ok: false, error: 'Missing job' });
+      return true;
+    }
+    (async () => {
+      try {
+        const jobId = message.jobId;
+        const st = await readJobsState();
+        const job = (st.jobs || []).find((j) => j.id === jobId);
+        const outputPath = job && job.outputPath;
+        if (!outputPath) {
+          respond(sendResponse, { ok: false, error: 'No file to open' });
+          return;
+        }
+        const opened = await openLocalFileInBrowserTab(outputPath);
+        if (!opened.ok) {
+          respond(sendResponse, { ok: false, error: opened.error || 'Could not open file' });
+          return;
+        }
+        respond(sendResponse, { ok: true });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
       }
-      const del = await deleteOutputFileViaNative(outputPath, outDir);
-      if (!del.ok) {
-        respond(sendResponse, { ok: false, error: del.error || 'Could not delete file' });
-        return;
-      }
-      await patchJob(jobId, {
-        outputPath: null,
-        error: job.status === 'canceled' ? 'Canceled (file deleted)' : job.error,
-      });
-      respond(sendResponse, { ok: true });
     })();
     return true;
   }
@@ -1263,9 +2031,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // ignore
         }
       }
-      if (tabUrl && /^https?:/i.test(tabUrl)) {
-        base.pageUrl = tabUrl;
-      }
+      base.pageUrl = resolveYtdlpPageUrl(base.url || payload.url, tabUrl, base.pageUrl);
       try {
         const mhStore = await chrome.storage.local.get(YTDLP_MAX_HEIGHT_KEY);
         const mhRaw = mhStore[YTDLP_MAX_HEIGHT_KEY];
@@ -1376,9 +2142,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // ignore
         }
       }
-      if (tabUrl && /^https?:/i.test(tabUrl)) {
-        base.pageUrl = tabUrl;
-      }
+      base.pageUrl = resolveYtdlpPageUrl(base.url || payload.url, tabUrl, base.pageUrl);
       const timeoutMs = 90000;
       let settled = false;
       const port = chrome.runtime.connectNative(NATIVE);
@@ -1519,9 +2283,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // ignore
         }
       }
-      if (tabUrl && /^https?:/i.test(tabUrl)) {
-        base.pageUrl = tabUrl;
-      }
+      base.pageUrl = resolveYtdlpPageUrl(base.url || payload.url, tabUrl, base.pageUrl);
       try {
         const mhStore = await chrome.storage.local.get(YTDLP_MAX_HEIGHT_KEY);
         const mhRaw = mhStore[YTDLP_MAX_HEIGHT_KEY];
@@ -1534,6 +2296,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
       const jobId = payload.jobId || genJobId();
       const label = (payload.filename || 'video').toString() || 'video';
+      const seedMediaId =
+        mediaIdFromUrl(payload.url) ||
+        mediaIdFromUrl(base.pageUrl) ||
+        mediaIdFromUrl(tabUrl) ||
+        null;
       await upsertJob({
         id: jobId,
         label,
@@ -1544,6 +2311,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         tabId: tabIdForJob ?? null,
         streamUrl: payload.url,
         streamKind: payload.streamKind || null,
+        mediaId: seedMediaId,
         fileStem: (payload.filename || label).toString(),
         ffmpegPreset: base.ffmpegPreset || null,
         downloadPayload: base,
@@ -1552,6 +2320,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
       enqueueDownload(jobId, base);
       tryDispatch();
+      if (tabIdForJob != null) {
+        notifyTabDownloadProgress(tabIdForJob, {
+          id: jobId,
+          label,
+          status: 'queued',
+          detail: 'Waiting',
+          mediaId: seedMediaId,
+          streamUrl: payload.url,
+          pageUrl: base.pageUrl || tabUrl || '',
+          downloadPayload: base,
+        });
+      }
       respond(sendResponse, { ok: true, jobId });
     })();
     return true;

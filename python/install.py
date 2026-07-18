@@ -2,6 +2,7 @@
 """
 Install script for Stuff Grabber native host.
 Run this once after loading the extension.
+Registers the host for Google Chrome and Firefox (personal / unpacked use).
 """
 
 import os
@@ -12,6 +13,8 @@ import shutil
 import subprocess
 
 NATIVE_HOST_NAME = "com.medzy.hlsgrabber"
+# Must match browser_specific_settings.gecko.id in manifest.firefox.json
+FIREFOX_EXTENSION_ID = "stuff-grabber@local"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HOST_SCRIPT = os.path.join(SCRIPT_DIR, "host.py")
 
@@ -21,7 +24,9 @@ def get_extension_id():
         a = arg.strip()
         if a and not a.startswith("-"):
             return a
-    return input("Paste your Chrome extension ID (from chrome://extensions): ").strip()
+    return input(
+        "Paste your Chromium extension ID (from chrome://extensions or edge://extensions): "
+    ).strip()
 
 
 def _run(cmd):
@@ -31,18 +36,53 @@ def _run(cmd):
         return subprocess.CompletedProcess(cmd, 1, "", str(e))
 
 
+def _run_streaming(cmd, *, label=""):
+    """Run a long install command and stream output so the terminal does not look frozen."""
+    if label:
+        print(label)
+        sys.stdout.flush()
+    print(f"  $ {' '.join(cmd)}")
+    sys.stdout.flush()
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("PIP_PROGRESS_BAR", "on")
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return subprocess.CompletedProcess(cmd, 1, "", str(e))
+
+    chunks = []
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        chunks.append(line)
+        print("  " + line.rstrip("\r\n"))
+        sys.stdout.flush()
+    code = proc.wait()
+    out = "".join(chunks)
+    return subprocess.CompletedProcess(cmd, code, out, "")
+
+
 def install_ytdlp(python_exe):
-    """
-    Install yt-dlp into the exact Python the native host runs, which is the one running this
-    script. Getting the wrong Python here is the classic cause of a stale yt-dlp that keeps
-    warning about its age, so we pin it to python_exe on purpose.
-    """
     print("\nInstalling yt-dlp for the host Python...")
     print(f"  using: {python_exe}")
+    sys.stdout.flush()
     base = [python_exe, "-m", "pip", "install", "-U", "yt-dlp"]
-    r = _run(base)
+    r = _run_streaming(base, label="Downloading and installing yt-dlp (this can take a bit)...")
     if r.returncode != 0:
-        r = _run(base + ["--user"])
+        print("Retrying with --user ...")
+        sys.stdout.flush()
+        r = _run_streaming(base + ["--user"], label="Retrying yt-dlp install for this user...")
     if r.returncode == 0:
         ver = _run([python_exe, "-m", "yt_dlp", "--version"]).stdout.strip()
         print(f"✓ yt-dlp ready ({ver or 'installed'})")
@@ -56,14 +96,14 @@ def install_ytdlp(python_exe):
 
 
 def ensure_ffmpeg():
-    """Make sure ffmpeg is around, and try to grab it on Windows when a package manager exists."""
     if shutil.which("ffmpeg"):
         print("✓ ffmpeg found")
         return True
     print("\nffmpeg not found on PATH.")
     if sys.platform == "win32" and shutil.which("winget"):
         print("Trying winget to install ffmpeg (this can take a minute)...")
-        _run(
+        sys.stdout.flush()
+        _run_streaming(
             [
                 "winget",
                 "install",
@@ -72,7 +112,8 @@ def ensure_ffmpeg():
                 "-e",
                 "--accept-source-agreements",
                 "--accept-package-agreements",
-            ]
+            ],
+            label="Running winget. You should see download progress below.",
         )
         if shutil.which("ffmpeg"):
             print("✓ ffmpeg installed")
@@ -88,79 +129,128 @@ def ensure_ffmpeg():
     return False
 
 
-def install_windows(ext_id):
-    """Install for WSL/Windows - writes to Windows registry via PowerShell"""
-    # Create a wrapper batch file since Chrome on Windows can't call WSL python directly
-    wrapper_path = os.path.join(SCRIPT_DIR, "host_wrapper.bat")
-    
-    # Find python in WSL
+def _write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
+def _chrome_host_manifest(host_path, ext_id):
+    return {
+        "name": NATIVE_HOST_NAME,
+        "description": "Stuff Grabber native host",
+        "path": host_path,
+        "type": "stdio",
+        "allowed_origins": [f"chrome-extension://{ext_id}/"],
+    }
+
+
+def _firefox_host_manifest(host_path):
+    return {
+        "name": NATIVE_HOST_NAME,
+        "description": "Stuff Grabber native host",
+        "path": host_path,
+        "type": "stdio",
+        "allowed_extensions": [FIREFOX_EXTENSION_ID],
+    }
+
+
+def _write_host_wrapper_bat(python_exe, host_script, bat_path):
+    with open(bat_path, "w", newline="\r\n", encoding="utf-8") as f:
+        f.write("@echo off\r\n")
+        f.write("setlocal\r\n")
+        f.write(
+            "REM Optional: set User env var HLS_GRABBER_PYTHON to a full python.exe path "
+            "(e.g. from python.org) if Store Python fails for Chrome/Firefox.\r\n"
+        )
+        f.write('if not "%HLS_GRABBER_PYTHON%"=="" (\r\n')
+        f.write(f'  "%HLS_GRABBER_PYTHON%" -u "{host_script}"\r\n')
+        f.write("  exit /b %ERRORLEVEL%\r\n")
+        f.write(")\r\n")
+        f.write(f'"{python_exe}" -u "{host_script}"\r\n')
+
+
+def _register_windows_native_host(reg_subkey, manifest_path):
+    import winreg
+
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_subkey) as key:
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, manifest_path)
+
+
+def install_windows_wsl(ext_id):
+    """WSL: write Windows-side wrapper + Chrome/Firefox host manifests via PowerShell paths."""
     python_path = shutil.which("python3") or shutil.which("python")
     if not python_path:
         print("ERROR: python3 not found in PATH")
         sys.exit(1)
 
-    # We need a Windows-side wrapper. Let's create a PowerShell script instead.
     ps_wrapper = os.path.join(SCRIPT_DIR, "host_wrapper.ps1")
-    # Convert WSL path to Windows path
     result = subprocess.run(["wslpath", "-w", HOST_SCRIPT], capture_output=True, text=True)
     win_host_path = result.stdout.strip()
     result2 = subprocess.run(["wslpath", "-w", python_path], capture_output=True, text=True)
     win_python = result2.stdout.strip()
 
-    with open(ps_wrapper, "w") as f:
-        f.write(f'& "{win_python}" "{win_host_path}"')
+    with open(ps_wrapper, "w", encoding="utf-8") as f:
+        f.write(f'& "{win_python}" -u "{win_host_path}"\n')
 
-    manifest = {
-        "name": NATIVE_HOST_NAME,
-        "description": "Stuff Grabber native host",
-        "path": ps_wrapper.replace("/", "\\"),
-        "type": "stdio",
-        "allowed_origins": [f"chrome-extension://{ext_id}/"]
-    }
+    win_wrapper = subprocess.run(
+        ["wslpath", "-w", ps_wrapper], capture_output=True, text=True
+    ).stdout.strip()
 
-    # Write manifest to Windows AppData via PowerShell
     manifest_dir_result = subprocess.run(
         ["powershell.exe", "-Command", "echo $env:LOCALAPPDATA"],
-        capture_output=True, text=True
+        capture_output=True,
+        text=True,
     )
     local_app_data = manifest_dir_result.stdout.strip()
-    
-    # Convert to WSL path
     local_app_data_wsl = subprocess.run(
         ["wslpath", local_app_data], capture_output=True, text=True
     ).stdout.strip()
 
-    manifest_dir = os.path.join(local_app_data_wsl, "Google", "Chrome", "NativeMessagingHosts")
-    os.makedirs(manifest_dir, exist_ok=True)
-    manifest_path = os.path.join(manifest_dir, f"{NATIVE_HOST_NAME}.json")
+    chrome_dir = os.path.join(local_app_data_wsl, "Google", "Chrome", "NativeMessagingHosts")
+    chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
+    _write_json(chrome_manifest_path, _chrome_host_manifest(win_wrapper.replace("/", "\\"), ext_id))
 
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
+    firefox_dir = os.path.join(local_app_data_wsl, "Mozilla", "NativeMessagingHosts")
+    # Firefox on Windows uses registry; also keep a copy under LocalAppData for reference.
+    firefox_manifest_path = os.path.join(firefox_dir, f"{NATIVE_HOST_NAME}.json")
+    _write_json(firefox_manifest_path, _firefox_host_manifest(win_wrapper.replace("/", "\\")))
 
-    # Register in Windows registry
-    reg_key = f"HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_HOST_NAME}"
-    win_manifest_path = subprocess.run(
-        ["wslpath", "-w", manifest_path], capture_output=True, text=True
+    win_chrome_manifest = subprocess.run(
+        ["wslpath", "-w", chrome_manifest_path], capture_output=True, text=True
+    ).stdout.strip()
+    win_firefox_manifest = subprocess.run(
+        ["wslpath", "-w", firefox_manifest_path], capture_output=True, text=True
     ).stdout.strip()
 
-    subprocess.run([
-        "powershell.exe", "-Command",
-        f'New-Item -Path "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_HOST_NAME}" -Force | Set-ItemProperty -Name "(default)" -Value "{win_manifest_path}"'
-    ])
+    subprocess.run(
+        [
+            "powershell.exe",
+            "-Command",
+            f'New-Item -Path "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_HOST_NAME}" -Force | Set-ItemProperty -Name "(default)" -Value "{win_chrome_manifest}"',
+        ]
+    )
+    subprocess.run(
+        [
+            "powershell.exe",
+            "-Command",
+            f'New-Item -Path "HKCU:\\Software\\Mozilla\\NativeMessagingHosts\\{NATIVE_HOST_NAME}" -Force | Set-ItemProperty -Name "(default)" -Value "{win_firefox_manifest}"',
+        ]
+    )
 
-    print(f"\n✓ Manifest written to: {manifest_path}")
-    print(f"✓ Registry key set: {reg_key}")
-    print(f"\nRestart Chrome and test the extension!")
+    print(f"\n✓ Wrapper written: {ps_wrapper}")
+    print(f"✓ Chrome manifest: {chrome_manifest_path}")
+    print(f"✓ Firefox manifest: {firefox_manifest_path}")
+    print("✓ Registry: Chrome + Mozilla NativeMessagingHosts")
+    print("\nRestart Chrome/Firefox and test the extension!")
 
 
 def install_native_windows(ext_id):
     """
-    Chrome on Windows looks up HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\<name>
-    and does NOT read ~/.config (that is Linux). Use a .bat launcher because the manifest
-    \"path\" must be a single executable (Chrome does not pass script args).
+    Chrome: HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\<name>
+    Firefox: HKCU\\Software\\Mozilla\\NativeMessagingHosts\\<name>
     """
-    import winreg
-
     local_app_data = os.environ.get("LOCALAPPDATA")
     if not local_app_data:
         print("ERROR: LOCALAPPDATA is not set")
@@ -168,20 +258,8 @@ def install_native_windows(ext_id):
 
     python_exe = os.path.normpath(sys.executable)
     host_script = os.path.normpath(HOST_SCRIPT)
-    bat_path = os.path.join(SCRIPT_DIR, "host_wrapper.bat")
-    with open(bat_path, "w", newline="\r\n") as f:
-        f.write("@echo off\r\n")
-        f.write("setlocal\r\n")
-        f.write(
-            "REM Optional: set User env var HLS_GRABBER_PYTHON to a full python.exe path "
-            "(e.g. from python.org) if Store Python fails for Chrome.\r\n"
-        )
-        f.write('if not "%HLS_GRABBER_PYTHON%"=="" (\r\n')
-        f.write(f'  "%HLS_GRABBER_PYTHON%" -u "{host_script}"\r\n')
-        f.write("  exit /b %ERRORLEVEL%\r\n")
-        f.write(")\r\n")
-        # -u: unbuffered stdio (required for native messaging over pipes)
-        f.write(f'"{python_exe}" -u "{host_script}"\r\n')
+    bat_path = os.path.normpath(os.path.join(SCRIPT_DIR, "host_wrapper.bat"))
+    _write_host_wrapper_bat(python_exe, host_script, bat_path)
 
     low = python_exe.lower()
     if "windowsapps" in low:
@@ -189,7 +267,7 @@ def install_native_windows(ext_id):
             "\n*** NOTE: This installer is using Microsoft Store Python under WindowsApps."
         )
         print(
-            "    Chrome often cannot run yt-dlp reliably with that build, or yt-dlp is missing."
+            "    Browsers often cannot run yt-dlp reliably with that build, or yt-dlp is missing."
         )
         print("    Fix A (same Python): open cmd and run:")
         print(f'        "{python_exe}" -m pip install -U "yt-dlp[default]"')
@@ -201,31 +279,32 @@ def install_native_windows(ext_id):
             "        so host_wrapper.bat uses that python.exe instead of the Store shim.\n"
         )
 
-    manifest_dir = os.path.join(
+    chrome_dir = os.path.join(
         local_app_data, "Google", "Chrome", "User Data", "NativeMessagingHosts"
     )
-    os.makedirs(manifest_dir, exist_ok=True)
-    manifest_path = os.path.join(manifest_dir, f"{NATIVE_HOST_NAME}.json")
+    chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
+    _write_json(chrome_manifest_path, _chrome_host_manifest(bat_path, ext_id))
+    _register_windows_native_host(
+        rf"Software\Google\Chrome\NativeMessagingHosts\{NATIVE_HOST_NAME}",
+        chrome_manifest_path,
+    )
 
-    manifest = {
-        "name": NATIVE_HOST_NAME,
-        "description": "Stuff Grabber native host",
-        "path": os.path.normpath(bat_path),
-        "type": "stdio",
-        "allowed_origins": [f"chrome-extension://{ext_id}/"],
-    }
-
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
-
-    reg_subkey = rf"Software\Google\Chrome\NativeMessagingHosts\{NATIVE_HOST_NAME}"
-    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_subkey) as key:
-        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, manifest_path)
+    # Firefox reads the path from the Mozilla registry key (manifest file can live anywhere).
+    firefox_dir = os.path.join(local_app_data, "Mozilla", "NativeMessagingHosts")
+    firefox_manifest_path = os.path.join(firefox_dir, f"{NATIVE_HOST_NAME}.json")
+    _write_json(firefox_manifest_path, _firefox_host_manifest(bat_path))
+    _register_windows_native_host(
+        rf"Software\Mozilla\NativeMessagingHosts\{NATIVE_HOST_NAME}",
+        firefox_manifest_path,
+    )
 
     print(f"\n✓ Wrapper written: {bat_path}")
-    print(f"✓ Manifest written to: {manifest_path}")
-    print(f"✓ Registry: HKCU\\{reg_subkey}")
-    print("\nRestart Chrome and test the extension!")
+    print(f"✓ Chrome manifest: {chrome_manifest_path}")
+    print(f"✓ Firefox manifest: {firefox_manifest_path}")
+    print(f"✓ Registry: HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_HOST_NAME}")
+    print(f"✓ Registry: HKCU\\Software\\Mozilla\\NativeMessagingHosts\\{NATIVE_HOST_NAME}")
+    print(f"✓ Firefox allowed extension id: {FIREFOX_EXTENSION_ID}")
+    print("\nRestart Chrome and/or Firefox and test the extension!")
     print(
         "\n--- YouTube (yt-dlp) ---\n"
         "Music videos need JavaScript challenge solving (EJS). Install:\n"
@@ -237,56 +316,90 @@ def install_native_windows(ext_id):
 
 
 def install_linux(ext_id):
-    manifest = {
-        "name": NATIVE_HOST_NAME,
-        "description": "Stuff Grabber native host",
-        "path": HOST_SCRIPT,
-        "type": "stdio",
-        "allowed_origins": [f"chrome-extension://{ext_id}/"]
-    }
-
-    manifest_dir = os.path.expanduser("~/.config/google-chrome/NativeMessagingHosts")
-    os.makedirs(manifest_dir, exist_ok=True)
-    manifest_path = os.path.join(manifest_dir, f"{NATIVE_HOST_NAME}.json")
-
-    with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2)
-
-    # Make host.py executable
     st = os.stat(HOST_SCRIPT)
     os.chmod(HOST_SCRIPT, st.st_mode | stat.S_IEXEC)
+    host_path = os.path.normpath(HOST_SCRIPT)
 
-    print(f"\n✓ Manifest written to: {manifest_path}")
-    print(f"✓ host.py made executable")
-    print(f"\nRestart Chrome and test the extension!")
+    chrome_dir = os.path.expanduser("~/.config/google-chrome/NativeMessagingHosts")
+    chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
+    _write_json(chrome_manifest_path, _chrome_host_manifest(host_path, ext_id))
+
+    # Chromium / Brave common paths (best effort)
+    chromium_dir = os.path.expanduser("~/.config/chromium/NativeMessagingHosts")
+    _write_json(
+        os.path.join(chromium_dir, f"{NATIVE_HOST_NAME}.json"),
+        _chrome_host_manifest(host_path, ext_id),
+    )
+
+    firefox_dir = os.path.expanduser("~/.mozilla/native-messaging-hosts")
+    firefox_manifest_path = os.path.join(firefox_dir, f"{NATIVE_HOST_NAME}.json")
+    _write_json(firefox_manifest_path, _firefox_host_manifest(host_path))
+
+    print(f"\n✓ host.py made executable")
+    print(f"✓ Chrome manifest: {chrome_manifest_path}")
+    print(f"✓ Firefox manifest: {firefox_manifest_path}")
+    print(f"✓ Firefox allowed extension id: {FIREFOX_EXTENSION_ID}")
+    print("\nRestart Chrome/Firefox and test the extension!")
+
+
+def install_macos(ext_id):
+    st = os.stat(HOST_SCRIPT)
+    os.chmod(HOST_SCRIPT, st.st_mode | stat.S_IEXEC)
+    host_path = os.path.normpath(HOST_SCRIPT)
+
+    chrome_dir = os.path.expanduser(
+        "~/Library/Application Support/Google/Chrome/NativeMessagingHosts"
+    )
+    chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
+    _write_json(chrome_manifest_path, _chrome_host_manifest(host_path, ext_id))
+
+    firefox_dir = os.path.expanduser(
+        "~/Library/Application Support/Mozilla/NativeMessagingHosts"
+    )
+    firefox_manifest_path = os.path.join(firefox_dir, f"{NATIVE_HOST_NAME}.json")
+    _write_json(firefox_manifest_path, _firefox_host_manifest(host_path))
+
+    print(f"\n✓ host.py made executable")
+    print(f"✓ Chrome manifest: {chrome_manifest_path}")
+    print(f"✓ Firefox manifest: {firefox_manifest_path}")
+    print(f"✓ Firefox allowed extension id: {FIREFOX_EXTENSION_ID}")
+    print("\nRestart Chrome/Firefox and test the extension!")
 
 
 def main():
     print("=== Stuff Grabber Native Host Installer ===\n")
+    print(f"Firefox extension id (fixed): {FIREFOX_EXTENSION_ID}\n")
 
     ext_id = get_extension_id()
     if not ext_id:
-        print("ERROR: Extension ID required")
+        print("ERROR: Chromium Extension ID required")
         sys.exit(1)
 
-    # Detect if running in WSL
-    is_wsl = os.path.exists("/proc/version") and "microsoft" in open("/proc/version").read().lower()
+    is_wsl = (
+        os.path.exists("/proc/version")
+        and "microsoft" in open("/proc/version", encoding="utf-8", errors="ignore").read().lower()
+    )
 
     if is_wsl:
-        print("\nDetected WSL environment  installing for Windows Chrome...")
-        install_windows(ext_id)
+        print("\nDetected WSL environment  installing for Windows Chrome + Firefox...")
+        install_windows_wsl(ext_id)
     elif sys.platform == "win32":
-        print("\nDetected native Windows  installing for Google Chrome...")
+        print("\nDetected native Windows  installing for Google Chrome + Firefox...")
         install_native_windows(ext_id)
+    elif sys.platform == "darwin":
+        print("\nDetected macOS  installing for Google Chrome + Firefox...")
+        install_macos(ext_id)
     else:
-        print("\nInstalling for Linux Chrome...")
+        print("\nInstalling for Linux Chrome/Chromium + Firefox...")
         install_linux(ext_id)
 
     ensure_ffmpeg()
     install_ytdlp(sys.executable)
 
     print(
-        "\nAll set. Fully quit and reopen Chrome so it picks up the host.\n"
+        "\nAll set. Fully quit and reopen your browser so it picks up the host.\n"
+        "Chromium: load unpacked from chrome://extensions (or edge://extensions).\n"
+        "Firefox (personal): about:debugging → This Firefox → Load Temporary Add-on → manifest.json\n"
         "For YouTube music videos you also want one JS runtime on your PATH:\n"
         "  Node.js  https://nodejs.org   or   Deno  https://docs.deno.com/runtime/getting_started/installation/\n"
     )

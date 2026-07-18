@@ -1,94 +1,348 @@
-# Stuff Grabber (Chrome extension + little helper on your PC)
+Stuff Grabber
 
-This thing watches network requests in Chrome, lists video-ish URLs it thinks look useful, then your computer actually saves the file using **ffmpeg** through a small **Python** program (the "native host"). The extension by itself can not write to disk, which is why that extra step exists.
+Personal use only. This is not on the Chrome Web Store, the Edge Add ons store, Firefox Add-ons (AMO), or any other store. Use it by cloning the GitHub repo and loading it yourself.
 
-## What you need first
+It works in Chromium based browsers (Google Chrome, Microsoft Edge, Brave, Opera, and similar) as an unpacked extension, and in Firefox as a temporary add-on for personal use. Firefox temporary add-ons go away when you quit Firefox, so you load it again next time. That is expected for this personal setup.
 
-- **Google Chrome** (or Chromium-based browser that still supports the same extension + native messaging stuff, your mileage may vary)
-- **Python 3** on your machine, and `python` / `py` in PATH so a terminal can start it
-- **ffmpeg** for HLS/DASH work. The installer checks for it and tries to grab it on Windows if you have winget, so you usually do not have to do this by hand.
-- **yt-dlp** for YouTube, Instagram and other social sites. The installer puts this in for you too.
+The extension watches what a page loads when a video or track plays, then hands the useful links to a small helper on your computer. That helper is a Python program. It runs ffmpeg and yt-dlp so the file can land on your disk. The extension alone cannot save files, so you have to install the helper once.
 
-## Get the extension loaded
 
-1. Open `chrome://extensions`
-2. Turn on **Developer mode** (toggles in the corner somewhere)
-3. Click **Load unpacked** and point it at this folder, the one that has `manifest.json` in it
+Auto Download GUI
 
-Chrome will show you a random-looking **extension ID** under the extension name. Copy the whole id string, you need it for the installer.
+Easiest way to get the tools. From this folder run:
 
-## One command install (does everything)
+```text
+python -m auto_download
+```
 
-The extension only talks to Chrome. A small **host** on your PC is what runs ffmpeg and yt-dlp. One script sets all of it up: it registers the host, installs yt-dlp into the right Python, and checks or installs ffmpeg.
+On Windows you can also double click:
 
-From a terminal, `cd` into this folder and run it with the Python you want the host to use:
+```text
+auto_download\run.bat
+```
+
+You need Python 3 already installed so the window can open. The app checks helper tools like ffmpeg, yt-dlp, Deno, and Node. If something is missing, it shows the exact install command and asks you to Allow or Deny before anything runs. Prerequisites are checked first, so a package will not try to install until what it needs is ready. Errors show in the log and in a popup.
+
+After the tools are ready, keep going with Load the extension and Install the helper below.
+
+
+Install everything first
+
+Do these before you expect downloads to work if you are installing by hand instead of using Auto Download.
+
+
+1. A supported browser
+
+Install one of these and use that browser for Stuff Grabber:
+
+```text
+Google Chrome
+Microsoft Edge
+Brave
+Opera
+Firefox
+```
+
+Any Chromium based browser with unpacked extension support should be fine. Firefox is supported for personal use via temporary add-on load (see Load the extension below).
+
+
+2. Python 3
+
+Install Python 3 from python.org if you can. During setup on Windows, turn on the option that adds Python to PATH.
+
+Check that a terminal can see it:
+
+```text
+python --version
+```
+
+or:
+
+```text
+py -3 --version
+```
+
+You also need pip with that same Python:
+
+```text
+python -m pip --version
+```
+
+
+3. ffmpeg
+
+ffmpeg is required for HLS, DASH, and a lot of remux work. Check if you already have it:
+
+```text
+ffmpeg -version
+```
+
+If that fails, install it.
+
+On Windows with winget:
+
+```text
+winget install Gyan.FFmpeg
+```
+
+On Windows with Chocolatey:
+
+```text
+choco install ffmpeg
+```
+
+On macOS with Homebrew:
+
+```text
+brew install ffmpeg
+```
+
+On Debian or Ubuntu:
+
+```text
+sudo apt install ffmpeg
+```
+
+Close the terminal and open a new one after installing, then run `ffmpeg -version` again.
+
+
+4. yt-dlp
+
+yt-dlp is required for YouTube, Instagram, Spotify, Apple Music page downloads, and other social style sites. The install script below puts yt-dlp into the same Python the helper uses. You can also install it yourself the old way from this folder:
+
+```text
+python -m pip install -r requirements.txt
+```
+
+or:
+
+```text
+python -m pip install -U yt-dlp
+```
+
+Check it:
+
+```text
+python -m yt_dlp --version
+```
+
+
+5. A JavaScript runtime for YouTube (recommended)
+
+For a lot of YouTube downloads, yt-dlp wants Deno or Node on your PATH. Install one of them if YouTube keeps failing with challenge or solver style errors.
+
+Deno:
+
+```text
+winget install DenoLand.Deno
+```
+
+or see the Deno install docs for your OS.
+
+Node:
+
+```text
+winget install OpenJS.NodeJS.LTS
+```
+
+or install Node from nodejs.org.
+
+
+6. This project folder
+
+Clone the repo from GitHub, then keep this Stuff Grabber folder somewhere stable on disk. If you move it later, you have to run the helper installer again.
+
+
+Load the extension
+
+Chromium (stays loaded until you remove it)
+
+1. Open the extensions page in your Chromium browser:
+
+Google Chrome or Brave:
+
+```text
+chrome://extensions
+```
+
+Microsoft Edge:
+
+```text
+edge://extensions
+```
+
+Opera:
+
+```text
+opera://extensions
+```
+
+2. Turn on Developer mode.
+3. Click Load unpacked.
+4. Choose this folder, the one that contains `manifest.json` (Chromium uses `manifest.json`; Firefox uses `manifest.firefox.json`).
+
+The browser shows an Extension ID under the name. Copy that full ID. You need it when you run the helper installer.
+
+
+Firefox (personal temporary add-on)
+
+1. Open:
+
+```text
+about:debugging#/runtime/this-firefox
+```
+
+2. Click Load Temporary Add-on.
+3. Choose `manifest.firefox.json` in this folder (not `manifest.json`). Chromium browsers reject Firefox’s `background.scripts` field, so Firefox uses its own manifest file.
+
+Firefox will unload the add-on when you quit the browser. Load it again the same way next time. That is the supported personal Firefox path. The Firefox id is fixed as `stuff-grabber@local`, so you do not paste a Firefox id into the installer.
+
+
+Install the helper
+
+Open a terminal in this folder and run:
 
 ```text
 python python/install.py
 ```
 
-It asks for the extension ID you copied. You can also pass it straight in so nothing is interactive:
+It will ask for your Chromium Extension ID (from Load unpacked). You can also pass that ID on the same line:
 
 ```text
 python python/install.py YOUR_EXTENSION_ID
 ```
 
-Then **fully quit and reopen Chrome** (not just a tab) so it picks up the host.
+One run registers the native host for both Google Chrome and Firefox. The Firefox side uses the fixed id `stuff-grabber@local`. The script also installs or updates yt-dlp for that Python and checks for ffmpeg. On Windows it may try winget for ffmpeg if ffmpeg is missing.
 
-**Which Python matters.** The host uses whatever Python you run `install.py` with, and yt-dlp gets installed into that same one. So if you have more than one Python, run the installer with the exact `python.exe` you want the extension to use. On Windows the wrapper honors a `HLS_GRABBER_PYTHON` user env var if you would rather point it at a specific `python.exe`.
+You can still load the unpacked extension in Edge, Brave, and other Chromium browsers. If downloads do not start from those browsers, use Google Chrome for the download step, or re run the installer after loading the extension there.
 
-If you **reload the extension** or get a new ID, run `python python/install.py` again with the new id. If you ever bump yt-dlp on the wrong Python and it still looks old, just run the installer again with the correct one.
+When it finishes, fully quit the browser and open it again so the helper connects. Closing one tab is not enough. On Firefox, after a full quit you will also need to Load Temporary Add-on again.
 
-## Where files save
+Use the same Python you want the helper to keep using. If you have more than one Python, run the installer with the exact one you care about.
 
-1. Open the extension **Options** (right click the icon, or from the card on `chrome://extensions`, etc.)
-2. Paste a **full folder path** on your computer, like `C:\Users\You\Videos\HLS` or similar
-3. It saves to Chrome storage as you go (you can change it later)
+On Windows you can set a user environment variable named `HLS_GRABBER_PYTHON` to a full path to `python.exe` if you want to lock which Python the helper uses.
 
-The Python host will create the folder if it is missing, but the path has to be valid for your user.
+If you reload the Chromium extension and the ID changes, run the installer again with the new ID:
 
-## Actually using it
+```text
+python python/install.py YOUR_EXTENSION_ID
+```
 
-- Go to a page that plays a video and let it start
-- Open the extension popup. It tries to list streams it saw for **that tab**
-- For something with HLS, you usually want a line that looks like a **.m3u8** (or a single good **.mp4** link) rather than random tiny segment files
-- Type a file name (no .mp4 needed, it will still output mp4) or leave the default, hit **Download**
-- A few jobs can run at once, the rest queue; you can close the popup and it should keep chugging in the background
+If you move this folder to a new place on disk, run the installer again too.
 
-It is not magic. Some sites use DRM, blob URLs, or only pull video inside workers, so there will be nothing to catch. That is a limitation of this approach, not you.
 
-**Netflix, Disney+, Prime Video, etc.** use **Widevine DRM**. The extension may detect manifest URLs on those sites, but segments are encrypted and **cannot** be saved by ffmpeg or yt-dlp. Use each service's official offline feature, or download from open (non-DRM) sources such as YouTube trailers.
+Pick a save folder
 
-## Regenerating icons (optional)
+Open the extension Options. Paste a full folder path on your computer where you want files to go, for example:
 
-There is an `asset` folder with a master `icon.png` and fixed sizes. If you replace `asset/icon.png` and have ffmpeg in PATH, run:
+```text
+C:\Users\You\Videos\Grabs
+```
 
-- `asset\build-icons.cmd` on Windows
+The helper will create the folder if it is missing, as long as your user account can write there.
 
-That overwrites the `icon-16`, `32`, `48`, `128` files the manifest points at.
 
-## Running the tests
+How to download a normal video
 
-There is a small suite for the host logic that decides yt-dlp routing and cookie handling. From this folder run:
+Go to the page and start playback for a moment so the browser starts fetching media. Open the Stuff Grabber popup or the floating panel. You should see one or more entries for that tab.
+
+For many sites you want a playlist style link that ends in `.m3u8`, or a clear `.mp4` style link, not a pile of tiny segment files. Type a file name if you want, or leave the default. You do not need to type `.mp4` yourself. Hit Download.
+
+A few jobs can run at once and the rest wait in line. You can close the popup while downloads keep going.
+
+
+How to download YouTube and similar pages
+
+On YouTube and a bunch of other social sites, Stuff Grabber offers a page download instead of chasing every CDN blob. That row uses the page URL and sends it to yt-dlp. Pick Download this video, name the file if you want, and go.
+
+If the page looks like a playlist, you may get asked whether you want one video or the whole playlist.
+
+
+How to download Apple Music
+
+Open a song, album, or playlist page on `music.apple.com`. Stuff Grabber should show Download this track with that page link. It works like YouTube here. The helper sends the `music.apple.com` page URL to yt-dlp.
+
+Do not expect the raw Apple stream links to work. Those are usually locked with FairPlay, so the extension ignores them on purpose and sticks to the page URL. If Apple or yt-dlp cannot give you a real file, the download fails with an error instead of leaving a silent unplayable file.
+
+
+Spotify
+
+On Spotify web you can paste or use a track style URL and try an audio extract through yt-dlp. A lot of Spotify sources are protected, so this often fails or falls back to a YouTube search for the same title. That is a site limit, not something the extension can crack.
+
+
+Where things can fail
+
+Some sites wrap media in DRM. Netflix and similar services are a good example. The extension might see a manifest, but the segments stay encrypted and neither ffmpeg nor yt-dlp can unlock them. Use the official offline download from that service, or grab something that is not DRM locked.
+
+Some pages only play inside workers or blob URLs that never show up as a normal request. In those cases the list stays empty. Play the media, wait a second, and open the popup again. If it is still empty, that page may simply not expose anything we can catch.
+
+
+If something feels broken
+
+Native host missing or downloads never start. Run this again with the current Chromium Extension ID, then fully restart the browser. On Firefox, load the temporary add-on again after restart:
+
+```text
+python python/install.py YOUR_EXTENSION_ID
+```
+
+Make sure you did not move the project folder without reinstalling. If you are on Edge or Brave and the helper never connects, try Google Chrome, since the installer currently registers the host for Chrome.
+
+ffmpeg not found. Install ffmpeg, put it on PATH, open a new terminal, then check:
+
+```text
+ffmpeg -version
+```
+
+yt-dlp missing or stale for the helper Python:
+
+```text
+python -m pip install -U yt-dlp
+python -m yt_dlp --version
+```
+
+Then run `python python/install.py` again with the same Python.
+
+Saves fail with path or permission errors. Change the Options folder to a place your user can write.
+
+The list is noisy. Pick the page download when you see one, or pick the main playlist style URL and ignore the tiny junk links.
+
+
+Optional icon rebuild
+
+If you replace `asset/icon.png` and have ffmpeg available, on Windows you can run:
+
+```text
+asset\build-icons.cmd
+```
+
+That refreshes the icon sizes the manifest uses.
+
+
+Tests
+
+From this folder:
 
 ```text
 python -m unittest discover test
 ```
 
-It does not touch Chrome or your system, it just checks the pure logic, so it is safe to run anytime.
+That only checks helper logic. It does not open a browser.
 
-## If it feels broken
 
-- **"Native host" errors / download never really starts**  
-  Re-run `python/install.py` with the correct extension id, restart Chrome, make sure you did not move the project folder to a new path without re-installing (the host points at real paths on disk)
+Quick checklist
 
-- **ffmpeg not found**  
-  Install it, put it on PATH, open a new terminal, try `ffmpeg -version`
+Before first use you should have:
 
-- **Permission / path errors**  
-  The save folder in Options has to be a path your user can write to, not some random system folder
+```text
+A Chromium browser (Chrome, Edge, Brave, or similar)
+Python 3 with pip
+ffmpeg on PATH
+yt-dlp installed for that Python
+Deno or Node on PATH if you care about YouTube
+This repo cloned and the folder loaded as an unpacked extension
+python python/install.py run with your Extension ID
+A save folder set in Options
+Browser fully restarted after install
+```
 
-- **Too many junk URLs on some sites**  
-  The extension tries to filter noise but social sites are messy; pick a playlist or obvious main url when in doubt
-
-That is more or less it. The `python/host.py` file is the thing Chrome launches; you can read it if you are curious. Good luck
+That is the whole loop. Clone the repo, load the unpacked extension in a Chromium browser, install the helper once, set a save folder, play the media, download from the popup. The heavy lifting lives in `python/host.py` if you ever want to poke around.

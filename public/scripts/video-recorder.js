@@ -12,8 +12,12 @@
   const VIDEO_BITRATE = 6_000_000;
   const GATE_SAFETY_MS = 500; // low-frequency safety net (no per-frame thrash)
 
-  /** idx -> entry */
+  /** idx -> entry (at most one active when queuing) */
   const recordings = new Map();
+  /** @type {{ video: HTMLVideoElement, idx: number, label: string }[]} */
+  let recordQueue = [];
+  let queueTotal = 0;
+  let queueFinished = 0;
   let recording = false;
   let nextIdx = 0;
   let rafId = 0;
@@ -22,6 +26,7 @@
   let resizeTimer = 0;
   let resizeToastShown = false;
   let seekModalEntry = null;
+  let queueAdvanceTimer = 0;
 
   /* ───────────────────────── overlay host (shadow DOM, isolated) ───────────────────────── */
   const overlayHost = document.createElement('div');
@@ -420,9 +425,54 @@
     return { idx, label, ok: true };
   }
 
+  function clearQueueAdvanceTimer() {
+    if (queueAdvanceTimer) {
+      clearTimeout(queueAdvanceTimer);
+      queueAdvanceTimer = 0;
+    }
+  }
+
+  function queuePosition() {
+    // 1-based index of the video currently recording (or just finished slot).
+    const current = Math.min(queueTotal, queueFinished + (recordings.size > 0 ? 1 : 0));
+    return { current, total: queueTotal, remaining: recordQueue.length };
+  }
+
+  /**
+   * Start the next queued video only (never multiple at once).
+   * Skips videos that fail to start.
+   */
+  function startNextFromQueue() {
+    clearQueueAdvanceTimer();
+    while (recordQueue.length) {
+      const item = recordQueue.shift();
+      if (!item || !item.video || !document.contains(item.video)) continue;
+      const r = startOne(item.video, item.idx);
+      if (r && r.ok) {
+        mountOverlay();
+        startLoop();
+        const pos = queuePosition();
+        if (queueTotal > 1) {
+          showToast(
+            `Recording ${pos.current} of ${pos.total}: ${r.label}. Next starts when this one finishes.`,
+            5000
+          );
+        }
+        return r;
+      }
+      queueFinished += 1; // count skipped as done for progress
+    }
+    // Nothing left to record.
+    recording = false;
+    stopLoop();
+    unmountOverlay();
+    return null;
+  }
+
   function finalizeDownload(entry) {
     if (!recordings.has(entry.idx)) return;
     recordings.delete(entry.idx);
+    queueFinished += 1;
     if (seekModalEntry === entry) { seekModalEntry = null; closeSeekModal(); }
     for (const [ev, fn] of entry.listeners) {
       try { entry.video.removeEventListener(ev, fn); } catch (_) {}
@@ -443,9 +493,29 @@
     }
 
     if (recordings.size === 0) {
-      recording = false;
-      stopLoop();
-      unmountOverlay();
+      if (recording && recordQueue.length > 0) {
+        // Brief gap so the download save can settle before the next capture.
+        clearQueueAdvanceTimer();
+        queueAdvanceTimer = setTimeout(() => {
+          queueAdvanceTimer = 0;
+          if (!recording) return;
+          if (recordings.size > 0) return;
+          const next = startNextFromQueue();
+          if (!next && queueTotal > 1) {
+            showToast(`Finished the queue (${queueFinished} of ${queueTotal}).`, 5000);
+          }
+        }, 500);
+      } else {
+        const total = queueTotal;
+        const finished = queueFinished;
+        recording = false;
+        recordQueue = [];
+        stopLoop();
+        unmountOverlay();
+        if (total > 1 && finished > 0) {
+          showToast(`Finished all recordings (${finished} of ${total}).`, 5000);
+        }
+      }
     }
   }
 
@@ -465,6 +535,16 @@
     const videos = findVideoElements();
     if (!videos.length) return { ok: false, error: 'No video elements found on this page' };
 
+    // Queue every video; record one at a time so captureStream stays reliable.
+    recordQueue = [];
+    queueTotal = videos.length;
+    queueFinished = 0;
+    clearQueueAdvanceTimer();
+    for (const v of videos) {
+      const idx = nextIdx++;
+      recordQueue.push({ video: v, idx, label: labelForVideo(v, idx) });
+    }
+
     recording = true;
     resizing = false;
     resizeToastShown = false;
@@ -472,31 +552,44 @@
     startLoop();
 
     const details = [];
-    let started = 0;
-    for (const v of videos) {
-      const idx = nextIdx++;
-      const r = startOne(v, idx);
-      details.push(r);
-      if (r.ok) started++;
-    }
+    const first = startNextFromQueue();
+    if (first) details.push(first);
 
-    if (started === 0) {
+    if (!first || !first.ok) {
       recording = false;
+      recordQueue = [];
       stopLoop();
       unmountOverlay();
       return { ok: false, error: 'Could not start recording on any video', details };
     }
 
+    const pos = queuePosition();
     showToast(
-      'Recording started. For the cleanest capture, avoid resizing the window or switching ' +
-      'tabs — it auto-pauses if you do, then continues.',
+      queueTotal > 1
+        ? `Queued ${queueTotal} videos — recording one at a time (${pos.current} of ${queueTotal} now).`
+        : 'Recording started. Avoid resizing the window or switching tabs for the cleanest capture.',
       6000
     );
-    return { ok: true, count: started, total: videos.length, details };
+    return {
+      ok: true,
+      count: 1,
+      total: queueTotal,
+      queued: true,
+      sequential: true,
+      position: pos.current,
+      remaining: recordQueue.length,
+      details,
+    };
   }
 
   function stopRecording() {
-    if (!recording) return { ok: false, error: 'Not recording' };
+    if (!recording && recordings.size === 0 && !recordQueue.length) {
+      return { ok: false, error: 'Not recording' };
+    }
+    // Cancel anything still waiting, then stop the active capture.
+    const cancelled = recordQueue.length;
+    recordQueue = [];
+    clearQueueAdvanceTimer();
     const stopped = [];
     for (const entry of Array.from(recordings.values())) {
       stopped.push({
@@ -507,7 +600,7 @@
       stopOne(entry.idx);
     }
     recording = false;
-    return { ok: true, stopped };
+    return { ok: true, stopped, cancelled };
   }
 
   function getStatus() {
@@ -522,7 +615,18 @@
         reason: entry.reason,
       });
     }
-    return { recording, videoCount: findVideoElements().length, active };
+    const pos = queuePosition();
+    return {
+      recording: recording || recordings.size > 0,
+      videoCount: findVideoElements().length,
+      active,
+      sequential: queueTotal > 1,
+      queueTotal,
+      queueFinished,
+      queueRemaining: recordQueue.length,
+      position: pos.current,
+      total: pos.total || findVideoElements().length,
+    };
   }
 
   // Popup / options (separate contexts) reach us via chrome.tabs.sendMessage.
@@ -567,7 +671,10 @@
   document.addEventListener('visibilitychange', onVisibilityChange);
 
   window.addEventListener('pagehide', () => {
-    if (recording) {
+    if (recording || recordings.size || recordQueue.length) {
+      recordQueue = [];
+      clearQueueAdvanceTimer();
+      recording = false;
       for (const entry of Array.from(recordings.values())) stopOne(entry.idx);
     }
   });

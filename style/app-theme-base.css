@@ -1,48 +1,80 @@
-/* Shared theme tokens for popup, settings, and dynamic overlays */
+/* iOS-inspired theme tokens — popup, settings, overlays */
 :root {
-  --bg: #0f1117;
-  --surface: #161b27;
-  --surface-2: #131926;
-  --text: #e6e9ef;
-  --muted: #95a2bb;
-  --line: #293043;
-  --btnText: #f8fbff;
-  --accent: #4f8cff;
-  --accent-2: #3574f0;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --bg: #000000;
+  --grouped: #1c1c1e;
+  --surface: #1c1c1e;
+  --surface-2: #2c2c2e;
+  --elevated: #3a3a3c;
+  --text: #ffffff;
+  --muted: #8e8e93;
+  --line: rgba(84, 84, 88, 0.65);
+  --separator: rgba(84, 84, 88, 0.65);
+  --btnText: #ffffff;
+  --accent: #0a84ff;
+  --accent-2: #409cff;
+  --fill: rgba(120, 120, 128, 0.32);
+  --fill-secondary: rgba(120, 120, 128, 0.24);
+  --danger: #ff453a;
+  --danger-bg: rgba(255, 69, 58, 0.16);
+  --ok: #30d158;
+  --ok-bg: rgba(48, 209, 88, 0.16);
+  --warn: #ffd60a;
+  --warn-bg: rgba(255, 214, 10, 0.14);
   --radius: 12px;
-  --transition: 160ms cubic-bezier(.4, 0, .2, 1);
-  --overlay-bg: rgba(0, 0, 0, 0.55);
+  --radius-lg: 16px;
+  --radius-ctrl: 10px;
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  --shadow-soft: 0 1px 0 rgba(255, 255, 255, 0.04) inset;
+  --transition: 220ms cubic-bezier(0.25, 0.1, 0.25, 1);
+  --spring: 320ms cubic-bezier(0.34, 1.2, 0.64, 1);
+  --overlay-bg: rgba(0, 0, 0, 0.48);
 }
 
 :root[data-theme="light"] {
-  --bg: #f4f6fb;
+  --bg: #f2f2f7;
+  --grouped: #f2f2f7;
   --surface: #ffffff;
-  --surface-2: #eef2fb;
-  --text: #0f172a;
-  --muted: #475569;
-  --line: #d8e0ef;
+  --surface-2: #ffffff;
+  --elevated: #f2f2f7;
+  --text: #000000;
+  --muted: #8e8e93;
+  --line: rgba(60, 60, 67, 0.18);
+  --separator: rgba(60, 60, 67, 0.29);
   --btnText: #ffffff;
-  --accent: #2563eb;
-  --accent-2: #1d4ed8;
-  --overlay-bg: rgba(15, 23, 42, 0.38);
+  --accent: #007aff;
+  --accent-2: #0a84ff;
+  --fill: rgba(120, 120, 128, 0.16);
+  --fill-secondary: rgba(120, 120, 128, 0.12);
+  --danger: #ff3b30;
+  --danger-bg: rgba(255, 59, 48, 0.12);
+  --ok: #34c759;
+  --ok-bg: rgba(52, 199, 89, 0.12);
+  --warn: #ff9f0a;
+  --warn-bg: rgba(255, 159, 10, 0.14);
+  --shadow: 0 10px 40px rgba(0, 0, 0, 0.12);
+  --shadow-soft: none;
+  --overlay-bg: rgba(0, 0, 0, 0.28);
 }
 
-:root[data-accent="violet"] { --accent: #8b5cf6; --accent-2: #7c3aed; }
-:root[data-accent="emerald"] { --accent: #10b981; --accent-2: #059669; }
-:root[data-accent="rose"] { --accent: #f43f5e; --accent-2: #e11d48; }
-:root[data-accent="orange"] { --accent: #f97316; --accent-2: #ea580c; }
+:root[data-accent="violet"] { --accent: #bf5af2; --accent-2: #da8fff; }
+:root[data-accent="emerald"] { --accent: #30d158; --accent-2: #63e689; }
+:root[data-accent="rose"] { --accent: #ff375f; --accent-2: #ff6482; }
+:root[data-accent="orange"] { --accent: #ff9f0a; --accent-2: #ffb340; }
+
+:root[data-theme="light"][data-accent="violet"] { --accent: #af52de; --accent-2: #bf5af2; }
+:root[data-theme="light"][data-accent="emerald"] { --accent: #34c759; --accent-2: #30d158; }
+:root[data-theme="light"][data-accent="rose"] { --accent: #ff2d55; --accent-2: #ff375f; }
+:root[data-theme="light"][data-accent="orange"] { --accent: #ff9500; --accent-2: #ff9f0a; }
 
 :root[data-theme-mode="page"] select,
 :root[data-theme-mode="page"] .hgr-job-preset-select,
-:root[data-theme-mode="page"] .hgr-modal-select {
-  background: var(--accent);
-  color: var(--btnText);
-  border-color: color-mix(in srgb, var(--accent) 72%, var(--line) 28%);
-}
-
-:root[data-theme-mode="page"] select option,
-:root[data-theme-mode="page"] .hgr-job-preset-select option,
-:root[data-theme-mode="page"] .hgr-modal-select option {
-  background: var(--accent);
-  color: var(--btnText);
+:root[data-theme-mode="page"] .hgr-modal-select,
+:root[data-theme-mode="page"] .ios-select-trigger {
+  background: var(--fill);
+  color: var(--text);
+  border-color: transparent;
 }

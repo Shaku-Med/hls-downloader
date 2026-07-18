@@ -17,7 +17,13 @@
     "<all_urls>"
   ],
   "background": {
-    "service_worker": "public/scripts/background.js"
+    "scripts": ["public/scripts/background.js"]
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "stuff-grabber@local",
+      "strict_min_version": "121.0"
+    }
   },
   "icons": {
     "16": "asset/icon-16.png",
@@ -63,8 +69,7 @@
         "asset/icon-48.png",
         "asset/icon-128.png",
         "style/fab.css",
-        "style/modal-theme.css",
-        "style/ios-select.css"
+        "style/modal-theme.css"
       ],
       "matches": ["http://*/*", "https://*/*", "file:///*"]
     }

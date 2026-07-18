@@ -1284,22 +1284,141 @@ def _yt_dlp_available() -> bool:
     return _yt_dlp_invocation_prefix() is not None
 
 
+# yt-dlp progress lines vary: "of 12.3MiB", "of ~ 50MiB", "of Unknown size", fragment mode, etc.
 _RE_YTDLP_PROGRESS = re.compile(
-    r"\[download\]\s+(?P<pct>[\d.]+)%\s+of\s+~?\s*(?P<size>\S+)(?:\s+at\s+(?P<rate>\S+))?(?:\s+ETA\s+(?P<eta>\S+))?",
+    r"\[download\]\s+(?P<pct>[\d.]+)%"
+    r"(?:\s+of\s+~?\s*(?P<size>\S+))?"
+    r"(?:\s+at\s+(?P<rate>\S+))?"
+    r"(?:\s+ETA\s+(?P<eta>\S+))?",
     re.I,
+)
+_RE_YTDLP_ITEM = re.compile(
+    r"\[download\]\s+Downloading\s+(?:item|video)\s+(?P<i>\d+)\s+of\s+(?P<n>\d+)",
+    re.I,
+)
+# [youtube] dQw4w9WgXcQ: Downloading webpage
+_RE_YTDLP_MEDIA_ID = re.compile(
+    r"^\[(?P<ext>[a-z0-9_.:-]+)\]\s+(?P<id>[A-Za-z0-9_-]{6,})\s*:",
+    re.I,
+)
+# Destination: …-dQw4w9WgXcQ.mp4  /  …/reel/ABC123/…
+_RE_YTDLP_DEST_ID = re.compile(
+    r"\[download\]\s+Destination:\s*(?P<path>.+)$",
+    re.I,
+)
+_YTDLP_EXT_SKIP = frozenset(
+    {
+        "download",
+        "info",
+        "debug",
+        "warning",
+        "error",
+        "merger",
+        "extractaudio",
+        "fix",
+        "metadata",
+        "thumbnailsconvertor",
+        "ffmpeg",
+    }
 )
 
 
+def _media_id_from_url(url: str) -> Optional[str]:
+    """Best-effort post/video id from a page URL (for on-page highlight)."""
+    raw = (url or "").strip()
+    if not raw:
+        return None
+    try:
+        from urllib.parse import urlparse, parse_qs
+
+        u = urlparse(raw)
+        host = (u.hostname or "").lower().replace("www.", "")
+        path = u.path or ""
+        qs = parse_qs(u.query or "")
+        if "v" in qs and qs["v"]:
+            return str(qs["v"][0])
+        m = re.search(r"/(?:shorts|embed|live)/([^/?#]+)", path, re.I)
+        if m:
+            return m.group(1)
+        if host in ("youtu.be",) or host.endswith("youtu.be"):
+            seg = path.strip("/").split("/")[0]
+            if seg:
+                return seg
+        m = re.search(r"/(?:reel|p|tv)/([^/?#]+)", path, re.I)
+        if m:
+            return m.group(1)
+        m = re.search(r"/video/(\d+)", path, re.I)
+        if m:
+            return m.group(1)
+        m = re.search(r"/status/(\d+)", path, re.I)
+        if m:
+            return m.group(1)
+        m = re.search(r"/clip/([^/?#]+)", path, re.I)
+        if m:
+            return m.group(1)
+    except Exception:
+        return None
+    return None
+
+
 def _parse_yt_dlp_progress(line: str) -> Dict[str, Any]:
-    m = _RE_YTDLP_PROGRESS.search(line)
-    if not m:
-        return {}
-    parts = [f"{m.group('pct').strip()}%"]
-    if m.group("rate"):
-        parts.append(m.group("rate").strip())
-    if m.group("eta"):
-        parts.append(f"ETA {m.group('eta').strip()}")
-    return {"detail": " · ".join(parts)}
+    """Parse percent / playlist item / current media id from a yt-dlp stderr line."""
+    out: Dict[str, Any] = {}
+    text = (line or "").strip()
+    if not text:
+        return out
+
+    m_item = _RE_YTDLP_ITEM.search(text)
+    if m_item:
+        try:
+            out["playlistIndex"] = int(m_item.group("i"))
+            out["playlistCount"] = int(m_item.group("n"))
+            out["detail"] = f"Item {out['playlistIndex']} of {out['playlistCount']}"
+        except (TypeError, ValueError):
+            pass
+
+    m = _RE_YTDLP_PROGRESS.search(text)
+    if m:
+        try:
+            out["percent"] = float(m.group("pct").strip())
+        except (TypeError, ValueError):
+            pass
+        parts = [f"{m.group('pct').strip()}%"]
+        if m.group("rate"):
+            parts.append(m.group("rate").strip())
+        if m.group("eta"):
+            parts.append(f"ETA {m.group('eta').strip()}")
+        out["detail"] = " · ".join(parts)
+
+    m_id = _RE_YTDLP_MEDIA_ID.match(text)
+    if m_id:
+        ext = (m_id.group("ext") or "").split(":")[0].lower()
+        mid = (m_id.group("id") or "").strip()
+        if ext not in _YTDLP_EXT_SKIP and mid.lower() not in (
+            "downloading",
+            "extracting",
+            "playlist",
+            "webpage",
+        ):
+            out["mediaId"] = mid
+
+    m_dest = _RE_YTDLP_DEST_ID.search(text)
+    if m_dest and "mediaId" not in out:
+        path = m_dest.group("path") or ""
+        # Prefer common site id shapes from the filename / path.
+        for pat in (
+            r"(?:^|[^\w-])([A-Za-z0-9_-]{11})(?:\.[A-Za-z0-9]+)?$",  # YouTube-ish
+            r"/reel/([^/?#]+)",
+            r"/p/([^/?#]+)",
+            r"/video/(\d+)",
+            r"[?&]v=([A-Za-z0-9_-]{6,})",
+        ):
+            md = re.search(pat, path)
+            if md:
+                out["mediaId"] = md.group(1)
+                break
+
+    return out
 
 
 def _yt_dlp_header_args(message: dict) -> List[str]:
@@ -1443,6 +1562,8 @@ def _yt_dlp_build_cmd(prefix: List[str], message: dict, output_path: str, target
     cmd.extend(
         [
             "--no-mtime",
+            # One progress line per update (otherwise yt-dlp uses \\r and we never see %).
+            "--newline",
             "-o",
             output_path,
         ]
@@ -1457,12 +1578,46 @@ def _yt_dlp_build_cmd(prefix: List[str], message: dict, output_path: str, target
     return cmd
 
 
+def _looks_like_raw_cdn_media_url(url: str) -> bool:
+    """True when URL is a CDN media/manifest that yt-dlp usually can't treat as a post page."""
+    u = (url or "").strip().lower()
+    if not u.startswith("http"):
+        return False
+    if any(ext in u for ext in (".m3u8", ".mpd", ".m4s", ".ts?", ".ts&")):
+        return True
+    return any(
+        h in u
+        for h in (
+            "googlevideo.com",
+            "fbcdn.net",
+            "cdninstagram.com",
+            "tiktokcdn",
+            "byteoversea",
+            "akamaized.net",
+            "cloudfront.net",
+        )
+    )
+
+
 def _yt_dlp_primary_input_url(page_url: str, stream_url: str) -> str:
-    """yt-dlp extractors need the watch page URL when available, not only the CDN."""
+    """
+    Choose what yt-dlp should download.
+    Prefer the stream/post URL (each page-link job) when it is a real page URL.
+    Fall back to pageUrl only for raw CDN manifests that need the watch page.
+    """
+    s = (stream_url or "").strip()
     p = (page_url or "").strip()
-    if p.startswith("http://") or p.startswith("https://"):
+
+    def ok(u: str) -> bool:
+        return u.startswith("http://") or u.startswith("https://")
+
+    if ok(s) and not _looks_like_raw_cdn_media_url(s):
+        return s
+    if ok(p):
         return p
-    return (stream_url or "").strip()
+    if ok(s):
+        return s
+    return p or s
 
 
 def _handle_ytdlp_formats(message: dict) -> None:
@@ -1662,36 +1817,105 @@ def run_yt_dlp_with_updates(
 
         last_send = 0.0
         throttle_s = 0.35
+        last_percent: Optional[float] = None
+        last_playlist_index: Optional[int] = None
+        last_playlist_count: Optional[int] = None
+        # Prefer id from the actual download target / stream URL (not the tab feed URL).
+        last_media_id: Optional[str] = (
+            _media_id_from_url(target)
+            or _media_id_from_url(stream_url)
+            or _media_id_from_url(page_url)
+        )
+        if last_media_id:
+            send_message(
+                with_job_id(
+                    {
+                        "type": "progress",
+                        "phase": "starting",
+                        "detail": f"Starting {last_media_id}",
+                        "output": output_path,
+                        "mediaId": last_media_id,
+                    },
+                    job_id,
+                )
+            )
 
         def read_stderr() -> None:
-            nonlocal last_send
+            nonlocal last_send, last_percent, last_playlist_index, last_playlist_count, last_media_id
             try:
-                for raw in iter(proc.stderr.readline, b""):
-                    if not raw:
+                # yt-dlp may still emit \\r progress without --newline on older builds.
+                buf = b""
+                while True:
+                    chunk = proc.stderr.read(256)
+                    if not chunk:
                         break
-                    line = raw.decode("utf-8", errors="replace")
+                    buf += chunk
+                    while True:
+                        cut = -1
+                        for sep in (b"\n", b"\r"):
+                            i = buf.find(sep)
+                            if i >= 0 and (cut < 0 or i < cut):
+                                cut = i
+                        if cut < 0:
+                            break
+                        raw = buf[:cut]
+                        buf = buf[cut + 1 :]
+                        if not raw.strip():
+                            continue
+                        line = raw.decode("utf-8", errors="replace")
+                        stderr_lines.append(line + "\n")
+                        if len(stderr_lines) > 250:
+                            stderr_lines.pop(0)
+                        pr = _parse_yt_dlp_progress(line)
+                        if not pr:
+                            continue
+                        if "percent" in pr:
+                            last_percent = pr["percent"]
+                        if "playlistIndex" in pr:
+                            last_playlist_index = pr["playlistIndex"]
+                        if "playlistCount" in pr:
+                            last_playlist_count = pr["playlistCount"]
+                        if "mediaId" in pr:
+                            last_media_id = str(pr["mediaId"])
+
+                        parts: List[str] = []
+                        if last_playlist_index is not None and last_playlist_count is not None:
+                            parts.append(f"Item {last_playlist_index}/{last_playlist_count}")
+                        if last_media_id:
+                            parts.append(str(last_media_id))
+                        if pr.get("detail") and "%" in str(pr.get("detail")):
+                            parts.append(str(pr["detail"]))
+                        elif last_percent is not None and not any("%" in p for p in parts):
+                            parts.append(f"{last_percent:g}%")
+                        elif pr.get("detail") and not str(pr["detail"]).startswith("Item "):
+                            parts.append(str(pr["detail"]))
+                        det = " · ".join(parts) if parts else (pr.get("detail") or line.strip()[:140])
+
+                        now = time.monotonic()
+                        # Always flush playlist/id changes; throttle percent-only spam lightly.
+                        force = "playlistIndex" in pr or "mediaId" in pr
+                        min_gap = 0.2 if "percent" in pr else throttle_s
+                        if not force and now - last_send < min_gap:
+                            continue
+                        last_send = now
+                        payload: Dict[str, Any] = {
+                            "type": "progress",
+                            "phase": "downloading",
+                            "detail": det,
+                            "output": output_path,
+                        }
+                        if last_percent is not None:
+                            payload["percent"] = last_percent
+                        if last_playlist_index is not None:
+                            payload["playlistIndex"] = last_playlist_index
+                        if last_playlist_count is not None:
+                            payload["playlistCount"] = last_playlist_count
+                        if last_media_id:
+                            payload["mediaId"] = last_media_id
+                        send_message(with_job_id(payload, job_id))
+                if buf.strip():
+                    line = buf.decode("utf-8", errors="replace")
                     stderr_lines.append(line)
-                    if len(stderr_lines) > 250:
-                        stderr_lines.pop(0)
-                    if "[download]" not in line:
-                        continue
-                    pr = _parse_yt_dlp_progress(line)
-                    det = pr.get("detail") or line.strip()[:140]
-                    now = time.monotonic()
-                    if now - last_send < throttle_s:
-                        continue
-                    last_send = now
-                    send_message(
-                        with_job_id(
-                            {
-                                "type": "progress",
-                                "phase": "downloading",
-                                "detail": det,
-                                "output": output_path,
-                            },
-                            job_id,
-                        )
-                    )
             finally:
                 try:
                     proc.stderr.close()
@@ -3380,6 +3604,20 @@ def _handle_ffmpeg_encode_preset_probe(message: dict) -> None:
     )
 
 
+def _path_under_save_folder(path: str, out_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return (abspath, None) if path is under out_dir, else (None, error)."""
+    if not path or not out_dir:
+        return None, "Missing path or outputDirectory"
+    try:
+        ap = os.path.abspath(path)
+        ad = os.path.abspath(out_dir)
+        if not (ap == ad or ap.startswith(ad + os.sep)):
+            return None, "Path is outside the configured save folder"
+        return ap, None
+    except OSError as e:
+        return None, str(e)
+
+
 def _handle_delete_output_file(message: dict) -> None:
     """Delete a partial/finished output file under the user's save folder (UI restart flow)."""
     req_id = (message.get("requestId") or "").strip()
@@ -3389,15 +3627,11 @@ def _handle_delete_output_file(message: dict) -> None:
     def reply(**fields: Any) -> None:
         send_message({"type": "delete_output_file_result", "requestId": req_id, **fields})
 
-    if not path or not out_dir:
-        reply(success=False, error="Missing path or outputDirectory")
+    ap, err = _path_under_save_folder(path, out_dir)
+    if err or not ap:
+        reply(success=False, error=err or "Invalid path")
         return
     try:
-        ap = os.path.abspath(path)
-        ad = os.path.abspath(out_dir)
-        if not (ap == ad or ap.startswith(ad + os.sep)):
-            reply(success=False, error="Path is outside the configured save folder")
-            return
         removed: List[str] = []
         for candidate in (path, path + ".part", path + ".cont.mp4"):
             if candidate and os.path.isfile(candidate):

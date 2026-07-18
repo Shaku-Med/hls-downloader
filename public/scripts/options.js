@@ -48,6 +48,9 @@ function load() {
     const ta = document.getElementById('ui-theme-accent');
     if (ta) ta.value = data[THEME_ACCENT_KEY] || 'blue';
     syncAccentRowVisibility();
+    if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhanceAll) {
+      HLS_IOS_SELECT.enhanceAll(document);
+    }
   });
 }
 

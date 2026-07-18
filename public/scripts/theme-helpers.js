@@ -230,63 +230,237 @@
     return muted;
   }
 
-  function readPageTextColor(bgCss) {
-    const bgParsed =
-      normalizeCssColor(bgCss, 'backgroundColor') ||
-      parseCssColor(bgCss);
+  function rgbToHsl(c) {
+    if (!c) return { h: 0, s: 0, l: 0 };
+    const r = Math.max(0, Math.min(255, c.r)) / 255;
+    const g = Math.max(0, Math.min(255, c.g)) / 255;
+    const b = Math.max(0, Math.min(255, c.b)) / 255;
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const l = (max + min) / 2;
+    if (max === min) return { h: 0, s: 0, l };
+    const d = max - min;
+    const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+    let h = 0;
+    if (max === r) h = ((g - b) / d + (g < b ? 6 : 0)) / 6;
+    else if (max === g) h = ((b - r) / d + 2) / 6;
+    else h = ((r - g) / d + 4) / 6;
+    return { h: h * 360, s, l };
+  }
 
-    for (const node of [document.body, document.documentElement]) {
-      const c = readColorFrom(node, 'color');
-      if (c && bgParsed && contrastRatio(c, bgParsed) >= 4.5) return toCss(c);
-    }
+  function colorSaturation(c) {
+    return rgbToHsl(c).s;
+  }
 
+  function isGrayish(c, maxSat) {
+    if (!c) return true;
+    return colorSaturation(c) < (maxSat == null ? 0.12 : maxSat);
+  }
+
+  function isOurUiHost(el) {
+    if (!el || !el.closest) return false;
     try {
-      const selectors =
-        'h1,h2,h3,h4,h5,h6,p,span,label,a,button,nav,header,main,li,td,th,div';
-      const nodes = document.querySelectorAll(selectors);
-      const candidates = [];
-      const limit = Math.min(nodes.length, 120);
-      for (let i = 0; i < limit; i++) {
-        const el = nodes[i];
-        if (!el || el.closest('[data-hls-grabber-fab],[data-hls-image-dl]')) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width < 2 || r.height < 2) continue;
-        const sample = String(el.textContent || '').trim();
-        if (sample.length < 1) continue;
-        const c = readColorFrom(el, 'color');
-        if (!c || !bgParsed) continue;
-        if (contrastRatio(c, bgParsed) >= 4.5) candidates.push(c);
+      return !!el.closest('[data-hls-grabber-fab],[data-hls-image-dl]');
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function parseColorValue(raw, prop) {
+    if (raw == null) return null;
+    const s = String(raw).trim();
+    if (!s || s === 'transparent' || s === 'inherit' || s === 'initial' || s === 'unset') return null;
+    return (
+      normalizeCssColor(s, prop || 'color') ||
+      parseCssColor(s)
+    );
+  }
+
+  const BG_CSS_VARS = [
+    '--background',
+    '--bg',
+    '--color-background',
+    '--color-bg',
+    '--background-color',
+    '--bg-color',
+    '--surface',
+    '--color-surface',
+    '--page-background',
+    '--main-bg',
+    '--body-bg',
+    '--theme-background',
+    '--backgroundPrimary',
+    '--bgPrimary',
+    '--color-canvas-default',
+    '--bgColor-default',
+    '--yt-spec-base-background',
+  ];
+
+  const ACCENT_CSS_VARS = [
+    '--primary',
+    '--accent',
+    '--brand',
+    '--color-primary',
+    '--color-accent',
+    '--brand-color',
+    '--primary-color',
+    '--accent-color',
+    '--theme-color',
+    '--theme-primary',
+    '--link-color',
+    '--color-link',
+    '--focus-color',
+    '--button-primary-bg',
+    '--btn-primary-bg',
+    '--color-fg-brand',
+    '--fgColor-accent',
+    '--yt-spec-brand-button-background',
+    '--yt-spec-call-to-action',
+  ];
+
+  function readCssVarFrom(el, name) {
+    if (!el) return null;
+    try {
+      const raw = getComputedStyle(el).getPropertyValue(name);
+      if (!raw || !String(raw).trim()) return null;
+      // Prefer backgroundColor probe for bg-ish vars; color probe otherwise.
+      const asBg = /bg|background|surface|canvas/i.test(name);
+      return parseColorValue(raw, asBg ? 'backgroundColor' : 'color');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function readFirstCssVar(names) {
+    const hosts = [document.documentElement, document.body].filter(Boolean);
+    for (const host of hosts) {
+      for (const name of names) {
+        const c = readCssVarFrom(host, name);
+        if (c && c.a > 0.4) return c;
       }
-      if (candidates.length) {
-        const darkBg = relativeLuminance(bgParsed) < 0.5;
-        candidates.sort((a, b) =>
-          darkBg ? relativeLuminance(b) - relativeLuminance(a) : relativeLuminance(a) - relativeLuminance(b)
-        );
-        return toCss(candidates[0]);
+    }
+    return null;
+  }
+
+  function readMetaThemeColor() {
+    try {
+      const metas = document.querySelectorAll('meta[name="theme-color" i], meta[name="msapplication-TileColor" i]');
+      for (const meta of metas) {
+        const content = (meta.getAttribute('content') || '').trim();
+        if (!content) continue;
+        // Skip media-query metas that don't match when possible.
+        const media = (meta.getAttribute('media') || '').trim();
+        if (media) {
+          try {
+            if (!window.matchMedia(media).matches) continue;
+          } catch (_) {
+            // ignore bad media
+          }
+        }
+        const c = parseColorValue(content, 'backgroundColor');
+        if (c && c.a > 0.4) return c;
       }
     } catch (_) {
       // ignore
     }
-
-    try {
-      if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches && bgParsed) {
-        return readableFallbackText(bgParsed);
-      }
-    } catch (_) {
-      // ignore
-    }
-
-    return readableFallbackText(bgParsed);
+    return null;
   }
 
   function readOpaqueBackgroundFrom(el) {
     if (!el) return null;
     const c = readColorFrom(el, 'backgroundColor');
-    if (c && c.a > 0.01) return toCss(c);
+    if (c && c.a > 0.5) return c;
     return null;
   }
 
-  function readPageBackground() {
+  function elementInViewport(r) {
+    if (!r) return false;
+    if (r.bottom < 0 || r.right < 0) return false;
+    if (r.top > window.innerHeight || r.left > window.innerWidth) return false;
+    return true;
+  }
+
+  function scoreSurfaceCandidate(el, color) {
+    if (!el || !color || color.a <= 0.5) return 0;
+    try {
+      const r = el.getBoundingClientRect();
+      if (!elementInViewport(r)) return 0;
+      const area = Math.max(0, r.width) * Math.max(0, r.height);
+      if (area < 8000) return 0;
+      const vw = Math.max(1, window.innerWidth);
+      const vh = Math.max(1, window.innerHeight);
+      const cover = Math.min(1, area / (vw * vh));
+      // Prefer large shells; slight boost for near-root / landmark tags.
+      const tag = (el.tagName || '').toLowerCase();
+      const landmark =
+        tag === 'html' || tag === 'body' || tag === 'main' || tag === 'header' || tag === 'nav' ? 1.15 : 1;
+      return cover * color.a * landmark;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function readVisibleSurfaceBackground() {
+    let best = null;
+    let bestScore = 0;
+    const consider = (el) => {
+      if (!el || isOurUiHost(el)) return;
+      const c = readOpaqueBackgroundFrom(el);
+      if (!c) return;
+      const score = scoreSurfaceCandidate(el, c);
+      if (score > bestScore) {
+        bestScore = score;
+        best = c;
+      }
+    };
+
+    consider(document.documentElement);
+    consider(document.body);
+
+    const selectors = [
+      '#root',
+      '#app',
+      '#__next',
+      '#__nuxt',
+      '[data-reactroot]',
+      'main',
+      '[role="main"]',
+      'header',
+      'nav',
+      '.app',
+      '.App',
+      '.main',
+      '.page',
+      '.layout',
+      '[class*="background"]',
+      '[class*="Background"]',
+    ];
+    try {
+      for (const sel of selectors) {
+        document.querySelectorAll(sel).forEach((el) => consider(el));
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    // Scan a limited set of large visible divs / sections.
+    try {
+      const nodes = document.querySelectorAll('div, section, article, aside');
+      const limit = Math.min(nodes.length, 80);
+      for (let i = 0; i < limit; i++) consider(nodes[i]);
+    } catch (_) {
+      // ignore
+    }
+
+    return best;
+  }
+
+  function readPageBackgroundColor() {
+    // 1) CSS design tokens
+    const fromVar = readFirstCssVar(BG_CSS_VARS);
+    if (fromVar) return fromVar;
+
+    // 2) Walk body → html for opaque backgrounds
     let el = document.body;
     while (el) {
       const found = readOpaqueBackgroundFrom(el);
@@ -297,33 +471,171 @@
       const found = readOpaqueBackgroundFrom(node);
       if (found) return found;
     }
-    const roots = [
-      document.getElementById('root'),
-      document.getElementById('app'),
-      document.querySelector('main'),
-      document.querySelector('[role="main"]'),
-    ].filter(Boolean);
-    for (const root of roots) {
-      const found = readOpaqueBackgroundFrom(root);
-      if (found) return found;
-      try {
-        for (const child of root.children) {
-          const childBg = readOpaqueBackgroundFrom(child);
-          if (childBg) return childBg;
-        }
-      } catch (_) {
-        // ignore
-      }
-    }
+
+    // 3) Largest visible opaque surfaces
+    const surface = readVisibleSurfaceBackground();
+    if (surface) return surface;
+
+    // 4) Soft fallback: theme-color as page chrome (often header bar, not page bg)
+    // Prefer not using meta as bg unless nothing else found — handled in readPageColors.
     return null;
   }
 
-  function readPageColors() {
-    const bg = readPageBackground();
-    const text = readPageTextColor(bg);
+  function readPageTextColor(bgCss) {
     const bgParsed =
-      normalizeCssColor(bg, 'backgroundColor') ||
-      parseCssColor(bg);
+      normalizeCssColor(bgCss, 'backgroundColor') ||
+      parseCssColor(bgCss);
+
+    const textVarNames = [
+      '--foreground',
+      '--color-foreground',
+      '--text',
+      '--color-text',
+      '--text-color',
+      '--color-fg-default',
+      '--fgColor-default',
+      '--yt-spec-text-primary',
+    ];
+    const fromVar = readFirstCssVar(textVarNames);
+    if (fromVar && bgParsed && contrastRatio(fromVar, bgParsed) >= 4.5) {
+      return toCss(fromVar);
+    }
+
+    for (const node of [document.body, document.documentElement]) {
+      const c = readColorFrom(node, 'color');
+      if (c && bgParsed && contrastRatio(c, bgParsed) >= 4.5) return toCss(c);
+    }
+
+    try {
+      const selectors =
+        'main h1,main h2,main p,article p,h1,h2,h3,p,label,li,td,th,span,a,button,nav,header,main,div';
+      const nodes = document.querySelectorAll(selectors);
+      const candidates = [];
+      const limit = Math.min(nodes.length, 140);
+      for (let i = 0; i < limit; i++) {
+        const el = nodes[i];
+        if (!el || isOurUiHost(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2 || !elementInViewport(r)) continue;
+        const sample = String(el.textContent || '').trim();
+        if (sample.length < 2) continue;
+        const c = readColorFrom(el, 'color');
+        if (!c || !bgParsed) continue;
+        if (isGrayish(c, 0.05) && sample.length < 4) continue;
+        if (contrastRatio(c, bgParsed) >= 4.5) {
+          const tag = (el.tagName || '').toLowerCase();
+          const weight =
+            tag === 'p' || tag === 'h1' || tag === 'h2' || tag === 'label' ? 2 : 1;
+          candidates.push({ c, weight, len: sample.length });
+        }
+      }
+      if (candidates.length) {
+        const darkBg = relativeLuminance(bgParsed) < 0.5;
+        candidates.sort((a, b) => {
+          if (b.weight !== a.weight) return b.weight - a.weight;
+          return darkBg
+            ? relativeLuminance(b.c) - relativeLuminance(a.c)
+            : relativeLuminance(a.c) - relativeLuminance(b.c);
+        });
+        return toCss(candidates[0].c);
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    return readableFallbackText(bgParsed);
+  }
+
+  function accentScore(color, bgParsed) {
+    if (!color || color.a < 0.5) return 0;
+    const sat = colorSaturation(color);
+    if (sat < 0.14) return 0;
+    const lum = relativeLuminance(color);
+    // Avoid near-white / near-black “accents”
+    if (lum > 0.92 || lum < 0.05) return 0;
+    let score = sat * 2.2;
+    if (bgParsed) {
+      const cr = contrastRatio(color, bgParsed);
+      if (cr < 1.35) score *= 0.35;
+      else score += Math.min(2, cr * 0.15);
+    }
+    return score;
+  }
+
+  function readAccentFromUi(bgParsed) {
+    const candidates = [];
+    const push = (c, boost) => {
+      const score = accentScore(c, bgParsed) * (boost || 1);
+      if (score > 0) candidates.push({ c, score });
+    };
+
+    const fromVar = readFirstCssVar(ACCENT_CSS_VARS);
+    if (fromVar) push(fromVar, 1.35);
+
+    const meta = readMetaThemeColor();
+    if (meta && !isGrayish(meta, 0.14)) push(meta, 1.2);
+
+    const selectors = [
+      'button',
+      '[role="button"]',
+      'a.button',
+      'a.btn',
+      '.btn',
+      '.button',
+      '[class*="btn-primary"]',
+      '[class*="ButtonPrimary"]',
+      'input[type="submit"]',
+      'a[href]',
+    ];
+    try {
+      for (const sel of selectors) {
+        const nodes = document.querySelectorAll(sel);
+        const limit = Math.min(nodes.length, 40);
+        for (let i = 0; i < limit; i++) {
+          const el = nodes[i];
+          if (!el || isOurUiHost(el)) continue;
+          const r = el.getBoundingClientRect();
+          if (r.width < 8 || r.height < 8 || !elementInViewport(r)) continue;
+          const bg = readOpaqueBackgroundFrom(el);
+          if (bg) push(bg, sel.includes('primary') || sel === 'button' ? 1.15 : 1);
+          const fg = readColorFrom(el, 'color');
+          if (fg && !isGrayish(fg, 0.18)) {
+            // Link/text accents count less than filled buttons.
+            push(fg, bg ? 0.55 : 0.85);
+          }
+        }
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    if (!candidates.length) return null;
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0].c;
+  }
+
+  function fallbackAccentFrom(bg, text, theme) {
+    const base =
+      theme === 'dark'
+        ? parseCssColor(FIXED.dark.accent)
+        : parseCssColor(FIXED.light.accent);
+    if (!bg) return base;
+    // Nudge fixed accent toward page text hue when text is somewhat saturated.
+    if (text && !isGrayish(text, 0.2)) {
+      return mixRgb(base, text, 0.35);
+    }
+    return mixRgb(base, bg, 0.15);
+  }
+
+  function readPageColors() {
+    const metaTheme = readMetaThemeColor();
+    let bgParsed = readPageBackgroundColor();
+
+    // If we only have theme-color and it looks like a page background (low sat / large chrome), use it.
+    if (!bgParsed && metaTheme && (isGrayish(metaTheme, 0.22) || relativeLuminance(metaTheme) < 0.2 || relativeLuminance(metaTheme) > 0.85)) {
+      bgParsed = metaTheme;
+    }
+
     const theme =
       bgParsed && relativeLuminance(bgParsed) < 0.5
         ? 'dark'
@@ -336,13 +648,45 @@
                 return 'light';
               }
             })();
+
     const fallbackBg = theme === 'dark' ? FIXED.dark.bg : FIXED.light.bg;
-    const readableText = ensureReadableText(bg || fallbackBg, text);
+    const bgCss = bgParsed ? toCss(bgParsed) : fallbackBg;
+    const bgForContrast =
+      normalizeCssColor(bgCss, 'backgroundColor') ||
+      parseCssColor(bgCss) ||
+      parseCssColor(fallbackBg);
+
+    const textCss = ensureReadableText(bgCss, readPageTextColor(bgCss));
+    const textParsed =
+      normalizeCssColor(textCss, 'color') ||
+      parseCssColor(textCss);
+
+    let accentParsed = readAccentFromUi(bgForContrast);
+    if (!accentParsed && metaTheme && !isGrayish(metaTheme, 0.14)) {
+      // Use theme-color as accent when it's a brand color (not a near-bg chrome color).
+      const metaVsBg = bgForContrast ? contrastRatio(metaTheme, bgForContrast) : 1;
+      if (metaVsBg >= 1.25 || colorSaturation(metaTheme) >= 0.25) {
+        accentParsed = metaTheme;
+      }
+    }
+    if (!accentParsed) {
+      accentParsed = fallbackAccentFrom(bgForContrast, textParsed, theme);
+    }
+
     return {
-      bg: bg || fallbackBg,
-      text: readableText,
+      bg: bgCss,
+      text: textCss,
+      accent: toCss(accentParsed),
       theme,
     };
+  }
+
+  function readableOn(bgCss) {
+    const bg =
+      normalizeCssColor(bgCss, 'backgroundColor') ||
+      normalizeCssColor(bgCss, 'color') ||
+      parseCssColor(bgCss);
+    return readableFallbackText(bg);
   }
 
   function derivePalette(pageColors) {
@@ -361,9 +705,21 @@
     const surface2 = toCss(mixRgb(bg, text, 0.08));
     const muted = toCss(deriveMutedColor(text, bg, theme));
     const line = toCss(mixRgb(text, bg, 0.16));
-    const accent = textCss;
-    const accent2 = toCss(mixRgb(text, bg, 0.2));
-    const btnText = bgCss;
+
+    let accentParsed =
+      parseColorValue(pageColors.accent, 'color') ||
+      fallbackAccentFrom(bg, text, theme);
+    // If accent is too close to bg, push it toward a fixed brand hue.
+    if (contrastRatio(accentParsed, bg) < 1.35) {
+      accentParsed = mixRgb(
+        accentParsed,
+        theme === 'dark' ? parseCssColor(FIXED.dark.accent) : parseCssColor(FIXED.light.accent),
+        0.55
+      );
+    }
+    const accentCss = toCss(accentParsed);
+    const accent2 = toCss(mixRgb(accentParsed, bg, 0.22));
+    const btnText = readableOn(accentCss);
 
     return {
       bg: bgCss,
@@ -372,7 +728,7 @@
       surface2,
       muted,
       line,
-      accent,
+      accent: accentCss,
       accent2,
       btnText,
       theme,
@@ -534,6 +890,21 @@
     }
     readStoredTheme((mode, accent) => {
       if (mode === 'page') {
+        // Already on a web page (FAB / content script): sample locally — don't ping tabs.
+        try {
+          if (/^https?:$/i.test(String(location.protocol || ''))) {
+            const colors = getCurrentPagePalette();
+            if (colors && colors.bg) {
+              el.setAttribute('data-theme-mode', 'page');
+              el.setAttribute('data-theme', colors.theme === 'dark' ? 'dark' : 'light');
+              applyPaletteToElement(el, colors);
+              if (cb) cb();
+              return;
+            }
+          }
+        } catch (_) {
+          // fall through
+        }
         findThemeSourceTab((tab) => {
           if (!tab || tab.id == null) {
             applyThemeToHost(el, 'system', accent);
@@ -620,72 +991,132 @@
     }
   }
 
-  /** @param {(row: object | null | undefined) => void} callback */
-  function showYtdlpFormatPicker(title, rows, callback) {
+  /**
+   * Shared choice sheet — same modal chrome as ffmpeg / quality dialogs.
+   * @param {{
+   *   title: string,
+   *   subtitle?: string,
+   *   choices: Array<{ id: string, label: string, primary?: boolean }>,
+   *   cancelLabel?: string,
+   *   mount?: ParentNode | null,
+   * }} opts
+   * @param {(id: string | null) => void} callback — null = canceled
+   */
+  function showChoicePicker(opts, callback) {
     ensurePickerStyles();
+    const title = (opts && opts.title) || 'Choose';
+    const subtitle = (opts && opts.subtitle) || '';
+    const choices = (opts && opts.choices) || [];
+    const cancelLabel = (opts && opts.cancelLabel) || 'Cancel';
+    const mount = (opts && opts.mount) || document.documentElement || document.body;
     const overlay = document.createElement('div');
-    overlay.className = 'hgr-picker-overlay';
+    // Use the same classes as ffmpeg-preset dialogs so theme tokens / CSS match.
+    overlay.className = 'hgr-modal-overlay';
     let offLive = () => {};
+    let settled = false;
     applyStoredThemeToElement(overlay, () => {
       offLive = bindLiveOverlayTheme(overlay);
       const box = document.createElement('div');
-      box.className = 'hgr-picker-box';
+      box.className = 'hgr-modal-box';
       const h = document.createElement('div');
-      h.className = 'hgr-picker-title';
-      h.textContent = 'Choose quality';
+      h.className = 'hgr-modal-title';
+      h.textContent = title;
       const sub = document.createElement('div');
-      sub.className = 'hgr-picker-sub';
-      sub.textContent = (title && title.trim()) || 'Several formats are available.';
+      sub.className = 'hgr-modal-sub';
+      if (subtitle) sub.textContent = subtitle;
+      else sub.hidden = true;
       const form = document.createElement('div');
-      form.className = 'hgr-picker-list';
-      const close = () => {
+      form.className = 'hgr-modal-actions';
+      const finish = (id) => {
+        if (settled) return;
+        settled = true;
         offLive();
         if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        callback(id);
       };
-      const mkBtn = (label, onClick) => {
+      for (const c of choices) {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = 'hgr-picker-choice';
-        b.textContent = label;
-        b.addEventListener('click', onClick);
-        return b;
-      };
-      form.appendChild(
-        mkBtn('Best available (auto merge)', () => {
-          close();
-          callback(null);
-        })
-      );
-      for (const r of rows) {
-        const rowRef = r;
-        form.appendChild(
-          mkBtn(rowRef.label || rowRef.format_id, () => {
-            close();
-            callback(rowRef);
-          })
-        );
+        b.className = c.primary ? 'hgr-modal-btn-primary' : 'hgr-modal-btn-secondary';
+        b.textContent = c.label;
+        b.addEventListener('click', () => finish(c.id));
+        form.appendChild(b);
       }
       const cancel = document.createElement('button');
       cancel.type = 'button';
-      cancel.className = 'hgr-picker-cancel';
-      cancel.textContent = 'Cancel';
-      cancel.addEventListener('click', () => {
-        close();
-        callback(undefined);
-      });
+      cancel.className = 'hgr-modal-btn-ghost';
+      cancel.textContent = cancelLabel;
+      cancel.addEventListener('click', () => finish(null));
+      form.appendChild(cancel);
       box.appendChild(h);
       box.appendChild(sub);
       box.appendChild(form);
-      box.appendChild(cancel);
       overlay.appendChild(box);
       overlay.addEventListener('click', (ev) => {
-        if (ev.target === overlay) {
-          close();
-          callback(undefined);
-        }
+        if (ev.target === overlay) finish(null);
       });
-      document.body.appendChild(overlay);
+      mount.appendChild(overlay);
     });
+  }
+
+  /** @param {(row: object | null | undefined) => void} callback */
+  function showYtdlpFormatPicker(title, rows, callback) {
+    const choices = [
+      { id: '__best__', label: 'Best available (auto merge)', primary: true },
+      ...((rows || []).map((r, i) => ({
+        id: `row:${i}`,
+        label: r.label || r.format_id || `Format ${i + 1}`,
+      }))),
+    ];
+    showChoicePicker(
+      {
+        title: 'Choose quality',
+        subtitle: (title && title.trim()) || 'Several formats are available.',
+        choices,
+        cancelLabel: 'Cancel',
+      },
+      (id) => {
+        if (id == null) {
+          callback(undefined);
+          return;
+        }
+        if (id === '__best__') {
+          callback(null);
+          return;
+        }
+        const m = /^row:(\d+)$/.exec(id);
+        const idx = m ? parseInt(m[1], 10) : -1;
+        callback(rows && rows[idx] != null ? rows[idx] : null);
+      }
+    );
+  }
+
+  /**
+   * Get-all page links: include thumbnails for the whole batch?
+   * @param {number} count
+   * @param {(choice: boolean | null) => void} callback — true / false / null(cancel)
+   * @param {ParentNode | null} [mount]
+   */
+  function showBatchThumbnailPrompt(count, callback, mount) {
+    const n = Math.max(0, Number(count) || 0);
+    showChoicePicker(
+      {
+        title: `Queue ${n} page link${n === 1 ? '' : 's'}?`,
+        subtitle:
+          'Include thumbnails for all of them? This choice applies to every download in this batch.',
+        choices: [
+          { id: 'yes', label: 'Yes, with thumbnails', primary: true },
+          { id: 'no', label: 'No, videos only' },
+        ],
+        cancelLabel: 'Cancel',
+        mount: mount || document.body,
+      },
+      (id) => {
+        if (id === 'yes') callback(true);
+        else if (id === 'no') callback(false);
+        else callback(null);
+      }
+    );
   }
 
   function syncThemeFromRoot(fromEl, toEl) {
@@ -728,13 +1159,13 @@
 
   function pageThemeFingerprint() {
     const p = readPageColors();
-    return `${p.bg}|${p.text}|${p.theme}`;
+    return `${p.bg}|${p.text}|${p.accent || ''}|${p.theme}`;
   }
 
   function notifyPageThemeChange(force) {
     if (_cachedThemeMode !== 'page') return;
     const palette = getCurrentPagePalette();
-    const key = `${palette.bg}|${palette.text}|${palette.theme}`;
+    const key = `${palette.bg}|${palette.text}|${palette.accent || ''}|${palette.theme}`;
     if (!force && key === _lastPageThemeKey) return;
     _lastPageThemeKey = key;
 
@@ -1027,7 +1458,9 @@
     onPageThemeChange,
     bindLiveThemeHost,
     bindLiveOverlayTheme,
+    showChoicePicker,
     showYtdlpFormatPicker,
+    showBatchThumbnailPrompt,
     syncThemeFromRoot,
     ACCENTS,
   };
