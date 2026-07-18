@@ -40,7 +40,11 @@
   },
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*", "file:///*"],
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
       "js": [
         "public/scripts/ios-select.js",
         "public/scripts/theme-helpers.js",
@@ -66,7 +70,11 @@
         "style/modal-theme.css",
         "style/ios-select.css"
       ],
-      "matches": ["http://*/*", "https://*/*", "file:///*"]
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ]
     }
   ]
 }

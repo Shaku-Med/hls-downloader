@@ -32,6 +32,14 @@ package-lock.json
 *.zip
 *.xpi
 
+# Shared asset junctions/symlinks under browser roots (real files live at repo root)
+/chromium/public/
+/chromium/asset/
+/chromium/style/
+/firefox/public/
+/firefox/asset/
+/firefox/style/
+
 # OS
 .DS_Store
 .AppleDouble

@@ -17,13 +17,9 @@
     "<all_urls>"
   ],
   "background": {
-    "scripts": ["public/scripts/background.js"]
-  },
-  "browser_specific_settings": {
-    "gecko": {
-      "id": "stuff-grabber@local",
-      "strict_min_version": "121.0"
-    }
+    "scripts": [
+      "public/scripts/background.js"
+    ]
   },
   "icons": {
     "16": "asset/icon-16.png",
@@ -46,7 +42,11 @@
   },
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*", "file:///*"],
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
       "js": [
         "public/scripts/ios-select.js",
         "public/scripts/theme-helpers.js",
@@ -69,9 +69,20 @@
         "asset/icon-48.png",
         "asset/icon-128.png",
         "style/fab.css",
-        "style/modal-theme.css"
+        "style/modal-theme.css",
+        "style/ios-select.css"
       ],
-      "matches": ["http://*/*", "https://*/*", "file:///*"]
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ]
     }
-  ]
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "stuff-grabber@local",
+      "strict_min_version": "121.0"
+    }
+  }
 }

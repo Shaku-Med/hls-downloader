@@ -13,7 +13,7 @@ import shutil
 import subprocess
 
 NATIVE_HOST_NAME = "com.medzy.hlsgrabber"
-# Must match browser_specific_settings.gecko.id in manifest.firefox.json
+# Must match browser_specific_settings.gecko.id in firefox/manifest.json
 FIREFOX_EXTENSION_ID = "stuff-grabber@local"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HOST_SCRIPT = os.path.join(SCRIPT_DIR, "host.py")
@@ -366,9 +366,25 @@ def install_macos(ext_id):
     print("\nRestart Chrome/Firefox and test the extension!")
 
 
+def ensure_browser_roots():
+    """Create chromium/ + firefox/ folders (each with its own manifest.json)."""
+    setup = os.path.join(SCRIPT_DIR, "setup_browser_roots.py")
+    if not os.path.isfile(setup):
+        return
+    r = _run([sys.executable, setup])
+    if r.stdout:
+        print(r.stdout.rstrip())
+    if r.returncode != 0:
+        if r.stderr:
+            print(r.stderr.rstrip())
+        print("WARNING: could not set up chromium/firefox extension folders.")
+
+
 def main():
     print("=== Stuff Grabber Native Host Installer ===\n")
     print(f"Firefox extension id (fixed): {FIREFOX_EXTENSION_ID}\n")
+    ensure_browser_roots()
+    print("")
 
     ext_id = get_extension_id()
     if not ext_id:
@@ -398,8 +414,8 @@ def main():
 
     print(
         "\nAll set. Fully quit and reopen your browser so it picks up the host.\n"
-        "Chromium: load unpacked from chrome://extensions (or edge://extensions).\n"
-        "Firefox (personal): about:debugging → This Firefox → Load Temporary Add-on → manifest.json\n"
+        "Chromium: Load unpacked → select the chromium/ folder.\n"
+        "Firefox:  about:debugging → This Firefox → Load Temporary Add-on → firefox/manifest.json\n"
         "For YouTube music videos you also want one JS runtime on your PATH:\n"
         "  Node.js  https://nodejs.org   or   Deno  https://docs.deno.com/runtime/getting_started/installation/\n"
     )

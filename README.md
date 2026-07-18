@@ -179,12 +179,20 @@ opera://extensions
 
 2. Turn on Developer mode.
 3. Click Load unpacked.
-4. Choose this folder, the one that contains `manifest.json` (Chromium uses `manifest.json`; Firefox uses `manifest.firefox.json`).
+4. Choose the `chromium` folder (it has its own `manifest.json`).
+
+If `chromium` is missing, run once from this repo:
+
+```text
+python python/setup_browser_roots.py
+```
 
 The browser shows an Extension ID under the name. Copy that full ID. You need it when you run the helper installer.
 
 
 Firefox (personal temporary add-on)
+
+Firefox always reads `manifest.json` from the folder you load. Chrome and Firefox each have their own folder so you never swap files:
 
 1. Open:
 
@@ -192,10 +200,19 @@ Firefox (personal temporary add-on)
 about:debugging#/runtime/this-firefox
 ```
 
-2. Click Load Temporary Add-on.
-3. Choose `manifest.firefox.json` in this folder (not `manifest.json`). Chromium browsers reject Firefox’s `background.scripts` field, so Firefox uses its own manifest file.
+2. Click This Firefox.
+3. Click Load Temporary Add-on.
+4. Choose `firefox/manifest.json` (or any file inside the `firefox` folder).
+
+If `firefox` is missing, run once:
+
+```text
+python python/setup_browser_roots.py
+```
 
 Firefox will unload the add-on when you quit the browser. Load it again the same way next time. That is the supported personal Firefox path. The Firefox id is fixed as `stuff-grabber@local`, so you do not paste a Firefox id into the installer.
+
+How the folders work: `public/`, `asset/`, and `style/` stay at the repo root. The setup script links those into `chromium/` and `firefox/` (junctions on Windows, symlinks elsewhere), so Chrome Load unpacked on `chromium/` and Firefox temporary load on `firefox/` both see the same scripts and icons without duplicating the tree.
 
 
 Install the helper
