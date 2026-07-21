@@ -1208,6 +1208,36 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
   content.appendChild(list);
 }
 
+/** Make sure the active tab has live content scripts (FAB / image grabber). */
+function ensureActiveTabScripts(tab, done) {
+  if (!tab || tab.id == null) {
+    if (done) done(false);
+    return;
+  }
+  const url = String(tab.url || '');
+  if (!/^https?:/i.test(url) && !/^file:/i.test(url)) {
+    if (done) done(false);
+    return;
+  }
+  const finish = (ok) => {
+    if (done) done(!!ok);
+  };
+  chrome.tabs.sendMessage(tab.id, { type: 'HLS_GRABBER_PING' }, (res) => {
+    if (!chrome.runtime.lastError && res && res.ok) {
+      finish(true);
+      return;
+    }
+    chrome.runtime.sendMessage({ type: 'REINJECT_PAGE_SCRIPTS', tabId: tab.id }, () => {
+      void chrome.runtime.lastError;
+      window.setTimeout(() => {
+        chrome.tabs.sendMessage(tab.id, { type: 'HLS_GRABBER_PING' }, (res2) => {
+          finish(!chrome.runtime.lastError && res2 && res2.ok);
+        });
+      }, 250);
+    });
+  });
+}
+
 function loadUi() {
   try {
     chrome.runtime.sendMessage({ type: 'POPUP_OPENED' });
@@ -1218,20 +1248,23 @@ function loadUi() {
     window.HGR_THEME.initExtensionPageTheme();
   }
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-    const activeUrl = tabs && tabs[0] ? tabs[0].url || '' : '';
+    const tab = tabs && tabs[0] ? tabs[0] : null;
+    const activeUrl = tab ? tab.url || '' : '';
     const spotifyCtx = spotifyContextFromTabUrl(activeUrl);
-    chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
-      const hasPath = !!(response && response.userDownloadPath);
-      setPathBar(response && response.userDownloadPath);
-      const streams = response?.streams || [];
-      _lastStreamsSig = streamsSignature(streams);
-      renderStreams(streams, response?.pageTitle || '', hasPath, spotifyCtx);
-      renderJobsBanner(response?.jobs || [], {
-        running: response?.running,
-        queueLength: response?.queueLength,
-        max: response?.maxParallel,
+    ensureActiveTabScripts(tab, () => {
+      chrome.runtime.sendMessage({ type: 'GET_STREAMS' }, (response) => {
+        const hasPath = !!(response && response.userDownloadPath);
+        setPathBar(response && response.userDownloadPath);
+        const streams = response?.streams || [];
+        _lastStreamsSig = streamsSignature(streams);
+        renderStreams(streams, response?.pageTitle || '', hasPath, spotifyCtx);
+        renderJobsBanner(response?.jobs || [], {
+          running: response?.running,
+          queueLength: response?.queueLength,
+          max: response?.maxParallel,
+        });
+        renderPageImages(hasPath);
       });
-      renderPageImages(hasPath);
     });
   });
 }

@@ -650,6 +650,75 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 const IMAGE_GRABBER_KEY = 'imageHoverDownloadEnabled';
+const FLOAT_GRABBER_KEY = 'floatGrabberEnabled';
+
+/** Same order as content_scripts in chromium/firefox manifests. */
+const PAGE_CONTENT_SCRIPTS = [
+  'public/scripts/ios-select.js',
+  'public/scripts/theme-helpers.js',
+  'public/scripts/social-post-urls.js',
+  'public/scripts/download-progress.js',
+  'public/scripts/yt-page-helpers.js',
+  'public/scripts/ffmpeg-preset-helpers.js',
+  'public/scripts/image-hover-download.js',
+  'public/scripts/fab.js',
+  'public/scripts/video-recorder.js',
+];
+
+/**
+ * Re-inject page scripts into open tabs. Needed after extension reload (orphaned
+ * content scripts stop listening) and when on-page toggles change on tabs that
+ * never received a content script yet.
+ */
+async function reinjectPageContentScripts(tabIds) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') return;
+  let ids = tabIds;
+  if (!ids) {
+    try {
+      const tabs = await chrome.tabs.query({
+        url: ['http://*/*', 'https://*/*', 'file:///*'],
+      });
+      ids = (tabs || []).map((t) => t.id).filter((id) => id != null);
+    } catch (_) {
+      return;
+    }
+  }
+  for (const tabId of ids) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId },
+        files: PAGE_CONTENT_SCRIPTS,
+      });
+    } catch (_) {
+      // Restricted pages, discarded tabs, missing file-access, etc.
+    }
+  }
+}
+
+let _reinjectTimer = 0;
+function scheduleReinjectPageContentScripts() {
+  if (_reinjectTimer) clearTimeout(_reinjectTimer);
+  _reinjectTimer = setTimeout(() => {
+    _reinjectTimer = 0;
+    void reinjectPageContentScripts();
+  }, 120);
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (!msg || msg.type !== 'REINJECT_PAGE_SCRIPTS') return;
+  const tabId =
+    msg.tabId != null
+      ? msg.tabId
+      : sender && sender.tab && sender.tab.id != null
+        ? sender.tab.id
+        : null;
+  void (async () => {
+    if (tabId != null) await reinjectPageContentScripts([tabId]);
+    else await reinjectPageContentScripts();
+    sendResponse({ ok: true });
+  })();
+  return true;
+});
 
 /** Serialize menu rebuilds — overlapping removeAll/create causes duplicate-id errors. */
 let _ctxMenusChain = Promise.resolve();
@@ -709,15 +778,22 @@ function setupImageContextMenus() {
 
 chrome.runtime.onInstalled.addListener(() => {
   setupImageContextMenus();
+  scheduleReinjectPageContentScripts();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   setupImageContextMenus();
+  scheduleReinjectPageContentScripts();
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes[IMAGE_GRABBER_KEY]) {
+  if (area !== 'local') return;
+  if (changes[IMAGE_GRABBER_KEY]) {
     setupImageContextMenus();
+    scheduleReinjectPageContentScripts();
+  }
+  if (changes[FLOAT_GRABBER_KEY]) {
+    scheduleReinjectPageContentScripts();
   }
 });
 

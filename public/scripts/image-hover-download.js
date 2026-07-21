@@ -1,5 +1,9 @@
 (function () {
-  if (window.__hlsGrabberImageHoverDownload) return;
+  try {
+    if (window.__hlsGrabberImageHoverDownload && chrome.runtime && chrome.runtime.id) return;
+  } catch (_) {
+    // invalidated context — take over from orphaned script
+  }
   window.__hlsGrabberImageHoverDownload = true;
 
   const ENABLE_KEY = 'imageHoverDownloadEnabled';
@@ -30,8 +34,32 @@
     dismissedImg: null,
   };
 
-  const host = document.createElement('div');
+  const host = document.createElement('stuff-grabber-image-dl');
   host.setAttribute('data-hls-image-dl', '');
+  try {
+    const s = host.style;
+    s.setProperty('position', 'fixed', 'important');
+    s.setProperty('left', '0', 'important');
+    s.setProperty('top', '0', 'important');
+    s.setProperty('right', '0', 'important');
+    s.setProperty('bottom', '0', 'important');
+    s.setProperty('width', '100vw', 'important');
+    s.setProperty('height', '100vh', 'important');
+    s.setProperty('margin', '0', 'important');
+    s.setProperty('padding', '0', 'important');
+    s.setProperty('border', '0', 'important');
+    s.setProperty('background', 'transparent', 'important');
+    s.setProperty('pointer-events', 'none', 'important');
+    s.setProperty('z-index', '2147483646', 'important');
+    s.setProperty('overflow', 'visible', 'important');
+    s.setProperty('display', 'block', 'important');
+    s.setProperty('visibility', 'visible', 'important');
+    s.setProperty('opacity', '1', 'important');
+    s.setProperty('transform', 'none', 'important');
+    s.setProperty('filter', 'none', 'important');
+  } catch (_) {
+    // ignore
+  }
   const shadow = host.attachShadow({ mode: 'open' });
 
   shadow.innerHTML = `
@@ -734,18 +762,16 @@
 
   function startBoxLoop() {
     if (_rafId) return;
-    const tick = () => {
-      _rafId = 0;
+    // Interval (not perpetual rAF) — refresh geometry without burning a frame loop.
+    _rafId = window.setInterval(() => {
       if (!st.enabled) return;
       recomputeBoxes();
-      _rafId = window.requestAnimationFrame(tick);
-    };
-    _rafId = window.requestAnimationFrame(tick);
+    }, BOX_REFRESH_MS);
   }
 
   function stopBoxLoop() {
     if (_rafId) {
-      window.cancelAnimationFrame(_rafId);
+      window.clearInterval(_rafId);
       _rafId = 0;
     }
   }
@@ -922,9 +948,29 @@
     if (st.enabled && st.activeImg && isImgGood(st.activeImg)) positionUi(st.activeImg);
   }
 
+  function removeOrphanImageHosts() {
+    document.querySelectorAll('[data-hls-image-dl], stuff-grabber-image-dl').forEach((el) => {
+      if (el === host) return;
+      try {
+        el.remove();
+      } catch (_) {
+        // ignore
+      }
+    });
+  }
+
   function mount() {
+    removeOrphanImageHosts();
     if (!document.documentElement.contains(host)) {
-      document.documentElement.appendChild(host);
+      try {
+        document.documentElement.appendChild(host);
+      } catch (_) {
+        try {
+          (document.body || document.documentElement).appendChild(host);
+        } catch (e2) {
+          return;
+        }
+      }
     }
     window.addEventListener('pointermove', onPointerMove, { passive: true, capture: true });
     window.addEventListener('scroll', onScrollReposition, { passive: true, capture: true });
@@ -945,6 +991,7 @@
     window.removeEventListener('resize', onResizeReposition, false);
     stopBoxLoop();
     if (host.parentNode) host.parentNode.removeChild(host);
+    removeOrphanImageHosts();
   }
 
   elPop.addEventListener('pointerenter', () => {
@@ -978,15 +1025,23 @@
     else unmount();
   }
 
-  chrome.storage.local.get([ENABLE_KEY], (d) => {
-    if (chrome.runtime.lastError) return;
-    setEnabled(d[ENABLE_KEY] === true);
-  });
+  try {
+    chrome.storage.local.get([ENABLE_KEY], (d) => {
+      if (chrome.runtime.lastError) return;
+      setEnabled(d[ENABLE_KEY] === true);
+    });
+  } catch (_) {
+    // Extension context invalidated
+  }
 
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area !== 'local' || !changes[ENABLE_KEY]) return;
-    setEnabled(changes[ENABLE_KEY].newValue === true);
-  });
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes[ENABLE_KEY]) return;
+      setEnabled(changes[ENABLE_KEY].newValue === true);
+    });
+  } catch (_) {
+    // ignore
+  }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || !msg.type) return;

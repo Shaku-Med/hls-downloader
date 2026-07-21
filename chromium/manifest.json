@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Stuff Grabber",
-  "version": "1.0",
+  "version": "1.0.2",
   "description": "Grabs HLS, DASH, direct video URLs, and page images; saves via helper tools",
   "permissions": [
     "webRequest",
     "nativeMessaging",
     "storage",
     "tabs",
+    "scripting",
     "cookies",
     "alarms",
     "downloads",

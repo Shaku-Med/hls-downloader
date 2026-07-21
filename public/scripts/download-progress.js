@@ -2,7 +2,11 @@
  * On-page download progress bar + highlight <a href> that contains the media id.
  */
 (function () {
-  if (window.__hlsGrabberDownloadProgressUi) return;
+  try {
+    if (window.__hlsGrabberDownloadProgressUi && chrome.runtime && chrome.runtime.id) return;
+  } catch (_) {
+    // invalidated context — take over from orphaned script
+  }
   window.__hlsGrabberDownloadProgressUi = true;
 
   const HIGHLIGHT_CLASS = 'hls-grabber-dl-current';

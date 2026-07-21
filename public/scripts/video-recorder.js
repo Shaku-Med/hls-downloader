@@ -1,5 +1,9 @@
 (function () {
-  if (window.__hlsGrabberVideoRecorder) return;
+  try {
+    if (window.__hlsGrabberVideoRecorder && chrome.runtime && chrome.runtime.id) return;
+  } catch (_) {
+    // invalidated context — take over from orphaned script
+  }
   window.__hlsGrabberVideoRecorder = true;
 
   const MIMES = [

@@ -1,5 +1,21 @@
 (function () {
-  if (window.__hlsGrabberFabLoader) return;
+  function extAlive() {
+    try {
+      return !!(chrome.runtime && chrome.runtime.id);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Living instance: just re-sync. Orphaned instance (dead chrome.*): fall through and take over.
+  try {
+    if (extAlive() && typeof window.__hlsGrabberFabRemount === 'function') {
+      window.__hlsGrabberFabRemount();
+      return;
+    }
+  } catch (_) {
+    // take over
+  }
   window.__hlsGrabberFabLoader = true;
 
   const FLOAT_KEY = 'floatGrabberEnabled';
@@ -11,6 +27,7 @@
   const FAB_SIZE = 52;
   const FAB_MARGIN = 14;
   const MOVE_TOLERANCE = 8;
+  const HOST_TAG = 'stuff-grabber-fab';
 
   const fabCtl = {
     closePanel: () => {},
@@ -20,16 +37,73 @@
     runGetAllPageLinks: null,
   };
 
+  /** Host owned by this live content-script instance (null after unmount / orphan cleanup). */
+  let liveFabHost = null;
+
+  function hardenFabHost(el) {
+    if (!el || !el.style) return;
+    // Custom element + inline shell so page `div {…}` rules cannot hide us.
+    const s = el.style;
+    s.cssText = '';
+    s.setProperty('position', 'fixed', 'important');
+    s.setProperty('left', '0', 'important');
+    s.setProperty('top', '0', 'important');
+    s.setProperty('right', '0', 'important');
+    s.setProperty('bottom', '0', 'important');
+    s.setProperty('width', '100vw', 'important');
+    s.setProperty('height', '100vh', 'important');
+    s.setProperty('margin', '0', 'important');
+    s.setProperty('padding', '0', 'important');
+    s.setProperty('border', '0', 'important');
+    s.setProperty('background', 'transparent', 'important');
+    s.setProperty('pointer-events', 'none', 'important');
+    s.setProperty('z-index', '2147483647', 'important');
+    s.setProperty('overflow', 'visible', 'important');
+    s.setProperty('display', 'block', 'important');
+    s.setProperty('visibility', 'visible', 'important');
+    s.setProperty('opacity', '1', 'important');
+    s.setProperty('transform', 'none', 'important');
+    s.setProperty('filter', 'none', 'important');
+    s.setProperty('clip', 'auto', 'important');
+    s.setProperty('clip-path', 'none', 'important');
+    s.setProperty('max-width', 'none', 'important');
+    s.setProperty('max-height', 'none', 'important');
+  }
+
+  function removeOrphanFabHosts() {
+    document.querySelectorAll('[data-hls-grabber-fab], ' + HOST_TAG).forEach((h) => {
+      if (liveFabHost && h === liveFabHost) return;
+      try {
+        if (typeof h._hlsFabCleanup === 'function') h._hlsFabCleanup();
+      } catch (_) {
+        // ignore
+      }
+      try {
+        h.remove();
+      } catch (_) {
+        // ignore
+      }
+    });
+  }
+
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-    if (msg && msg.type === 'HLS_GRABBER_CLOSE_FLOAT_PANEL') {
+    if (!msg || !msg.type) return;
+    if (msg.type === 'HLS_GRABBER_PING') {
+      sendResponse({
+        ok: true,
+        fab: !!(liveFabHost && (liveFabHost.isConnected || document.documentElement.contains(liveFabHost))),
+      });
+      return true;
+    }
+    if (msg.type === 'HLS_GRABBER_CLOSE_FLOAT_PANEL') {
       fabCtl.closePanel();
       return;
     }
-    if (msg && msg.type === 'HLS_GRABBER_LIVE_UPDATE') {
+    if (msg.type === 'HLS_GRABBER_LIVE_UPDATE') {
       fabCtl.liveRefresh(msg.kind || 'jobs');
       return;
     }
-    if (msg && msg.type === 'HLS_SHOW_BATCH_THUMB_PROMPT') {
+    if (msg.type === 'HLS_SHOW_BATCH_THUMB_PROMPT') {
       const run =
         typeof fabCtl.showBatchThumbPrompt === 'function'
           ? fabCtl.showBatchThumbPrompt
@@ -44,7 +118,7 @@
       });
       return true;
     }
-    if (msg && msg.type === 'HLS_GET_ALL_PAGE_LINKS') {
+    if (msg.type === 'HLS_GET_ALL_PAGE_LINKS') {
       const run =
         typeof fabCtl.runGetAllPageLinks === 'function' ? fabCtl.runGetAllPageLinks : null;
       if (!run) {
@@ -70,8 +144,12 @@
   });
 
   function unmountGrabberUi() {
-    const h = document.querySelector('[data-hls-grabber-fab]');
-    if (!h) return;
+    const h = liveFabHost || document.querySelector('[data-hls-grabber-fab]');
+    liveFabHost = null;
+    if (!h) {
+      removeOrphanFabHosts();
+      return;
+    }
     if (typeof h._hlsFabCleanup === 'function') {
       try {
         h._hlsFabCleanup();
@@ -84,32 +162,63 @@
     fabCtl.liveRefresh = () => {};
     fabCtl.showBatchThumbPrompt = null;
     fabCtl.runGetAllPageLinks = null;
-    h.remove();
+    try {
+      h.remove();
+    } catch (_) {
+      // ignore
+    }
+    removeOrphanFabHosts();
   }
 
   function syncFloatPreference() {
-    chrome.storage.local.get([FLOAT_KEY], (d) => {
-      if (chrome.runtime.lastError) return;
-      const on = d[FLOAT_KEY] !== false;
-      if (on) mountGrabberUi();
-      else unmountGrabberUi();
-    });
+    try {
+      chrome.storage.local.get([FLOAT_KEY], (d) => {
+        if (chrome.runtime.lastError) {
+          // Still try to show — default is ON when unset.
+          mountGrabberUi();
+          return;
+        }
+        const on = !d || d[FLOAT_KEY] !== false;
+        if (on) mountGrabberUi();
+        else unmountGrabberUi();
+      });
+    } catch (_) {
+      // Extension context invalidated
+    }
   }
 
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes[FLOAT_KEY]) {
-      const on = changes[FLOAT_KEY].newValue !== false;
-      if (on) mountGrabberUi();
-      else unmountGrabberUi();
-    }
-    if (area === 'local' && (changes[THEME_MODE_KEY] || changes[THEME_ACCENT_KEY])) {
-      const host = document.querySelector('[data-hls-grabber-fab]');
-      if (host) {
-        unmountGrabberUi();
-        mountGrabberUi();
+  window.__hlsGrabberFabRemount = syncFloatPreference;
+
+  // Some sites rewrite <html>/<body> and strip unknown nodes — put the FAB back.
+  try {
+    const mo = new MutationObserver(() => {
+      if (!liveFabHost) return;
+      if (liveFabHost.isConnected) return;
+      liveFabHost = null;
+      syncFloatPreference();
+    });
+    mo.observe(document.documentElement, { childList: true, subtree: false });
+  } catch (_) {
+    // ignore
+  }
+
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes[FLOAT_KEY]) {
+        const on = changes[FLOAT_KEY].newValue !== false;
+        if (on) mountGrabberUi();
+        else unmountGrabberUi();
       }
-    }
-  });
+      if (area === 'local' && (changes[THEME_MODE_KEY] || changes[THEME_ACCENT_KEY])) {
+        if (liveFabHost || document.querySelector('[data-hls-grabber-fab], ' + HOST_TAG)) {
+          unmountGrabberUi();
+          mountGrabberUi();
+        }
+      }
+    });
+  } catch (_) {
+    // ignore
+  }
 
   function genJobId() {
     return `j_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`;
@@ -211,16 +320,69 @@
   }
 
   function mountGrabberUi() {
-    if (document.querySelector('[data-hls-grabber-fab]')) return;
+    try {
+      if (liveFabHost && (liveFabHost.isConnected || document.documentElement.contains(liveFabHost))) {
+        hardenFabHost(liveFabHost);
+        return;
+      }
+      // Drop hosts left by orphaned scripts after an extension reload.
+      removeOrphanFabHosts();
 
-    const ac = new AbortController();
-    const { signal } = ac;
+      const ac = new AbortController();
+      const { signal } = ac;
 
-    const host = document.createElement('div');
-  host.setAttribute('data-hls-grabber-fab', '');
-  const shadow = host.attachShadow({ mode: 'open' });
+      // Custom tag avoids hostile page rules that target bare `div`.
+      const host = document.createElement(HOST_TAG);
+      host.setAttribute('data-hls-grabber-fab', '');
+      hardenFabHost(host);
+      const shadow = host.attachShadow({ mode: 'open' });
 
-  shadow.innerHTML = `
+      shadow.innerHTML = `
+<style data-hls-fab-fallback>
+  .fab {
+    position: fixed !important;
+    width: ${FAB_SIZE}px !important;
+    height: ${FAB_SIZE}px !important;
+    border-radius: 50% !important;
+    border: none !important;
+    cursor: grab !important;
+    background: #ffffff !important;
+    color: #111 !important;
+    padding: 0 !important;
+    z-index: 2147483647 !important;
+    pointer-events: auto !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    box-shadow: 0 12px 40px rgba(0,0,0,.22) !important;
+    left: var(--fab-left, 14px) !important;
+    top: var(--fab-top, 14px) !important;
+    right: auto !important;
+    bottom: auto !important;
+    transform: var(--fab-transform, none);
+    margin: 0 !important;
+  }
+  .fab-icon { width: 34px; height: 34px; border-radius: 50%; object-fit: cover; pointer-events: none; display: block; }
+  .fab-badge {
+    position: absolute; top: -4px; right: -4px; min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: 999px; background: #ff3b30; color: #fff; font: 700 11px/18px system-ui, sans-serif;
+    pointer-events: none;
+  }
+  .fab-badge[hidden] { display: none !important; }
+  .panel { display: none !important; }
+  .panel.open {
+    display: flex !important; flex-direction: column; position: fixed; z-index: 2147483646;
+    pointer-events: auto; width: min(360px, calc(100vw - 24px));
+    max-height: min(520px, calc(100vh - 24px));
+    background: #fff; color: #111; border-radius: 16px;
+    box-shadow: 0 16px 48px rgba(0,0,0,.25); overflow: hidden;
+  }
+  .panel-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 14px; font-weight: 700; }
+  .close-p { border: 0; background: transparent; font-size: 22px; cursor: pointer; line-height: 1; }
+  .panel-scroll { overflow: auto; padding: 0 14px 14px; }
+</style>
 <button type="button" class="fab" aria-label="Open Stuff Grabber" title="Stuff Grabber">
   <img class="fab-icon" src="" alt="" draggable="false" />
   <span class="fab-badge" hidden></span>
@@ -245,20 +407,37 @@
   </div>
 </div>`;
 
-  document.documentElement.appendChild(host);
-  host.style.setProperty('--fab-size', `${FAB_SIZE}px`);
-  const link = document.createElement('link');
-  link.rel = 'stylesheet';
-  link.href = chrome.runtime.getURL('style/fab.css');
-  shadow.prepend(link);
+      const mountRoot = document.documentElement || document.body;
+      if (!mountRoot) return;
+      mountRoot.appendChild(host);
+      liveFabHost = host;
+      host.style.setProperty('--fab-size', `${FAB_SIZE}px`);
+      try {
+        const link = document.createElement('link');
+        link.rel = 'stylesheet';
+        link.href = chrome.runtime.getURL('style/fab.css');
+        // Keep fallback first so a broken/late fab.css cannot blank the button.
+        shadow.appendChild(link);
+      } catch (_) {
+        // Stylesheet optional — inline fallback above is enough to show the button.
+      }
 
-  const fab = shadow.querySelector('.fab');
-  const panel = shadow.querySelector('.panel');
-  const fabPath = shadow.getElementById('fab-path');
-  const fabJobs = shadow.getElementById('fab-jobs');
-  const fabStreams = shadow.getElementById('fab-streams');
-  const fabImages = shadow.getElementById('fab-images');
-  const closeBtn = shadow.querySelector('.close-p');
+      const fab = shadow.querySelector('.fab');
+      const panel = shadow.querySelector('.panel');
+      const fabPath = shadow.getElementById('fab-path');
+      const fabJobs = shadow.getElementById('fab-jobs');
+      const fabStreams = shadow.getElementById('fab-streams');
+      const fabImages = shadow.getElementById('fab-images');
+      const closeBtn = shadow.querySelector('.close-p');
+      if (!fab || !panel || !closeBtn) {
+        try {
+          host.remove();
+        } catch (_) {
+          // ignore
+        }
+        liveFabHost = null;
+        return;
+      }
 
   let _fabStreamsSig = '';
   function fabStreamsSignature(streams) {
@@ -353,14 +532,32 @@
     const isSnap = mode === true || mode === 'snap';
     fab.classList.toggle('dragging', isDrag);
     if (!isSnap) fab.classList.remove('snapping');
-    fab.style.setProperty('--fab-left', `${Math.round(left)}px`);
-    fab.style.setProperty('--fab-top', `${Math.round(top)}px`);
+    const l = Math.round(Number(left) || 0);
+    const t = Math.round(Number(top) || 0);
+    // Direct inline position (not only CSS vars) so the button stays visible
+    // even when fab.css fails to load or var() resolution breaks.
+    fab.style.setProperty('position', 'fixed', 'important');
+    fab.style.setProperty('left', `${l}px`, 'important');
+    fab.style.setProperty('top', `${t}px`, 'important');
+    fab.style.setProperty('right', 'auto', 'important');
+    fab.style.setProperty('bottom', 'auto', 'important');
+    fab.style.setProperty('width', `${FAB_SIZE}px`, 'important');
+    fab.style.setProperty('height', `${FAB_SIZE}px`, 'important');
+    fab.style.setProperty('display', 'flex', 'important');
+    fab.style.setProperty('visibility', 'visible', 'important');
+    fab.style.setProperty('opacity', '1', 'important');
+    fab.style.setProperty('pointer-events', 'auto', 'important');
+    fab.style.setProperty('z-index', '2147483647', 'important');
+    fab.style.setProperty('--fab-left', `${l}px`);
+    fab.style.setProperty('--fab-top', `${t}px`);
     fab.style.setProperty('--fab-right', 'auto');
     fab.style.setProperty('--fab-bottom', 'auto');
     if (isDrag) {
       fab.style.setProperty('--fab-transform', 'scale(1.08)');
+      fab.style.setProperty('transform', 'scale(1.08)');
     } else if (!isSnap) {
       fab.style.setProperty('--fab-transform', 'none');
+      fab.style.setProperty('transform', 'none');
     }
   }
 
@@ -390,13 +587,18 @@
     // Force style flush so the next left/top change animates from here.
     void fab.offsetWidth;
 
-    fab.style.setProperty('--fab-left', `${Math.round(left)}px`);
-    fab.style.setProperty('--fab-top', `${Math.round(top)}px`);
+    const l = Math.round(left);
+    const t = Math.round(top);
+    fab.style.setProperty('left', `${l}px`, 'important');
+    fab.style.setProperty('top', `${t}px`, 'important');
+    fab.style.setProperty('--fab-left', `${l}px`);
+    fab.style.setProperty('--fab-top', `${t}px`);
     fab.style.setProperty('--fab-right', 'auto');
     fab.style.setProperty('--fab-bottom', 'auto');
 
     requestAnimationFrame(() => {
       fab.style.setProperty('--fab-transform', 'scale(1)');
+      fab.style.setProperty('transform', 'scale(1)');
     });
 
     trackPanelDuringSnap();
@@ -1581,12 +1783,8 @@
         btn.type = 'button';
         btn.className = 'btn btn-pri';
         btn.textContent = 'Save';
-        if (!hasPath) btn.disabled = true;
+        // Image saves use the browser Downloads API — no helper folder required.
         btn.addEventListener('click', () => {
-          if (!hasPath) {
-            chrome.runtime.openOptionsPage();
-            return;
-          }
           btn.disabled = true;
           btn.textContent = '…';
           const stem = (img.alt && img.alt.trim()) || `image_${idx + 1}`;
@@ -1819,10 +2017,30 @@
     });
   }
 
+  // Position immediately so the button is visible even before storage returns.
+  try {
+    const sc = cornerCoords('br');
+    corner = 'br';
+    applyFabPixels(sc.left, sc.top, false);
+  } catch (_) {
+    applyFabPixels(FAB_MARGIN, FAB_MARGIN, false);
+  }
+
   loadPos(() => {
     refreshBadgeOnly();
     fabRecScan();
   });
+
+  liveFabHost = host;
+    } catch (err) {
+      try {
+        console.warn('Stuff Grabber: FAB mount failed', err);
+      } catch (_) {
+        // ignore
+      }
+      liveFabHost = null;
+      removeOrphanFabHosts();
+    }
   }
 
   syncFloatPreference();
