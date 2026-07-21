@@ -17,35 +17,58 @@
   const shadow = host.attachShadow({ mode: 'open' });
   shadow.innerHTML = `
     <style>
-      :host { all: initial; }
+      :host {
+        all: initial;
+        --bg: #000000;
+        --surface: #1c1c1e;
+        --text: #ffffff;
+        --muted: #8e8e93;
+        --line: rgba(84, 84, 88, 0.65);
+        --accent: #0a84ff;
+        --accent-2: #409cff;
+        --fill: rgba(120, 120, 128, 0.32);
+        --shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+        --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      }
+      :host([data-theme="light"]) {
+        --bg: #f2f2f7;
+        --surface: #ffffff;
+        --text: #000000;
+        --muted: #8e8e93;
+        --line: rgba(60, 60, 67, 0.18);
+        --accent: #007aff;
+        --accent-2: #0a84ff;
+        --fill: rgba(120, 120, 128, 0.16);
+        --shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
+      }
       .bar-wrap {
         position: fixed; left: 16px; right: 16px; bottom: 16px; z-index: 2147483646;
         pointer-events: none; display: none;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        font-family: var(--font);
       }
       .bar-wrap[data-open="1"] { display: block; }
       .card {
         pointer-events: auto;
         max-width: 420px; margin: 0 auto;
-        background: rgba(22, 27, 39, 0.94); color: #e6e9ef;
-        border: 1px solid rgba(255,255,255,0.12); border-radius: 14px;
-        box-shadow: 0 16px 48px rgba(0,0,0,0.45);
+        background: color-mix(in srgb, var(--surface) 94%, transparent); color: var(--text);
+        border: 0.5px solid var(--line); border-radius: 14px;
+        box-shadow: var(--shadow);
         backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
         padding: 12px 14px 14px;
       }
       .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
-      .title { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; }
-      .sub { font-size: 11px; color: #95a2bb; margin-top: 3px; line-height: 1.35; word-break: break-word; }
+      .title { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; color: var(--text); }
+      .sub { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.35; word-break: break-word; }
       .x {
-        flex: 0 0 auto; border: 0; background: transparent; color: #95a2bb;
+        flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
         font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px;
       }
       .track {
-        height: 8px; border-radius: 980px; background: rgba(120,120,128,0.35); overflow: hidden;
+        height: 8px; border-radius: 980px; background: var(--fill); overflow: hidden;
       }
       .fill {
         height: 100%; width: 0%; border-radius: 980px;
-        background: linear-gradient(90deg, #4f8cff, #3574f0);
+        background: linear-gradient(90deg, var(--accent), var(--accent-2));
         transition: width 220ms ease;
       }
       .fill.indeterminate {
@@ -56,7 +79,7 @@
         0% { transform: translateX(-120%); }
         100% { transform: translateX(280%); }
       }
-      .meta { margin-top: 7px; font-size: 11px; color: #aab4c8; font-variant-numeric: tabular-nums; }
+      .meta { margin-top: 7px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
     </style>
     <div class="bar-wrap" part="wrap">
       <div class="card">
@@ -80,6 +103,17 @@
   const metaEl = shadow.querySelector('.meta');
   const closeBtn = shadow.querySelector('.x');
 
+  let unbindProgressTheme = null;
+  try {
+    if (window.HGR_THEME && window.HGR_THEME.bindLiveThemeHost) {
+      unbindProgressTheme = window.HGR_THEME.bindLiveThemeHost(host);
+    } else if (window.HGR_THEME && window.HGR_THEME.applyStoredThemeToElement) {
+      window.HGR_THEME.applyStoredThemeToElement(host);
+    }
+  } catch (_) {
+    // ignore
+  }
+
   /** @type {HTMLElement[]} */
   let highlighted = [];
   let hideTimer = 0;
@@ -98,12 +132,14 @@
     if (document.getElementById(STYLE_ID)) return;
     const st = document.createElement('style');
     st.id = STYLE_ID;
+    const accent =
+      (host && getComputedStyle(host).getPropertyValue('--accent').trim()) || '#0a84ff';
     st.textContent = `
       a.${HIGHLIGHT_CLASS},
       .${HIGHLIGHT_CLASS} {
-        outline: 3px solid #0a84ff !important;
+        outline: 3px solid ${accent} !important;
         outline-offset: 3px !important;
-        box-shadow: 0 0 0 4px rgba(10, 132, 255, 0.35) !important;
+        box-shadow: 0 0 0 4px color-mix(in srgb, ${accent} 35%, transparent) !important;
         border-radius: 8px !important;
         position: relative !important;
         z-index: 2147483000 !important;
@@ -118,13 +154,11 @@
         padding: 2px 8px;
         border-radius: 980px;
         font: 600 11px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+        background: ${accent};
         color: #fff;
-        background: #0a84ff;
-        pointer-events: none;
-        letter-spacing: -0.01em;
       }
     `;
-    (document.head || document.documentElement).appendChild(st);
+    document.documentElement.appendChild(st);
   }
 
   function clearHighlights() {

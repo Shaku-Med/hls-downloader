@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="color-scheme" content="dark light" />
+  <title>Stuff Grabber helper</title>
+  <link rel="stylesheet" href="/style/options.css" />
+</head>
+<body>
+  <nav class="page-nav">
+    <a class="page-nav-link" href="/public/options.html">← Settings</a>
+  </nav>
+
+  <header class="page-header">
+    <h1>Helper on this PC</h1>
+    <p class="lead">
+      Downloads need a small helper on your computer. Check the connection here, copy your extension ID, and reinstall if something’s off.
+    </p>
+  </header>
+
+  <section class="group">
+    <div class="group-title">Status</div>
+    <div class="group-card">
+      <div class="row helper-status-row">
+        <div class="helper-status-top">
+          <div>
+            <div class="helper-status-label">Connection</div>
+            <div id="helper-status-title" class="helper-status-title">Checking…</div>
+            <div id="helper-status-body" class="hint">Looking for the download helper…</div>
+          </div>
+          <span id="helper-status-badge" class="helper-badge is-checking">Checking</span>
+        </div>
+        <div class="helper-tools" id="helper-tools" hidden>
+          <div class="helper-tool"><span>ffmpeg</span><code id="helper-ffmpeg">…</code></div>
+          <div class="helper-tool"><span>yt-dlp</span><code id="helper-ytdlp">…</code></div>
+          <div class="helper-tool"><span>Python</span><code id="helper-python">…</code></div>
+        </div>
+        <div class="helper-actions">
+          <button type="button" id="helper-recheck" class="btn-secondary">Check again</button>
+          <button type="button" id="helper-test-write" class="btn-secondary">Test save folder</button>
+        </div>
+        <div id="helper-action-status" class="hint" hidden></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="group">
+    <div class="group-title">Install</div>
+    <div class="group-card">
+      <div class="row">
+        <label for="helper-ext-id">Extension ID</label>
+        <div class="helper-id-line">
+          <input id="helper-ext-id" type="text" readonly autocomplete="off" />
+          <button type="button" id="helper-copy-id" class="btn-secondary">Copy</button>
+        </div>
+        <div class="hint">Paste this into <code>python python/install.py</code> if you reinstall the helper.</div>
+      </div>
+      <div class="row" id="helper-fix" hidden>
+        <div class="helper-fix-title">Fix it</div>
+        <ol id="helper-fix-steps"></ol>
+        <div class="helper-cmd-wrap">
+          <code id="helper-install-cmd"></code>
+          <button type="button" id="helper-copy-cmd" class="btn-secondary">Copy command</button>
+        </div>
+      </div>
+      <div class="row" id="helper-cmd-always">
+        <div class="helper-fix-title">Install command</div>
+        <div class="hint" style="margin-top:0;margin-bottom:8px">From the Stuff Grabber folder, run:</div>
+        <div class="helper-cmd-wrap">
+          <code id="helper-install-cmd-main"></code>
+          <button type="button" id="helper-copy-cmd-main" class="btn-secondary">Copy command</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <script src="/public/scripts/theme-helpers.js"></script>
+  <script src="/public/scripts/helper.js"></script>
+</body>
+</html>

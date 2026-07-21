@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Mapping, Optional
 
 from .models import CommandPlan, RunResult
 
@@ -16,11 +16,14 @@ def _stream_process(
     *,
     timeout: Optional[float],
     on_log: Optional[LogFn],
+    extra_env: Optional[Mapping[str, str]] = None,
 ) -> RunResult:
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     # Help pip show progress when stdout is not a TTY (GUI / captured).
     env.setdefault("PIP_PROGRESS_BAR", "on")
+    if extra_env:
+        env.update(extra_env)
 
     try:
         proc = subprocess.Popen(
@@ -125,7 +128,12 @@ def run_command(
         on_log(f"$ {plan.display()}")
         on_log("Running... live output below.")
 
-    return _stream_process(list(plan.argv), timeout=timeout, on_log=on_log)
+    return _stream_process(
+        list(plan.argv),
+        timeout=timeout,
+        on_log=on_log,
+        extra_env=plan.env,
+    )
 
 
 def run_with_approval(

@@ -21,35 +21,35 @@
 
   const THEME_PALETTE = {
     dark: {
-      bg: '#0f1117',
-      surface: '#161b27',
-      surface2: '#131926',
-      text: '#e6e9ef',
-      muted: '#95a2bb',
-      line: '#293043',
-      btnText: '#f8fbff',
+      bg: '#000000',
+      surface: '#1c1c1e',
+      surface2: '#2c2c2e',
+      text: '#ffffff',
+      muted: '#8e8e93',
+      line: 'rgba(84, 84, 88, 0.65)',
+      btnText: '#ffffff',
       accents: {
-        blue: ['#4f8cff', '#3574f0'],
-        violet: ['#8b5cf6', '#7c3aed'],
-        emerald: ['#10b981', '#059669'],
-        rose: ['#f43f5e', '#e11d48'],
-        orange: ['#f97316', '#ea580c'],
+        blue: ['#0a84ff', '#409cff'],
+        violet: ['#bf5af2', '#da8fff'],
+        emerald: ['#30d158', '#63e689'],
+        rose: ['#ff375f', '#ff6482'],
+        orange: ['#ff9f0a', '#ffb340'],
       },
     },
     light: {
-      bg: '#f4f6fb',
+      bg: '#f2f2f7',
       surface: '#ffffff',
-      surface2: '#eef2fb',
-      text: '#0f172a',
-      muted: '#475569',
-      line: '#d8e0ef',
+      surface2: '#ffffff',
+      text: '#000000',
+      muted: '#8e8e93',
+      line: 'rgba(60, 60, 67, 0.18)',
       btnText: '#ffffff',
       accents: {
-        blue: ['#2563eb', '#1d4ed8'],
-        violet: ['#8b5cf6', '#7c3aed'],
-        emerald: ['#10b981', '#059669'],
-        rose: ['#f43f5e', '#e11d48'],
-        orange: ['#f97316', '#ea580c'],
+        blue: ['#007aff', '#0a84ff'],
+        violet: ['#af52de', '#bf5af2'],
+        emerald: ['#34c759', '#30d158'],
+        rose: ['#ff2d55', '#ff375f'],
+        orange: ['#ff9500', '#ff9f0a'],
       },
     },
   };
@@ -94,6 +94,10 @@
       global.HGR_THEME.syncThemeFromRoot(document.documentElement, el);
       return;
     }
+    if (global.HGR_THEME && typeof global.HGR_THEME.applyThemeToHost === 'function') {
+      global.HGR_THEME.applyThemeToHost(el, mode || 'system', accent || 'blue');
+      return;
+    }
     if (mode === 'page' && global.HGR_THEME && global.HGR_THEME.readPageColors) {
       const palette = global.HGR_THEME.derivePalette(global.HGR_THEME.readPageColors());
       global.HGR_THEME.applyPaletteToElement(el, palette);
@@ -103,9 +107,8 @@
       return;
     }
     const resolved = resolveThemeMode(mode);
-    const useAccent = mode === 'light' || mode === 'dark';
     const pal = THEME_PALETTE[resolved] || THEME_PALETTE.dark;
-    const accKey = useAccent ? accent || 'blue' : 'blue';
+    const accKey = accent || 'blue';
     const acc = (pal.accents && pal.accents[accKey]) || pal.accents.blue;
     el.style.setProperty('--bg', pal.bg);
     el.style.setProperty('--surface', pal.surface);
@@ -118,8 +121,8 @@
     el.style.setProperty('--accent-2', acc[1]);
     el.setAttribute('data-theme', resolved);
     el.setAttribute('data-theme-mode', mode || 'system');
-    if (useAccent) el.setAttribute('data-accent', accent || 'blue');
-    else el.removeAttribute('data-accent');
+    if (mode === 'page') el.removeAttribute('data-accent');
+    else el.setAttribute('data-accent', accKey);
   }
 
   function readUiTheme(cb) {
@@ -331,12 +334,18 @@
     ensureModalStyles();
     const overlay = document.createElement('div');
     overlay.className = 'hgr-modal-overlay';
+    if (global.HGR_THEME && typeof global.HGR_THEME.hardenModalOverlay === 'function') {
+      global.HGR_THEME.hardenModalOverlay(overlay);
+    }
     applyModalTheme(overlay, themeMode, themeAccent);
     if (global.HGR_THEME && global.HGR_THEME.bindLiveOverlayTheme) {
       overlay._hgrOffLiveTheme = global.HGR_THEME.bindLiveOverlayTheme(overlay);
     }
     const box = document.createElement('div');
     box.className = 'hgr-modal-box';
+    if (global.HGR_THEME && typeof global.HGR_THEME.hardenModalBox === 'function') {
+      global.HGR_THEME.hardenModalBox(box);
+    }
     overlay.appendChild(box);
     return { overlay, box };
   }
@@ -382,7 +391,9 @@
       box.appendChild(h);
       box.appendChild(sub);
       box.appendChild(row);
-      document.body.appendChild(overlay);
+      // Mount on <html>: the floater host follows <body>, so a body-mounted
+      // overlay would stack behind the floating panel.
+      (document.documentElement || document.body).appendChild(overlay);
     });
   }
 
@@ -575,7 +586,9 @@
     if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
       HLS_IOS_SELECT.enhance(select);
     }
-    document.body.appendChild(overlay);
+    // Mount on <html>: the floater host follows <body>, so a body-mounted
+    // overlay would stack behind the floating panel.
+    (document.documentElement || document.body).appendChild(overlay);
     updateTrade();
   }
 

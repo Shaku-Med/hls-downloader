@@ -1,16 +1,37 @@
 (function () {
-  try {
-    if (window.__hlsGrabberImageHoverDownload && chrome.runtime && chrome.runtime.id) return;
-  } catch (_) {
-    // invalidated context — take over from orphaned script
+  function extAlive() {
+    try {
+      return !!(chrome.runtime && chrome.runtime.id);
+    } catch (_) {
+      return false;
+    }
   }
+
+  // Same live context already owns image hover — skip. After reload, old flag may
+  // still be set while chrome.* in THAT closure is dead; take over in that case.
+  try {
+    const prev = window.__hlsGrabberImageHoverApi;
+    if (prev && typeof prev.__hlsAlive === 'function' && prev.__hlsAlive()) {
+      return;
+    }
+  } catch (_) {
+    // take over
+  }
+  if (!extAlive()) return;
+
+  window.__hlsGrabberImageHoverGen = (window.__hlsGrabberImageHoverGen || 0) + 1;
+  const myGen = window.__hlsGrabberImageHoverGen;
   window.__hlsGrabberImageHoverDownload = true;
+
+  function stillOwner() {
+    return extAlive() && window.__hlsGrabberImageHoverGen === myGen;
+  }
 
   const ENABLE_KEY = 'imageHoverDownloadEnabled';
   const THEME_MODE_KEY = 'uiThemeMode';
   const THEME_ACCENT_KEY = 'uiThemeAccent';
   const MIN_SIZE = 28;
-  const HIDE_DELAY_MS = 180;
+  const HIDE_DELAY_MS = 220;
   // How long the pointer must rest on a *different* image before the popover
   // moves to it. Stops neighbouring grid thumbnails from stealing focus while
   // you're just on your way to click Download.
@@ -34,6 +55,8 @@
     dismissedImg: null,
   };
 
+  // Same Shadow DOM path as Chromium. Styles are promoted to adoptedStyleSheets
+  // so Firefox page CSP cannot blank the UI.
   const host = document.createElement('stuff-grabber-image-dl');
   host.setAttribute('data-hls-image-dl', '');
   try {
@@ -50,7 +73,7 @@
     s.setProperty('border', '0', 'important');
     s.setProperty('background', 'transparent', 'important');
     s.setProperty('pointer-events', 'none', 'important');
-    s.setProperty('z-index', '2147483646', 'important');
+    s.setProperty('z-index', '2147483647', 'important');
     s.setProperty('overflow', 'visible', 'important');
     s.setProperty('display', 'block', 'important');
     s.setProperty('visibility', 'visible', 'important');
@@ -62,7 +85,16 @@
   }
   const shadow = host.attachShadow({ mode: 'open' });
 
-  shadow.innerHTML = `
+  const setHtml =
+    window.HGR_THEME && typeof window.HGR_THEME.setNodeHtml === 'function'
+      ? window.HGR_THEME.setNodeHtml
+      : (node, html) => {
+          if (node) node.innerHTML = String(html == null ? '' : html);
+        };
+
+  setHtml(
+    shadow,
+    `
     <style>
       :host {
         all: initial;
@@ -116,7 +148,8 @@
       }
       .pop {
         position: fixed;
-        z-index: 2147483646;
+        z-index: 2147483647;
+        pointer-events: auto !important;
         display: none;
         padding: 14px;
         border-radius: 18px;
@@ -128,6 +161,9 @@
         backdrop-filter: blur(28px) saturate(180%);
         -webkit-backdrop-filter: blur(28px) saturate(180%);
         border: 0.5px solid var(--sg-line);
+      }
+      .pop, .pop * {
+        pointer-events: auto !important;
       }
       .row1 {
         display: flex;
@@ -211,7 +247,8 @@
       .ios-select-chevron { width: 16px; height: 16px; color: var(--sg-muted); transition: transform var(--spring); }
       .ios-select.is-open .ios-select-chevron { transform: rotate(180deg); }
       .ios-select-menu {
-        position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 80;
+        position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 2147483647;
+        pointer-events: auto !important;
         max-height: 220px; overflow: auto; overscroll-behavior: contain; padding: 6px;
         border-radius: 14px; background: color-mix(in srgb, var(--sg-surface) 92%, transparent);
         backdrop-filter: blur(24px) saturate(160%); -webkit-backdrop-filter: blur(24px) saturate(160%);
@@ -219,7 +256,10 @@
       }
       .ios-select-menu.ios-select-menu--fixed {
         position: fixed !important; right: auto !important; bottom: auto !important;
-        margin: 0; z-index: 2147483647 !important;
+        margin: 0; z-index: 2147483647 !important; pointer-events: auto !important;
+      }
+      .ios-select-menu, .ios-select-menu * {
+        pointer-events: auto !important;
       }
       .ios-select-menu[hidden] { display: none !important; }
       .ios-select-option {
@@ -250,15 +290,47 @@
       </div>
       <div class="sub" id="sub"></div>
     </div>
-  `;
+  `
+  );
+
+  try {
+    if (window.HGR_THEME && typeof window.HGR_THEME.promoteInlineStyles === 'function') {
+      window.HGR_THEME.promoteInlineStyles(shadow);
+    }
+  } catch (_) {
+    // ignore
+  }
+
+  function rootById(root, id) {
+    if (!root || id == null || id === '') return null;
+    if (typeof root.getElementById === 'function') {
+      try {
+        return root.getElementById(String(id));
+      } catch (_) {
+        // fall through
+      }
+    }
+    try {
+      if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') {
+        return root.querySelector('#' + CSS.escape(String(id)));
+      }
+    } catch (_) {
+      // fall through
+    }
+    try {
+      return root.querySelector('[id="' + String(id).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"]');
+    } catch (_) {
+      return null;
+    }
+  }
 
   const elHL = shadow.querySelector('.hl');
   const elPop = shadow.querySelector('.pop');
-  const elTitle = shadow.getElementById('t');
-  const elSub = shadow.getElementById('sub');
-  const elFmt = shadow.getElementById('fmt');
-  const elDl = shadow.getElementById('dl');
-  const elClose = shadow.getElementById('x');
+  const elTitle = rootById(shadow, 't');
+  const elSub = rootById(shadow, 'sub');
+  const elFmt = rootById(shadow, 'fmt');
+  const elDl = rootById(shadow, 'dl');
+  const elClose = rootById(shadow, 'x');
 
   function applyTheme(mode, accent) {
     const themeApi = window.HGR_THEME;
@@ -496,26 +568,118 @@
   function setVisible(on) {
     elHL.style.display = on ? 'block' : 'none';
     elPop.style.display = on ? 'block' : 'none';
+    if (on) {
+      elPop.style.setProperty('pointer-events', 'auto', 'important');
+      elPop.style.setProperty('z-index', '2147483647', 'important');
+    }
+  }
+
+  function popRect() {
+    try {
+      return elPop.getBoundingClientRect();
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /** True when pointer is on the pop, format menu, active image, or a narrow bridge between them. */
+  function pointerOverActiveUi(x, y) {
+    if (elPop.style.display === 'none') return false;
+    const pad = 10;
+    const hit = (r) =>
+      !!r &&
+      x >= r.left - pad &&
+      x <= r.right + pad &&
+      y >= r.top - pad &&
+      y <= r.bottom + pad;
+
+    const pr = popRect();
+    if (hit(pr)) return true;
+
+    try {
+      const menus = shadow.querySelectorAll('.ios-select-menu:not([hidden])');
+      for (const m of menus) {
+        if (hit(m.getBoundingClientRect())) return true;
+      }
+    } catch (_) {
+      // ignore
+    }
+
+    if (!(st.activeImg instanceof HTMLImageElement)) return false;
+    let ir;
+    try {
+      ir = st.activeImg.getBoundingClientRect();
+    } catch (_) {
+      return false;
+    }
+    if (hit(ir)) return true;
+    if (!pr) return false;
+
+    // Narrow travel lane only in the gap between image and pop (not the whole bounding box).
+    const left = Math.min(ir.left, pr.left) - pad;
+    const right = Math.max(ir.right, pr.right) + pad;
+    if (x < left || x > right) return false;
+
+    // Pop above image
+    if (pr.bottom <= ir.top + 2) {
+      return y >= pr.bottom - pad && y <= ir.top + pad;
+    }
+    // Pop below image
+    if (pr.top >= ir.bottom - 2) {
+      return y >= ir.bottom - pad && y <= pr.top + pad;
+    }
+    // Pop to the side
+    if (pr.right <= ir.left + 2) {
+      return y >= Math.min(ir.top, pr.top) - pad &&
+        y <= Math.max(ir.bottom, pr.bottom) + pad &&
+        x >= pr.right - pad &&
+        x <= ir.left + pad;
+    }
+    if (pr.left >= ir.right - 2) {
+      return y >= Math.min(ir.top, pr.top) - pad &&
+        y <= Math.max(ir.bottom, pr.bottom) + pad &&
+        x >= ir.right - pad &&
+        x <= pr.left + pad;
+    }
+    return false;
   }
 
   function scheduleHide() {
     if (st.hideTimer) window.clearTimeout(st.hideTimer);
     st.hideTimer = window.setTimeout(() => {
       st.hideTimer = null;
-      if (!st.hoveringImg && !st.hoveringUi) {
-        st.activeImg = null;
-        setVisible(false);
+      if (st.hoveringImg || st.hoveringUi) return;
+      try {
+        if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.closeAll) {
+          HLS_IOS_SELECT.closeAll();
+        }
+      } catch (_) {
+        // ignore
       }
+      st.activeImg = null;
+      setVisible(false);
     }, HIDE_DELAY_MS);
   }
 
-  function positionUi(img) {
+  function positionHighlight(img) {
     const r = img.getBoundingClientRect();
     const pad = 3;
     elHL.style.left = `${Math.max(0, Math.round(r.left - pad))}px`;
     elHL.style.top = `${Math.max(0, Math.round(r.top - pad))}px`;
     elHL.style.width = `${Math.max(0, Math.round(r.width + pad * 2))}px`;
     elHL.style.height = `${Math.max(0, Math.round(r.height + pad * 2))}px`;
+  }
+
+  function positionUi(img, { forcePop = false } = {}) {
+    positionHighlight(img);
+
+    // Keep the popover pinned while the same image is active so it doesn't
+    // jump away from the cursor as you move toward Download.
+    const popOpen = elPop.style.display !== 'none';
+    if (popOpen && !forcePop && st.activeImg === img) {
+      elPop.style.setProperty('pointer-events', 'auto', 'important');
+      return;
+    }
 
     const edge = 10;
     const gap = 10;
@@ -529,6 +693,7 @@
     if (wasHidden) {
       elPop.style.visibility = '';
     }
+    const r = img.getBoundingClientRect();
     let left = r.left + gap;
     let top = r.top - ph - gap;
     if (top < edge) top = r.bottom + gap;
@@ -538,6 +703,8 @@
     if (top < edge) top = edge;
     elPop.style.left = `${Math.round(left)}px`;
     elPop.style.top = `${Math.round(top)}px`;
+    elPop.style.setProperty('pointer-events', 'auto', 'important');
+    elPop.style.setProperty('z-index', '2147483647', 'important');
   }
 
   async function fetchAsBlob(url) {
@@ -722,8 +889,8 @@
     const stem = fileStemFromImg(img, url);
     elTitle.textContent = stem;
     elSub.textContent = prettyUrl(url);
-    positionUi(img);
     setVisible(true);
+    positionUi(img, { forcePop: true });
   }
 
   let _boxes = [];
@@ -864,32 +1031,40 @@
 
   function onPointerMove(ev) {
     if (!st.enabled) return;
-    // Popover / iOS dropdown (including portaled menu) — keep UI stable.
-    // Only treat as "over UI" when the popover is actually visible; otherwise a
-    // stale hoveringUi / leave race after Close would block all future hovers.
+    const x = ev.clientX;
+    const y = ev.clientY;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+
     const popOpen = elPop.style.display !== 'none';
-    if (popOpen && (st.hoveringUi || pointerOverOurUi(ev))) {
+    // Recompute from geometry every move — don't sticky-lock open after pointerenter.
+    const overActive =
+      popOpen &&
+      (pointerOverOurUi(ev) || pointerOverActiveUi(x, y));
+
+    if (overActive) {
       st.hoveringUi = true;
+      st.hoveringImg = true;
       if (st.hideTimer) {
         clearTimeout(st.hideTimer);
         st.hideTimer = null;
       }
+      if (st.activeImg && isImgGood(st.activeImg)) positionHighlight(st.activeImg);
       return;
     }
+
     st.hoveringUi = false;
-    const x = ev.clientX;
-    const y = ev.clientY;
-    if (!Number.isFinite(x) || !Number.isFinite(y)) return;
     recomputeBoxes();
     const img = boxHit(x, y);
+
     if (!(img instanceof HTMLImageElement) || !isImgGood(img)) {
       st.hoveringImg = false;
       st.dismissedImg = null;
       clearPendingSwitch();
-      scheduleHide();
+      if (popOpen) scheduleHide();
       return;
     }
-    // User closed while on this image — wait until they leave it.
+
+    // User closed with X while on this image — wait until they leave it.
     if (st.dismissedImg && img === st.dismissedImg) {
       st.hoveringImg = false;
       clearPendingSwitch();
@@ -898,16 +1073,17 @@
     if (st.dismissedImg && img !== st.dismissedImg) {
       st.dismissedImg = null;
     }
+
     st.hoveringImg = true;
     if (st.hideTimer) {
       clearTimeout(st.hideTimer);
       st.hideTimer = null;
     }
 
-    // Same image already showing: just keep the outline aligned.
+    // Same image already showing: keep outline aligned; leave pop pinned.
     if (st.activeImg === img) {
       clearPendingSwitch();
-      positionUi(img);
+      positionHighlight(img);
       return;
     }
 
@@ -940,12 +1116,16 @@
   function onScrollReposition() {
     _lastBoxesAt = 0;
     if (st.enabled) recomputeBoxes();
-    if (st.enabled && st.activeImg && isImgGood(st.activeImg)) positionUi(st.activeImg);
+    if (st.enabled && st.activeImg && isImgGood(st.activeImg)) {
+      positionUi(st.activeImg, { forcePop: true });
+    }
   }
   function onResizeReposition() {
     _lastBoxesAt = 0;
     if (st.enabled) recomputeBoxes();
-    if (st.enabled && st.activeImg && isImgGood(st.activeImg)) positionUi(st.activeImg);
+    if (st.enabled && st.activeImg && isImgGood(st.activeImg)) {
+      positionUi(st.activeImg, { forcePop: true });
+    }
   }
 
   function removeOrphanImageHosts() {
@@ -1003,12 +1183,12 @@
   });
   elPop.addEventListener('pointerleave', (ev) => {
     // Moving into the portaled format menu still counts as our UI.
-    // Must use relatedTarget — composedPath always includes the element being left.
     if (pointerGoingToOurUi(ev)) {
       st.hoveringUi = true;
       return;
     }
     st.hoveringUi = false;
+    // If pointer is still on the image / bridge, onPointerMove will cancel the hide.
     scheduleHide();
   });
 
@@ -1017,7 +1197,19 @@
     ev.stopPropagation();
     dismissPopover(st.activeImg);
   });
-  elDl.addEventListener('click', () => void handleDownloadClick());
+  elDl.addEventListener('click', (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    void handleDownloadClick();
+  });
+  elDl.addEventListener('pointerdown', (ev) => {
+    ev.stopPropagation();
+    st.hoveringUi = true;
+  });
+  elPop.addEventListener('pointerdown', (ev) => {
+    ev.stopPropagation();
+    st.hoveringUi = true;
+  });
 
   function setEnabled(on) {
     st.enabled = !!on;
@@ -1044,6 +1236,7 @@
   }
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (!stillOwner()) return;
     if (!msg || !msg.type) return;
 
     if (msg.type === 'LIST_PAGE_IMAGES') {
@@ -1100,5 +1293,7 @@
     normalizeListScope,
     LIST_SCOPE_KEY,
   };
+  window.HLS_IMAGE_DL.__hlsAlive = extAlive;
+  window.__hlsGrabberImageHoverApi = window.HLS_IMAGE_DL;
 })();
 

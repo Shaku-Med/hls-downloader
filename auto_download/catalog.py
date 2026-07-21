@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import sys
 from typing import Dict, List
 
-from . import detect
+from . import detect, osinfo
 from .models import Package
 from .platform_cmds import (
     deno_plans,
@@ -15,33 +14,28 @@ from .platform_cmds import (
 )
 
 
-def _has_windows_pkg_manager() -> bool:
-    return detect.has_winget() or detect.has_choco()
-
-
-def _has_unix_pkg_manager() -> bool:
-    if sys.platform == "darwin":
-        return detect.has_brew()
-    return detect.has_apt()
-
-
 def _has_pkg_manager() -> bool:
-    if sys.platform == "win32":
-        return _has_windows_pkg_manager()
-    return _has_unix_pkg_manager()
+    return bool(osinfo.available_managers())
+
+
+def _pkg_manager_summary() -> str:
+    found = osinfo.available_managers()
+    if found:
+        return f"Found: {', '.join(found)}."
+    return "winget/Chocolatey on Windows, Homebrew on macOS, apt/dnf/pacman/zypper/apk on Linux."
 
 
 def build_catalog() -> List[Package]:
     packages: List[Package] = [
         Package(
             id="python",
-            title="Python 3",
+            title=f"Python {'.'.join(str(p) for p in osinfo.MIN_PYTHON)}+",
             summary="Runs the Stuff Grabber helper and installs yt-dlp.",
             required=True,
             detect=detect.has_python,
             prerequisites=("pkg_manager",),
             build_plans=python_plans,
-            missing_hint="Install Python 3 from https://www.python.org/downloads/ and enable Add to PATH.",
+            missing_hint=osinfo.manual_python_steps(),
         ),
         Package(
             id="pip",
@@ -56,7 +50,7 @@ def build_catalog() -> List[Package]:
         Package(
             id="pkg_manager",
             title="Package manager",
-            summary="winget/Chocolatey on Windows, Homebrew on macOS, or apt on Linux.",
+            summary=_pkg_manager_summary(),
             required=False,
             detect=_has_pkg_manager,
             build_plans=lambda: [],

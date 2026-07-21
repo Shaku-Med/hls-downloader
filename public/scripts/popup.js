@@ -240,14 +240,43 @@ function maybeAskYtdlpFormat(kind, probePayload, onPick, onCancel) {
 }
 
 /* ── Ready status dot ── */
-const ready = { hasPath: false, active: 0 };
+const ready = { hasPath: false, active: 0, helper: null };
 
 function updateReadyDot() {
   const dot = document.getElementById('status-dot');
   const title = document.getElementById('status-pop-title');
   const body = document.getElementById('status-pop-body');
   if (!dot) return;
-  dot.classList.remove('is-setup', 'is-busy');
+  dot.classList.remove('is-setup', 'is-busy', 'is-error');
+  const helper = ready.helper;
+  const helperBad =
+    helper &&
+    (helper.status === 'missing' ||
+      helper.status === 'error' ||
+      helper.status === 'degraded' ||
+      helper.ok === false);
+
+  if (helperBad) {
+    dot.classList.add(helper.status === 'degraded' ? 'is-setup' : 'is-error');
+    if (title) {
+      title.textContent =
+        helper.status === 'missing'
+          ? 'Helper missing'
+          : helper.status === 'degraded'
+            ? 'Helper needs attention'
+            : 'Helper error';
+    }
+    if (body) {
+      let msg =
+        helper.error ||
+        (helper.status === 'missing'
+          ? 'Install the download helper, then fully restart the browser.'
+          : 'Open Helper on this PC for ffmpeg / yt-dlp / install steps.');
+      if (!ready.hasPath) msg += ' Also pick a save folder in Settings.';
+      body.textContent = msg;
+    }
+    return;
+  }
   if (!ready.hasPath) {
     dot.classList.add('is-setup');
     if (title) title.textContent = 'One quick thing first';
@@ -279,9 +308,25 @@ function setPathBar(userDownloadPath) {
     el.textContent = `Saving to ${short}`;
     el.classList.remove('path-missing');
   } else {
-    el.textContent = 'No save folder picked yet. Choose one in Settings.';
+    el.textContent = 'No save folder yet. Pick one in Settings.';
     el.classList.add('path-missing');
   }
+}
+
+function refreshHelperHealthForPopup() {
+  chrome.runtime.sendMessage({ type: 'GET_HELPER_HEALTH' }, (res) => {
+    if (chrome.runtime.lastError) {
+      ready.helper = {
+        ok: false,
+        status: 'error',
+        error: chrome.runtime.lastError.message,
+      };
+      updateReadyDot();
+      return;
+    }
+    ready.helper = res || { ok: false, status: 'error', error: 'No response' };
+    updateReadyDot();
+  });
 }
 
 function renderJobsBanner(jobs, meta) {
@@ -670,21 +715,27 @@ function streamSourceBadge(stream, kind) {
   return { text: kind || 'stream', mod: 'traffic' };
 }
 
-function shortStreamUrl(url) {
-  const raw = String(url || '').trim();
-  if (!raw) return '';
-  try {
-    const u = new URL(raw);
-    const path = (u.pathname || '/').replace(/\/$/, '') || '/';
-    const keep = [];
-    if (u.searchParams.get('v')) keep.push(`v=${u.searchParams.get('v')}`);
-    if (u.searchParams.get('list')) keep.push('list=…');
-    const q = keep.length ? `?${keep.join('&')}` : '';
-    const s = `${u.host}${path}${q}`;
-    return s.length > 56 ? s.slice(0, 54) + '…' : s;
-  } catch (_) {
-    return raw.length > 56 ? raw.slice(0, 54) + '…' : raw;
+function makeExpandableUrl(url, className, maxLen) {
+  const api = (typeof HGR_THEME !== 'undefined' && HGR_THEME.createExpandableUrl)
+    || (typeof globalThis !== 'undefined' && globalThis.HGR_THEME && globalThis.HGR_THEME.createExpandableUrl);
+  if (typeof api === 'function') {
+    return api(url, { className: className || 'url-expand', maxLen: maxLen || 72 });
   }
+  // Fallback if theme helpers failed to load.
+  const wrap = document.createElement('div');
+  wrap.className = className || 'url-expand';
+  const text = document.createElement('div');
+  text.className = 'url-expand-text';
+  text.textContent = String(url || '');
+  wrap.appendChild(text);
+  return {
+    el: wrap,
+    textEl: text,
+    getUrl: () => String(url || ''),
+    setUrl(next) {
+      text.textContent = String(next || '');
+    },
+  };
 }
 
 function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
@@ -868,12 +919,9 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
       badge.textContent = 'page link';
       titleRow.appendChild(badge);
       titleRow.appendChild(input);
-      const urlLine = document.createElement('div');
-      urlLine.className = 'link-card-url';
-      urlLine.textContent = shortStreamUrl(url);
-      urlLine.title = url;
+      const urlView = makeExpandableUrl(url, 'url-expand link-card-url', 56);
       main.appendChild(titleRow);
-      main.appendChild(urlLine);
+      main.appendChild(urlView.el);
       const thumbLab = document.createElement('label');
       thumbLab.className = 'stream-thumb-label link-card-thumb';
       const tcb = document.createElement('input');
@@ -918,17 +966,15 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
 
       const urlEl = document.createElement('div');
       urlEl.className = 'stream-url';
-      const link = document.createElement('div');
-      link.className = 'stream-page-link';
-      link.textContent = url;
+      const urlView = makeExpandableUrl(url, 'url-expand stream-page-link', 80);
       if (pageOnly) {
         const intro = document.createElement('div');
         intro.className = 'stream-page-intro';
         intro.textContent = isAppleMusicPage
           ? 'Apple Music: yt-dlp uses the song page URL below (not the FairPlay m3u8 stream).'
-          : 'This tab’s post URL. Playlist params are kept — use Clean URL to strip tracking.';
+          : 'This tab’s post URL. Playlist bits stay on. Tap Clean URL if you want tracking junk removed.';
         urlEl.appendChild(intro);
-        urlEl.appendChild(link);
+        urlEl.appendChild(urlView.el);
         // Clean URL only on the main tab item (not page links).
         if (urlSource === 'tab' && cleanedUrl && cleanedUrl !== url) {
           const cleanBtn = document.createElement('button');
@@ -938,14 +984,14 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
           cleanBtn.title = 'Strip tracking junk (keeps playlist list= / video id)';
           cleanBtn.addEventListener('click', () => {
             url = cleanedUrl;
-            link.textContent = url;
+            urlView.setUrl(url);
             cleanBtn.disabled = true;
             cleanBtn.textContent = 'Cleaned';
           });
           urlEl.appendChild(cleanBtn);
         }
       } else {
-        urlEl.appendChild(link);
+        urlEl.appendChild(urlView.el);
       }
 
       const field = document.createElement('div');
@@ -1247,6 +1293,7 @@ function loadUi() {
   if (window.HGR_THEME && window.HGR_THEME.initExtensionPageTheme) {
     window.HGR_THEME.initExtensionPageTheme();
   }
+  refreshHelperHealthForPopup();
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     const tab = tabs && tabs[0] ? tabs[0] : null;
     const activeUrl = tab ? tab.url || '' : '';
@@ -1388,15 +1435,20 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
   });
 })();
 
-/* ── Record video elements ── */
+/* ── Record video elements (HLS_IOS_SELECT dropdown) ── */
 (function initRecordUi() {
   const btn = document.getElementById('record-btn');
   const label = document.getElementById('record-btn-label');
   const statusEl = document.getElementById('record-status');
-  if (!btn || !label || !statusEl) return;
+  const row = document.getElementById('record-row');
+  const selectEl = document.getElementById('record-select');
+  if (!btn || !label || !statusEl || !row || !selectEl) return;
 
   let isRecording = false;
   let pollTimer = null;
+  let videos = [];
+  let selectedIndex = 0;
+  let selectEnhanced = false;
 
   function setStatus(text) {
     if (text) {
@@ -1408,15 +1460,14 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
     }
   }
 
-  function sendToTab(action, cb) {
+  function sendToTab(action, cb, extra) {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs && tabs[0];
       if (!tab || !tab.id) { cb({ ok: false, error: 'No active tab' }); return; }
-      chrome.tabs.sendMessage(tab.id, { type: 'VIDEO_RECORDER', action }, (res) => {
+      const msg = Object.assign({ type: 'VIDEO_RECORDER', action }, extra || {});
+      chrome.tabs.sendMessage(tab.id, msg, (res) => {
         if (chrome.runtime.lastError) {
-          // Content script isn't present here (browser-internal page, web store,
-          // PDF viewer) or the page predates the extension being installed/updated.
-          cb({ ok: false, error: "I can't record on this page. Try reloading it, or it might be one the browser keeps locked down." });
+          cb({ ok: false, error: "I can't record on this page. Try reloading it. Some browser pages just won't allow it." });
           return;
         }
         cb(res || { ok: false });
@@ -1430,16 +1481,76 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
     return `${m}:${String(s).padStart(2, '0')}`;
   }
 
+  function shortLabel(text, max) {
+    const t = String(text || 'Video').trim();
+    const n = max || 42;
+    return t.length > n ? `${t.slice(0, n - 1)}…` : t;
+  }
+
+  function ensureSelectEnhanced() {
+    if (selectEnhanced) return;
+    if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+      HLS_IOS_SELECT.enhance(selectEl, { compact: true, className: 'rec-ios-select' });
+      selectEnhanced = true;
+    }
+  }
+
+  function fillSelect() {
+    const prev = String(selectedIndex);
+    selectEl.textContent = '';
+    if (!videos.length) {
+      const opt = document.createElement('option');
+      opt.value = '0';
+      opt.textContent = 'No videos right now';
+      selectEl.appendChild(opt);
+      selectEl.disabled = true;
+    } else {
+      selectEl.disabled = isRecording;
+      videos.forEach((v) => {
+        const opt = document.createElement('option');
+        opt.value = String(v.index);
+        if (videos.length === 1) opt.textContent = '1 video on this page';
+        else opt.textContent = `${v.index + 1}. ${shortLabel(v.label, 48)}`;
+        selectEl.appendChild(opt);
+      });
+      selectEl.value = prev;
+      if (selectEl.selectedIndex < 0) selectEl.selectedIndex = 0;
+      selectedIndex = Number(selectEl.value) || 0;
+    }
+    ensureSelectEnhanced();
+    try {
+      selectEl.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function applyVideoList(res) {
+    videos = Array.isArray(res && res.videos) ? res.videos : [];
+    const pref = Number.isFinite(Number(res && res.preferredStartIndex))
+      ? Number(res.preferredStartIndex)
+      : selectedIndex;
+    selectedIndex = videos.length
+      ? Math.max(0, Math.min(videos.length - 1, pref | 0))
+      : 0;
+    fillSelect();
+  }
+
   function enterRecordingUi() {
     isRecording = true;
     btn.classList.add('is-recording');
     label.textContent = 'Stop';
+    selectEl.disabled = true;
+    if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.closeAll) {
+      try { HLS_IOS_SELECT.closeAll(); } catch (_) { /* ignore */ }
+    }
     if (!pollTimer) pollTimer = setInterval(updateStatus, 1000);
   }
   function exitRecordingUi() {
     isRecording = false;
     btn.classList.remove('is-recording');
     label.textContent = 'Rec';
+    selectEl.disabled = !videos.length;
     if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   }
 
@@ -1453,31 +1564,34 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
       const paused = act.filter((a) => a.gate && a.gate !== 'rec');
       if (paused.length) {
         const reasons = paused.map((a) => a.reason || a.gate);
-        const why = reasons.includes('buffer') ? 'buffering'
-          : reasons.includes('resize') ? 'resizing, so try not to resize the window'
-          : reasons.includes('seek') ? 'you skipped ahead, it picks back up on play'
-          : reasons.includes('hidden') ? 'tab is hidden, come back to it to resume'
+        const why = reasons.includes('buffer') ? 'waiting for the video to catch up'
+          : reasons.includes('resize') ? 'you resized the window'
+          : reasons.includes('seek') ? 'you skipped ahead (hit play to continue)'
+          : reasons.includes('hidden') ? 'this tab is in the background'
           : 'waiting for playback';
-        setStatus(`⏸ Paused (${why})`);
+        setStatus(`Paused for a sec (${why})`);
         return;
       }
       const total = res.total || res.queueTotal || act.length;
       const pos = res.position || 1;
       if (res.sequential && total > 1) {
-        const label = act[0] ? act[0].label : 'video';
+        const aLabel = act[0] ? act[0].label : 'video';
         const elapsed = act[0] ? fmt(act[0].elapsed) : '';
-        setStatus(`● Recording ${pos} of ${total}${elapsed ? ` · ${elapsed}` : ''} · ${label}`);
+        setStatus(`Recording ${pos} of ${total}${elapsed ? `, ${elapsed}` : ''} on ${aLabel}`);
       } else {
-        let txt = `● Recording ${act.length} video${act.length > 1 ? 's' : ''}`;
-        if (act.length === 1) txt += ` · ${fmt(act[0].elapsed)}`;
+        let txt = `Recording ${act.length} video${act.length > 1 ? 's' : ''}`;
+        if (act.length === 1) txt += `, ${fmt(act[0].elapsed)}`;
         setStatus(txt);
       }
     });
   }
 
   function setRecordUiVisible(visible) {
-    btn.hidden = !visible;
-    if (!visible) setStatus('');
+    row.hidden = !visible;
+    if (!visible) {
+      setStatus('');
+      videos = [];
+    }
   }
 
   function scanAndUpdate() {
@@ -1486,18 +1600,39 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
         setRecordUiVisible(false);
         return;
       }
+      applyVideoList(res);
       if (res.recording) {
         setRecordUiVisible(true);
         enterRecordingUi();
         updateStatus();
       } else if (res.count > 0) {
         setRecordUiVisible(true);
-        setStatus(`${res.count} video${res.count > 1 ? 's' : ''} on this page`);
+        if (!statusEl.textContent || statusEl.hidden) {
+          setStatus(
+            res.count === 1
+              ? 'Found 1 video. Hit Rec when you’re ready, or open the list to peek at it.'
+              : `Found ${res.count} videos. Pick which one to start with, then hit Rec.`
+          );
+        }
       } else {
         setRecordUiVisible(false);
       }
     });
   }
+
+  selectEl.addEventListener('change', () => {
+    const idx = Number(selectEl.value);
+    if (!Number.isFinite(idx)) return;
+    selectedIndex = idx;
+    if (isRecording) return;
+    sendToTab('focus', (res) => {
+      if (!res || !res.ok) {
+        setStatus(res?.error || 'Couldn’t find that video. Try again.');
+        return;
+      }
+      setStatus(`Got it. Brought you to “${shortLabel(res.label, 48)}”.`);
+    }, { index: idx });
+  });
 
   btn.addEventListener('click', () => {
     if (isRecording) {
@@ -1513,26 +1648,28 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
       });
     } else {
       btn.disabled = true;
+      if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.closeAll) {
+        try { HLS_IOS_SELECT.closeAll(); } catch (_) { /* ignore */ }
+      }
       sendToTab('start', (res) => {
         btn.disabled = false;
         if (res && res.ok) {
           enterRecordingUi();
           if (res.sequential && res.total > 1) {
             setStatus(
-              `● Recording 1 of ${res.total} (one at a time` +
-                (res.remaining ? `, ${res.remaining} queued` : '') +
-                ')'
+              `Recording 1 of ${res.total}` +
+                (res.remaining ? ` (${res.remaining} waiting in line)` : '')
             );
           } else {
             const fail = (res.details || []).filter((d) => !d.ok);
-            let msg = `● Recording ${res.count} of ${res.total} video${res.total > 1 ? 's' : ''}`;
-            if (fail.length) msg += ` · ${fail.length} skipped`;
+            let msg = `Recording ${res.count} of ${res.total} video${res.total > 1 ? 's' : ''}`;
+            if (fail.length) msg += ` (${fail.length} skipped)`;
             setStatus(msg);
           }
         } else {
-          setStatus(res?.error || 'Could not start recording');
+          setStatus(res?.error || 'Couldn’t start recording');
         }
-      });
+      }, { startIndex: selectedIndex });
     }
   });
 

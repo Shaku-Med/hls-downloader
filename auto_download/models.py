@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Mapping, Optional, Sequence
 
 
 class InstallStatus(str, Enum):
@@ -17,6 +17,7 @@ class CommandPlan:
     label: str
     argv: Sequence[str]
     shell: bool = False
+    env: Optional[Mapping[str, str]] = None
 
     def display(self) -> str:
         if self.shell:

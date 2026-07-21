@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Stuff Grabber",
-  "version": "1.0.2",
+  "version": "1.3.5",
   "description": "Grabs HLS, DASH, direct video URLs, and page images; saves via helper tools",
   "permissions": [
     "webRequest",
@@ -54,8 +54,11 @@
         "public/scripts/yt-page-helpers.js",
         "public/scripts/ffmpeg-preset-helpers.js",
         "public/scripts/image-hover-download.js",
-        "public/scripts/fab.js",
-        "public/scripts/video-recorder.js"
+        "public/scripts/video-recorder.js",
+        "public/scripts/fab.js"
+      ],
+      "css": [
+        "style/modal-theme.css"
       ],
       "run_at": "document_idle"
     }
@@ -67,6 +70,8 @@
         "asset/icon-32.png",
         "asset/icon-48.png",
         "asset/icon-128.png",
+        "style/app-theme-base.css",
+        "style/shared-ui.css",
         "style/fab.css",
         "style/modal-theme.css",
         "style/ios-select.css"

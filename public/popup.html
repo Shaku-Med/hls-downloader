@@ -29,10 +29,15 @@
             </svg>
           </button>
         </div>
-        <p class="brand-sub" id="context-line">Give it a name, or I'll borrow the page title.</p>
+        <p class="brand-sub" id="context-line">Name your file, or I’ll borrow the page title.</p>
       </div>
       <div class="settings-row">
         <div id="path-line" class="path-line">Checking your save folder…</div>
+      </div>
+      <div class="record-row" id="record-row" hidden>
+        <div class="record-select-wrap">
+          <select id="record-select" class="rec-video-select" aria-label="Choose which video to record first"></select>
+        </div>
         <button type="button" id="record-btn" class="record-mini" title="Record whatever's playing on this page">
           <span class="rec-dot"></span>
           <span id="record-btn-label">Rec</span>
@@ -41,14 +46,15 @@
       <div id="record-status" class="record-status" hidden></div>
     </header>
 
-    <section id="download-banner" class="jobs-panel" hidden></section>
-
-    <main id="content" class="streams-panel">
-      <div id="streams-root">
-        <div class="empty"><strong>Loading</strong>Hang tight…</div>
-      </div>
-      <div id="images-root" class="images-root" hidden></div>
-    </main>
+    <div class="popup-body">
+      <section id="download-banner" class="jobs-panel" hidden></section>
+      <main id="content" class="streams-panel">
+        <div id="streams-root">
+          <div class="empty"><strong>Loading</strong>Hang tight…</div>
+        </div>
+        <div id="images-root" class="images-root" hidden></div>
+      </main>
+    </div>
 
     <footer class="footer">Up to 4 downloads at once. The rest wait their turn across your tabs.</footer>
   </div>

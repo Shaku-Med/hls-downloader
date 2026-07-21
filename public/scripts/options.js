@@ -1,6 +1,7 @@
 const KEY = 'userDownloadPath';
 const FLOAT_KEY = 'floatGrabberEnabled';
 const IMG_DL_KEY = 'imageHoverDownloadEnabled';
+const REC_DETACH_KEY = 'recordDetachVideoEnabled';
 const YTDLP_MODE_KEY = 'ytDlpQualityMode';
 const FFMPEG_PRESET_MODE_KEY = 'ffmpegPresetMode';
 const YTDLP_MAX_H_KEY = 'ytDlpMaxHeight';
@@ -19,11 +20,11 @@ function syncAccentRowVisibility() {
   const row = document.getElementById('ui-theme-accent-row');
   if (!modeEl || !row) return;
   const mode = modeEl.value || 'system';
-  row.hidden = mode === 'system' || mode === 'page';
+  row.hidden = mode === 'page';
 }
 
 function load() {
-  chrome.storage.local.get([KEY, FLOAT_KEY, IMG_DL_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
+  chrome.storage.local.get([KEY, FLOAT_KEY, IMG_DL_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
     const err = chrome.runtime.lastError;
     if (err) {
       showStatus(String(err), 'err');
@@ -34,6 +35,8 @@ function load() {
     if (floatEl) floatEl.checked = data[FLOAT_KEY] !== false;
     const imgDlEl = document.getElementById('img-dl-on');
     if (imgDlEl) imgDlEl.checked = data[IMG_DL_KEY] === true; // default OFF
+    const recDetachEl = document.getElementById('rec-detach-on');
+    if (recDetachEl) recDetachEl.checked = data[REC_DETACH_KEY] !== false; // default ON
     const qEl = document.getElementById('ytdlp-quality');
     if (qEl) qEl.value = data[YTDLP_MODE_KEY] === 'ask' ? 'ask' : 'auto';
     const fpEl = document.getElementById('ffmpeg-preset-mode');
@@ -107,6 +110,13 @@ const imgDlOn = document.getElementById('img-dl-on');
 if (imgDlOn) {
   imgDlOn.addEventListener('change', () => {
     chrome.storage.local.set({ [IMG_DL_KEY]: !!imgDlOn.checked });
+  });
+}
+
+const recDetachOn = document.getElementById('rec-detach-on');
+if (recDetachOn) {
+  recDetachOn.addEventListener('change', () => {
+    chrome.storage.local.set({ [REC_DETACH_KEY]: !!recDetachOn.checked });
   });
 }
 

@@ -12,47 +12,60 @@
     '--accent',
     '--accent-2',
     '--btnText',
+    '--fill',
+    '--fill-secondary',
+    '--danger',
+    '--shadow',
   ];
 
+  // Keep in sync with style/app-theme-base.css (single source of truth for the app look).
   const FIXED = {
     dark: {
-      bg: '#0f1117',
-      surface: '#161b27',
-      surface2: '#131926',
-      text: '#e6e9ef',
-      muted: '#95a2bb',
-      line: '#293043',
-      btnText: '#f8fbff',
-      accent: '#4f8cff',
-      accent2: '#3574f0',
+      bg: '#000000',
+      surface: '#1c1c1e',
+      surface2: '#2c2c2e',
+      text: '#ffffff',
+      muted: '#8e8e93',
+      line: 'rgba(84, 84, 88, 0.65)',
+      btnText: '#ffffff',
+      accent: '#0a84ff',
+      accent2: '#409cff',
+      fill: 'rgba(120, 120, 128, 0.32)',
+      fillSecondary: 'rgba(120, 120, 128, 0.24)',
+      danger: '#ff453a',
+      shadow: '0 16px 48px rgba(0, 0, 0, 0.5)',
     },
     light: {
-      bg: '#f4f6fb',
+      bg: '#f2f2f7',
       surface: '#ffffff',
-      surface2: '#eef2fb',
-      text: '#0f172a',
-      muted: '#475569',
-      line: '#d8e0ef',
+      surface2: '#ffffff',
+      text: '#000000',
+      muted: '#8e8e93',
+      line: 'rgba(60, 60, 67, 0.18)',
       btnText: '#ffffff',
-      accent: '#2563eb',
-      accent2: '#1d4ed8',
+      accent: '#007aff',
+      accent2: '#0a84ff',
+      fill: 'rgba(120, 120, 128, 0.16)',
+      fillSecondary: 'rgba(120, 120, 128, 0.12)',
+      danger: '#ff3b30',
+      shadow: '0 12px 40px rgba(0, 0, 0, 0.18)',
     },
   };
 
   const ACCENTS = {
-    blue: ['#2563eb', '#1d4ed8'],
-    violet: ['#8b5cf6', '#7c3aed'],
-    emerald: ['#10b981', '#059669'],
-    rose: ['#f43f5e', '#e11d48'],
-    orange: ['#f97316', '#ea580c'],
+    blue: ['#007aff', '#0a84ff'],
+    violet: ['#af52de', '#bf5af2'],
+    emerald: ['#34c759', '#30d158'],
+    rose: ['#ff2d55', '#ff375f'],
+    orange: ['#ff9500', '#ff9f0a'],
   };
 
   const DARK_ACCENTS = {
-    blue: ['#4f8cff', '#3574f0'],
-    violet: ['#8b5cf6', '#7c3aed'],
-    emerald: ['#10b981', '#059669'],
-    rose: ['#f43f5e', '#e11d48'],
-    orange: ['#f97316', '#ea580c'],
+    blue: ['#0a84ff', '#409cff'],
+    violet: ['#bf5af2', '#da8fff'],
+    emerald: ['#30d158', '#63e689'],
+    rose: ['#ff375f', '#ff6482'],
+    orange: ['#ff9f0a', '#ffb340'],
   };
 
   function hslToRgb(h, s, l, a) {
@@ -767,6 +780,10 @@
       accent: '--accent',
       accent2: '--accent-2',
       btnText: '--btnText',
+      fill: '--fill',
+      fillSecondary: '--fill-secondary',
+      danger: '--danger',
+      shadow: '--shadow',
     };
     Object.entries(vars).forEach(([key, cssVar]) => {
       if (palette[key] != null) el.style.setProperty(cssVar, palette[key]);
@@ -780,12 +797,15 @@
       const palette = derivePalette(readPageColors());
       applyPaletteToElement(host, palette, varMap);
       host.setAttribute('data-theme', palette.theme);
+      host.removeAttribute('data-accent');
       return palette.theme;
     }
     const resolved = mode === 'light' || mode === 'dark' ? mode : resolveThemeMode(mode);
-    const useAccent = mode === 'light' || mode === 'dark';
-    applyPaletteToElement(host, fixedPalette(resolved, accent, useAccent), varMap);
+    const accentKey = accent || 'blue';
+    // Always honor color scheme for system / light / dark so FAB matches Settings.
+    applyPaletteToElement(host, fixedPalette(resolved, accentKey, true), varMap);
     host.setAttribute('data-theme', resolved);
+    host.setAttribute('data-accent', accentKey);
     return resolved;
   }
 
@@ -798,21 +818,17 @@
     if (!root) return;
     root.setAttribute('data-theme', resolved);
     root.setAttribute('data-theme-mode', mode || 'system');
-    const useAccent = mode === 'light' || mode === 'dark';
-    if (useAccent) {
-      root.setAttribute('data-accent', accent || 'blue');
-      clearCustomThemeVars(root);
+    if (mode === 'page') {
+      root.removeAttribute('data-accent');
+      if (colors) {
+        applyPaletteToElement(root, colors);
+      } else {
+        applyPaletteToElement(root, fixedPalette(resolved, 'blue', false));
+      }
       return;
     }
-    root.removeAttribute('data-accent');
-    if (mode === 'page' && colors) {
-      applyPaletteToElement(root, colors);
-      return;
-    }
-    if (mode === 'system') {
-      applyPaletteToElement(root, fixedPalette(resolved, 'blue', false));
-      return;
-    }
+    // light / dark / system → same CSS tokens as Settings (data-theme + data-accent).
+    root.setAttribute('data-accent', accent || 'blue');
     clearCustomThemeVars(root);
   }
 
@@ -851,11 +867,10 @@
 
   function applyUiThemeToDocument(mode, accent) {
     const root = document.documentElement;
-    const useAccent = mode === 'light' || mode === 'dark';
-    const effectiveAccent = useAccent ? accent || 'blue' : 'blue';
+    const effectiveAccent = accent || 'blue';
     const systemFallback = () => {
       const resolved = resolveThemeMode('system');
-      setResolvedThemeOnRoot(root, resolved, 'page', null, fixedPalette(resolved, 'blue', false));
+      setResolvedThemeOnRoot(root, resolved, 'system', effectiveAccent, null);
     };
 
     if (mode === 'page') {
@@ -979,45 +994,200 @@
       _pickerStylesReady = true;
       return;
     }
+    // Manifest content_scripts.css injects modal-theme.css (CSP-safe on Firefox).
+    // Also try a document <link> for Chromium / extension pages.
     try {
       const link = document.createElement('link');
       link.id = 'hgr-picker-theme-css';
       link.rel = 'stylesheet';
       link.href = chrome.runtime.getURL('style/modal-theme.css');
-      document.head.appendChild(link);
-      _pickerStylesReady = true;
+      (document.head || document.documentElement).appendChild(link);
     } catch (_) {
-      _pickerStylesReady = true;
+      // ignore
+    }
+    _pickerStylesReady = true;
+  }
+
+  const _cssTextCache = new Map();
+
+  function fetchExtensionCss(relPath) {
+    const url = chrome.runtime.getURL(relPath);
+    if (_cssTextCache.has(url)) return Promise.resolve(_cssTextCache.get(url));
+    return fetch(url)
+      .then((r) => {
+        if (!r.ok) throw new Error(`css ${r.status}`);
+        return r.text();
+      })
+      .then((text) => {
+        _cssTextCache.set(url, text);
+        return text;
+      });
+  }
+
+  function appendStyleTag(root, cssText, key) {
+    if (!root || cssText == null) return false;
+    try {
+      if (key && root.querySelector) {
+        const sel = `style[data-hgr-css="${String(key).replace(/"/g, '')}"]`;
+        if (root.querySelector(sel)) return true;
+      }
+      const style = document.createElement('style');
+      if (key) style.setAttribute('data-hgr-css', String(key));
+      style.textContent = String(cssText);
+      root.appendChild(style);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * Apply CSS to a ShadowRoot (or element) in a Firefox-CSP-safe way.
+   * Prefer constructable stylesheets; fall back to <style> text.
+   */
+  function adoptCssText(root, cssText, key) {
+    if (!root || cssText == null || String(cssText).trim() === '') {
+      return Promise.resolve(false);
+    }
+    const text = String(cssText);
+    try {
+      if (typeof CSSStyleSheet !== 'undefined' && root.adoptedStyleSheets != null) {
+        const sheet = new CSSStyleSheet();
+        const apply = () => {
+          try {
+            root.adoptedStyleSheets = [...root.adoptedStyleSheets, sheet];
+            return true;
+          } catch (_) {
+            return appendStyleTag(root, text, key);
+          }
+        };
+        if (typeof sheet.replace === 'function') {
+          return sheet
+            .replace(text)
+            .then(apply)
+            .catch(() => appendStyleTag(root, text, key));
+        }
+        try {
+          sheet.replaceSync(text);
+          return Promise.resolve(apply());
+        } catch (_) {
+          // fall through
+        }
+      }
+    } catch (_) {
+      // fall through
+    }
+    return Promise.resolve(appendStyleTag(root, text, key));
+  }
+
+  function adoptExtensionCss(root, relPaths) {
+    const paths = (Array.isArray(relPaths) ? relPaths : [relPaths]).filter(Boolean);
+    return Promise.all(
+      paths.map((p) =>
+        fetchExtensionCss(p)
+          .then((text) => adoptCssText(root, text, p))
+          .catch(() => false)
+      )
+    );
+  }
+
+  /** Move existing <style> tags into adoptedStyleSheets when possible (Firefox CSP). */
+  function promoteInlineStyles(root) {
+    if (!root || !root.querySelectorAll) return Promise.resolve();
+    const nodes = Array.prototype.slice.call(root.querySelectorAll('style'));
+    return Promise.all(
+      nodes.map((el, i) => {
+        const text = el.textContent || '';
+        if (!String(text).trim()) return Promise.resolve();
+        const key = el.getAttribute('data-hgr-css') || el.getAttribute('data-hls-fab-fallback') || `inline-${i}`;
+        return adoptCssText(root, text, key).then((ok) => {
+          if (ok) {
+            try {
+              el.remove();
+            } catch (_) {
+              // ignore
+            }
+          }
+        });
+      })
+    );
+  }
+
+  function hardenModalOverlay(overlay) {
+    if (!overlay || !overlay.style) return;
+    const s = overlay.style;
+    s.setProperty('position', 'fixed', 'important');
+    s.setProperty('inset', '0', 'important');
+    s.setProperty('left', '0', 'important');
+    s.setProperty('top', '0', 'important');
+    s.setProperty('right', '0', 'important');
+    s.setProperty('bottom', '0', 'important');
+    s.setProperty('width', '100%', 'important');
+    s.setProperty('height', '100%', 'important');
+    s.setProperty('z-index', '2147483647', 'important');
+    s.setProperty('display', 'flex', 'important');
+    s.setProperty('align-items', 'center', 'important');
+    s.setProperty('justify-content', 'center', 'important');
+    s.setProperty('padding', '24px', 'important');
+    s.setProperty('box-sizing', 'border-box', 'important');
+    s.setProperty('pointer-events', 'auto', 'important');
+    s.setProperty('margin', '0', 'important');
+    if (!s.background && !s.backgroundColor) {
+      s.setProperty('background', 'rgba(0, 0, 0, 0.48)', 'important');
+    }
+  }
+
+  function hardenModalBox(box) {
+    if (!box || !box.style) return;
+    const s = box.style;
+    s.setProperty('position', 'relative', 'important');
+    s.setProperty('z-index', '1', 'important');
+    s.setProperty('pointer-events', 'auto', 'important');
+    s.setProperty('max-width', 'min(400px, calc(100vw - 32px))', 'important');
+    s.setProperty('width', '100%', 'important');
+    s.setProperty('box-sizing', 'border-box', 'important');
+    s.setProperty('border-radius', '16px', 'important');
+    s.setProperty('padding', '20px', 'important');
+    if (!s.background && !s.backgroundColor) {
+      s.setProperty('background', '#1c1c1e', 'important');
+      s.setProperty('color', '#fff', 'important');
     }
   }
 
   /**
    * Shared choice sheet — same modal chrome as ffmpeg / quality dialogs.
+   * Always an in-page overlay (popup, options, floater, content scripts).
    * @param {{
    *   title: string,
    *   subtitle?: string,
-   *   choices: Array<{ id: string, label: string, primary?: boolean }>,
+   *   detail?: string,
+   *   choices: Array<{ id: string, label: string, primary?: boolean, danger?: boolean }>,
    *   cancelLabel?: string,
    *   mount?: ParentNode | null,
+   *   forcePageOverlay?: boolean,
    * }} opts
    * @param {(id: string | null) => void} callback — null = canceled
    */
   function showChoicePicker(opts, callback) {
-    ensurePickerStyles();
     const title = (opts && opts.title) || 'Choose';
     const subtitle = (opts && opts.subtitle) || '';
+    const detail = (opts && opts.detail) || '';
     const choices = (opts && opts.choices) || [];
     const cancelLabel = (opts && opts.cancelLabel) || 'Cancel';
+
+    ensurePickerStyles();
     const mount = (opts && opts.mount) || document.documentElement || document.body;
     const overlay = document.createElement('div');
     // Use the same classes as ffmpeg-preset dialogs so theme tokens / CSS match.
     overlay.className = 'hgr-modal-overlay';
+    hardenModalOverlay(overlay);
     let offLive = () => {};
     let settled = false;
     applyStoredThemeToElement(overlay, () => {
       offLive = bindLiveOverlayTheme(overlay);
       const box = document.createElement('div');
       box.className = 'hgr-modal-box';
+      hardenModalBox(box);
       const h = document.createElement('div');
       h.className = 'hgr-modal-title';
       h.textContent = title;
@@ -1037,7 +1207,11 @@
       for (const c of choices) {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = c.primary ? 'hgr-modal-btn-primary' : 'hgr-modal-btn-secondary';
+        b.className = c.primary
+          ? 'hgr-modal-btn-primary'
+          : c.danger
+            ? 'hgr-modal-btn-danger'
+            : 'hgr-modal-btn-secondary';
         b.textContent = c.label;
         b.addEventListener('click', () => finish(c.id));
         form.appendChild(b);
@@ -1050,6 +1224,12 @@
       form.appendChild(cancel);
       box.appendChild(h);
       box.appendChild(sub);
+      if (detail) {
+        const detailEl = document.createElement('div');
+        detailEl.className = 'hgr-modal-detail';
+        detailEl.textContent = detail;
+        box.appendChild(detailEl);
+      }
       box.appendChild(form);
       overlay.appendChild(box);
       overlay.addEventListener('click', (ev) => {
@@ -1109,7 +1289,7 @@
           { id: 'no', label: 'No, videos only' },
         ],
         cancelLabel: 'Cancel',
-        mount: mount || document.body,
+        mount: mount || document.documentElement || document.body,
       },
       (id) => {
         if (id === 'yes') callback(true);
@@ -1277,6 +1457,7 @@
       applyPaletteToElement(host, palette, varMap);
       host.setAttribute('data-theme', palette.theme);
       host.setAttribute('data-theme-mode', 'page');
+      host.removeAttribute('data-accent');
       if (onApplied) onApplied(palette.theme, 'page');
     };
 
@@ -1441,6 +1622,160 @@
     }
   }
 
+  /**
+   * Assign HTML into a node even on pages that enforce Trusted Types.
+   * Falls back to DOMParser + importNode when innerHTML assignment is blocked.
+   * Never throws — leaves the node unchanged/cleared on total failure.
+   */
+  function setNodeHtml(node, html) {
+    if (!node) return false;
+    const raw = String(html == null ? '' : html);
+    const clear = () => {
+      while (node.firstChild) node.removeChild(node.firstChild);
+    };
+    if (!raw) {
+      clear();
+      return true;
+    }
+
+    const tryAssign = (value) => {
+      node.innerHTML = value;
+    };
+
+    try {
+      const tt = typeof trustedTypes !== 'undefined' ? trustedTypes : null;
+      if (tt) {
+        let policy = tt.defaultPolicy || null;
+        if (!policy && typeof tt.createPolicy === 'function') {
+          try {
+            policy = tt.createPolicy('stuff-grabber', {
+              createHTML: (s) => s,
+              createScript: (s) => s,
+              createScriptURL: (s) => s,
+            });
+          } catch (_) {
+            // Page CSP may only allow specific policy names.
+          }
+        }
+        if (policy && typeof policy.createHTML === 'function') {
+          tryAssign(policy.createHTML(raw));
+          return true;
+        }
+      }
+      tryAssign(raw);
+      return true;
+    } catch (_) {
+      // Trusted Types / CSP blocked string assignment.
+    }
+
+    try {
+      clear();
+      const parsed = new DOMParser().parseFromString(
+        `<body><div id="__sg_root">${raw}</div></body>`,
+        'text/html'
+      );
+      const root = parsed.getElementById('__sg_root');
+      if (!root) return false;
+      const owner = node.ownerDocument || document;
+      while (root.firstChild) {
+        node.appendChild(owner.importNode(root.firstChild, true));
+      }
+      return !!node.firstChild;
+    } catch (_) {
+      // ignore
+    }
+
+    try {
+      clear();
+      const range = document.createRange();
+      range.selectNodeContents(node instanceof ShadowRoot ? node.host : node);
+      let frag = null;
+      const tt = typeof trustedTypes !== 'undefined' ? trustedTypes : null;
+      const policy = tt && (tt.defaultPolicy || null);
+      if (policy && typeof policy.createHTML === 'function') {
+        frag = range.createContextualFragment(policy.createHTML(raw));
+      } else {
+        frag = range.createContextualFragment(raw);
+      }
+      node.appendChild(frag);
+      return !!node.firstChild;
+    } catch (_) {
+      // ignore
+    }
+
+    return false;
+  }
+
+  /**
+   * Truncated URL with Show more / Show less.
+   * @param {string} fullUrl
+   * @param {{ maxLen?: number, className?: string }} [options]
+   * @returns {{ el: HTMLElement, textEl: HTMLElement, getUrl: () => string, setUrl: (next: string) => void }}
+   */
+  function createExpandableUrl(fullUrl, options) {
+    const opts = options || {};
+    const maxLen = Math.max(24, Number(opts.maxLen) || 72);
+    const className = opts.className || 'url-expand';
+    let url = String(fullUrl || '').trim();
+    let expanded = false;
+
+    const wrap = document.createElement('div');
+    wrap.className = className;
+    const text = document.createElement('div');
+    text.className = 'url-expand-text';
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'url-expand-btn';
+    btn.setAttribute('aria-label', 'Expand or collapse URL');
+
+    function isLong() {
+      return url.length > maxLen;
+    }
+
+    function paint() {
+      const long = isLong();
+      if (!long || !expanded) {
+        text.textContent = long ? `${url.slice(0, Math.max(1, maxLen - 1))}…` : url;
+        text.classList.remove('is-open');
+        wrap.classList.remove('is-open');
+        btn.textContent = 'Show more';
+        btn.hidden = !long;
+        btn.setAttribute('aria-expanded', 'false');
+        wrap.title = long ? url : '';
+      } else {
+        text.textContent = url;
+        text.classList.add('is-open');
+        wrap.classList.add('is-open');
+        btn.textContent = 'Show less';
+        btn.hidden = false;
+        btn.setAttribute('aria-expanded', 'true');
+        wrap.title = '';
+      }
+    }
+
+    btn.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      expanded = !expanded;
+      paint();
+    });
+
+    wrap.appendChild(text);
+    wrap.appendChild(btn);
+    paint();
+
+    return {
+      el: wrap,
+      textEl: text,
+      getUrl: () => url,
+      setUrl(next) {
+        url = String(next || '').trim();
+        if (!isLong()) expanded = false;
+        paint();
+      },
+    };
+  }
+
   global.HGR_THEME = {
     THEME_MODE_KEY,
     THEME_ACCENT_KEY,
@@ -1461,7 +1796,14 @@
     showChoicePicker,
     showYtdlpFormatPicker,
     showBatchThumbnailPrompt,
+    adoptCssText,
+    adoptExtensionCss,
+    promoteInlineStyles,
+    hardenModalOverlay,
+    hardenModalBox,
     syncThemeFromRoot,
+    setNodeHtml,
+    createExpandableUrl,
     ACCENTS,
   };
 

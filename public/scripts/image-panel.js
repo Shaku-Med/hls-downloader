@@ -5,18 +5,20 @@
 (function (global) {
   const SCOPE_KEY = 'imageListScope';
 
-  function shortImgUrl(url) {
-    const raw = String(url || '').trim();
-    if (!raw) return '';
-    if (raw.startsWith('data:')) return 'data:image';
-    try {
-      const u = new URL(raw);
-      const last = (u.pathname.split('/').filter(Boolean).pop() || '').slice(0, 42);
-      const s = `${u.host}${last ? '/' + last : ''}`;
-      return s.length > 52 ? s.slice(0, 50) + '…' : s;
-    } catch (_) {
-      return raw.length > 52 ? raw.slice(0, 50) + '…' : raw;
+  function makeImgExpandableUrl(url) {
+    const display = String(url || '').startsWith('data:') ? 'data:image' : url;
+    const api = (typeof HGR_THEME !== 'undefined' && HGR_THEME.createExpandableUrl)
+      || (global.HGR_THEME && global.HGR_THEME.createExpandableUrl);
+    if (typeof api === 'function') {
+      return api(display, { className: 'url-expand img-url', maxLen: 48 });
     }
+    const wrap = document.createElement('div');
+    wrap.className = 'url-expand img-url';
+    const text = document.createElement('div');
+    text.className = 'url-expand-text';
+    text.textContent = String(display || '');
+    wrap.appendChild(text);
+    return { el: wrap };
   }
 
   function readScope() {
@@ -217,12 +219,9 @@
       const name = (img.alt && img.alt.trim()) || `Image ${idx + 1}`;
       title.textContent = dim ? `${name} · ${dim}` : name;
       title.title = name;
-      const urlLine = document.createElement('div');
-      urlLine.className = 'img-url';
-      urlLine.textContent = shortImgUrl(img.url);
-      urlLine.title = img.url;
+      const urlView = makeImgExpandableUrl(img.url);
       meta.appendChild(title);
-      meta.appendChild(urlLine);
+      meta.appendChild(urlView.el);
 
       const actions = document.createElement('div');
       actions.className = 'img-actions';

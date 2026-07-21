@@ -66,6 +66,60 @@ def show_error(parent: tk.Misc, title: str, message: str) -> None:
     messagebox.showerror(title, message, parent=parent)
 
 
+def _readonly_text(parent: tk.Misc, content: str, height: int) -> tk.Text:
+    box = tk.Text(parent, height=height, width=88, wrap="word")
+    box.insert("1.0", content)
+    box.configure(state="disabled")
+    return box
+
+
+def show_install_failure(
+    parent: tk.Misc,
+    title: str,
+    summary: str,
+    details: str,
+    manual_steps: str,
+    log_path: Optional[str],
+) -> None:
+    dialog = tk.Toplevel(parent)
+    dialog.title(title)
+    dialog.transient(parent)
+    dialog.grab_set()
+
+    frame = ttk.Frame(dialog, padding=16)
+    frame.grid(row=0, column=0, sticky="nsew")
+    dialog.columnconfigure(0, weight=1)
+    dialog.rowconfigure(0, weight=1)
+    frame.columnconfigure(0, weight=1)
+    frame.rowconfigure(2, weight=1)
+    frame.rowconfigure(5, weight=1)
+
+    ttk.Label(frame, text=summary, wraplength=620, font=("", 10, "bold")).grid(
+        row=0, column=0, sticky="w", pady=(0, 10)
+    )
+
+    ttk.Label(frame, text="Error log").grid(row=1, column=0, sticky="w")
+    _readonly_text(frame, details or "No output was captured.", 10).grid(
+        row=2, column=0, sticky="nsew", pady=(4, 10)
+    )
+
+    if log_path:
+        ttk.Label(
+            frame,
+            text=f"Saved to: {log_path}",
+            wraplength=620,
+        ).grid(row=3, column=0, sticky="w", pady=(0, 10))
+
+    ttk.Label(frame, text="What to do yourself").grid(row=4, column=0, sticky="w")
+    _readonly_text(frame, manual_steps, 8).grid(
+        row=5, column=0, sticky="nsew", pady=(4, 12)
+    )
+
+    ttk.Button(frame, text="Close", command=dialog.destroy).grid(row=6, column=0, sticky="e")
+    dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+    dialog.wait_window()
+
+
 def show_info(parent: tk.Misc, title: str, message: str) -> None:
     messagebox.showinfo(title, message, parent=parent)
 

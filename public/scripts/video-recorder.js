@@ -15,6 +15,7 @@
   ];
   const VIDEO_BITRATE = 6_000_000;
   const GATE_SAFETY_MS = 500; // low-frequency safety net (no per-frame thrash)
+  const DETACH_KEY = 'recordDetachVideoEnabled';
 
   /** idx -> entry (at most one active when queuing) */
   const recordings = new Map();
@@ -23,6 +24,11 @@
   let queueTotal = 0;
   let queueFinished = 0;
   let recording = false;
+  /** Page-order index of the video the user wants to record first. */
+  let preferredStartIndex = 0;
+  let highlightTimer = 0;
+  let highlightVideo = null;
+  let highlightPrev = null;
   let nextIdx = 0;
   let rafId = 0;
   let lastBadgeTick = 0;
@@ -31,6 +37,148 @@
   let resizeToastShown = false;
   let seekModalEntry = null;
   let queueAdvanceTimer = 0;
+  /** Cached setting — default ON (unset === true). */
+  let detachVideoEnabled = true;
+
+  function refreshDetachSetting() {
+    try {
+      chrome.storage.local.get([DETACH_KEY], (d) => {
+        if (chrome.runtime.lastError) return;
+        detachVideoEnabled = !(d && d[DETACH_KEY] === false);
+      });
+    } catch (_) {
+      // ignore
+    }
+  }
+  refreshDetachSetting();
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes[DETACH_KEY]) return;
+      detachVideoEnabled = changes[DETACH_KEY].newValue !== false;
+    });
+  } catch (_) {
+    // ignore
+  }
+
+  function snapMediaTime(t) {
+    const n = Number(t);
+    if (!Number.isFinite(n) || n < 0) return 0;
+    // Millisecond precision — accurate enough for seek restore without float noise.
+    return Math.round(n * 1000) / 1000;
+  }
+
+  function fmtMediaClock(t) {
+    const s = Math.max(0, snapMediaTime(t));
+    const m = Math.floor(s / 60);
+    const whole = Math.floor(s % 60);
+    const ms = Math.round((s - Math.floor(s)) * 1000);
+    if (ms > 0) return `${m}:${String(whole).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+    return `${m}:${String(whole).padStart(2, '0')}`;
+  }
+
+  /* ───────────────────────── detach video for max-quality capture ───────────────────────── */
+  function detachVideoForRecord(video) {
+    if (!video || video.getAttribute('data-hls-rec-detached') === '1') return null;
+    const placeholder = document.createComment('stuff-grabber-rec-placeholder');
+    const parent = video.parentNode;
+    if (parent) {
+      try {
+        parent.insertBefore(placeholder, video);
+      } catch (_) {
+        // ignore
+      }
+    }
+    const saved = {
+      placeholder,
+      styleAttr: video.getAttribute('style'),
+      controls: !!video.controls,
+      playsInline: !!video.playsInline,
+    };
+    video.setAttribute('data-hls-rec-detached', '1');
+    // Fixed fullscreen on top of page chrome; overlay UI stays one layer above.
+    video.style.cssText = [
+      'position:fixed!important',
+      'inset:0!important',
+      'left:0!important',
+      'top:0!important',
+      'right:0!important',
+      'bottom:0!important',
+      'width:100vw!important',
+      'height:100vh!important',
+      'max-width:none!important',
+      'max-height:none!important',
+      'min-width:0!important',
+      'min-height:0!important',
+      'margin:0!important',
+      'padding:0!important',
+      'border:none!important',
+      'outline:none!important',
+      'transform:none!important',
+      'filter:none!important',
+      'clip:auto!important',
+      'clip-path:none!important',
+      'object-fit:contain!important',
+      'background:#000!important',
+      'z-index:2147483645!important',
+      'pointer-events:auto!important',
+      'visibility:visible!important',
+      'opacity:1!important',
+      'display:block!important',
+    ].join(';');
+    try {
+      video.controls = true;
+    } catch (_) {
+      // ignore
+    }
+    try {
+      video.playsInline = true;
+    } catch (_) {
+      // ignore
+    }
+    try {
+      document.documentElement.appendChild(video);
+    } catch (_) {
+      try {
+        (document.body || document.documentElement).appendChild(video);
+      } catch (e2) {
+        // leave in place if move fails
+      }
+    }
+    return saved;
+  }
+
+  function restoreVideoAfterRecord(video, saved) {
+    if (!video || !saved) return;
+    try {
+      video.removeAttribute('data-hls-rec-detached');
+    } catch (_) {
+      // ignore
+    }
+    try {
+      if (saved.styleAttr == null || saved.styleAttr === '') video.removeAttribute('style');
+      else video.setAttribute('style', saved.styleAttr);
+    } catch (_) {
+      // ignore
+    }
+    try {
+      video.controls = saved.controls;
+    } catch (_) {
+      // ignore
+    }
+    try {
+      video.playsInline = saved.playsInline;
+    } catch (_) {
+      // ignore
+    }
+    try {
+      if (saved.placeholder && saved.placeholder.parentNode) {
+        saved.placeholder.parentNode.insertBefore(video, saved.placeholder);
+        saved.placeholder.parentNode.removeChild(saved.placeholder);
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
 
   /* ───────────────────────── overlay host (shadow DOM, isolated) ───────────────────────── */
   const overlayHost = document.createElement('div');
@@ -38,56 +186,85 @@
   const overlayShadow = overlayHost.attachShadow({ mode: 'open' });
   overlayShadow.innerHTML = `
     <style>
-      :host { position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 2147483647; }
+      :host {
+        position: fixed; inset: 0; width: 100vw; height: 100vh; pointer-events: none; z-index: 2147483647;
+        --bg: #000000;
+        --surface: #1c1c1e;
+        --surface-2: #2c2c2e;
+        --text: #ffffff;
+        --muted: #8e8e93;
+        --line: rgba(84, 84, 88, 0.65);
+        --accent: #0a84ff;
+        --accent-2: #409cff;
+        --fill: rgba(120, 120, 128, 0.32);
+        --danger: #ff453a;
+        --shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+        --overlay-bg: rgba(0, 0, 0, 0.48);
+        --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+      }
+      :host([data-theme="light"]) {
+        --bg: #f2f2f7;
+        --surface: #ffffff;
+        --surface-2: #f2f2f7;
+        --text: #000000;
+        --muted: #8e8e93;
+        --line: rgba(60, 60, 67, 0.18);
+        --accent: #007aff;
+        --accent-2: #0a84ff;
+        --fill: rgba(120, 120, 128, 0.16);
+        --danger: #ff3b30;
+        --shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
+        --overlay-bg: rgba(0, 0, 0, 0.28);
+      }
       .layer { position: absolute; inset: 0; pointer-events: none; }
       .box {
-        position: fixed; border: 3px solid #ef4444; border-radius: 8px; box-sizing: border-box;
-        box-shadow: 0 0 0 2px rgba(239,68,68,.25), 0 0 22px rgba(239,68,68,.35);
+        position: fixed; border: 3px solid var(--danger); border-radius: 8px; box-sizing: border-box;
+        box-shadow: 0 0 0 2px color-mix(in srgb, var(--danger) 25%, transparent), 0 0 22px color-mix(in srgb, var(--danger) 35%, transparent);
         pointer-events: none; transition: border-color 200ms ease, box-shadow 200ms ease;
       }
-      .box.buffer, .box.seek { border-color: #f59e0b; box-shadow: 0 0 0 2px rgba(245,158,11,.25), 0 0 22px rgba(245,158,11,.35); }
-      .box.pause { border-color: #94a3b8; box-shadow: 0 0 0 2px rgba(148,163,184,.25); }
+      .box.buffer, .box.seek { border-color: #ff9f0a; box-shadow: 0 0 0 2px rgba(255,159,10,.25), 0 0 22px rgba(255,159,10,.35); }
+      .box.pause { border-color: var(--muted); box-shadow: 0 0 0 2px color-mix(in srgb, var(--muted) 25%, transparent); }
       .badge {
         position: absolute; top: 8px; left: 8px; display: flex; align-items: center; gap: 6px;
-        background: rgba(15,23,42,.92); color: #fff;
-        font: 600 11px/1.3 Inter, system-ui, "Segoe UI", sans-serif;
-        padding: 4px 9px; border-radius: 7px; box-shadow: 0 2px 10px rgba(0,0,0,.35);
+        background: color-mix(in srgb, var(--surface) 92%, transparent); color: var(--text);
+        font: 600 11px/1.3 var(--font);
+        padding: 4px 9px; border-radius: 7px; box-shadow: var(--shadow);
         max-width: calc(100% - 16px); white-space: nowrap; overflow: hidden;
+        border: 0.5px solid var(--line);
       }
-      .badge .d { width: 8px; height: 8px; border-radius: 50%; background: #ef4444; flex: 0 0 auto; animation: recblink 1s infinite; }
-      .badge.buffer .d, .badge.seek .d { background: #f59e0b; animation: none; }
-      .badge.pause .d { background: #94a3b8; animation: none; }
+      .badge .d { width: 8px; height: 8px; border-radius: 50%; background: var(--danger); flex: 0 0 auto; animation: recblink 1s infinite; }
+      .badge.buffer .d, .badge.seek .d { background: #ff9f0a; animation: none; }
+      .badge.pause .d { background: var(--muted); animation: none; }
       .badge .txt { overflow: hidden; text-overflow: ellipsis; }
       @keyframes recblink { 0%,100% { opacity: 1; } 50% { opacity: .2; } }
       .toast {
         position: fixed; left: 50%; bottom: 26px; transform: translateX(-50%);
-        background: rgba(15,23,42,.96); color: #fff;
-        font: 500 12px/1.45 Inter, system-ui, "Segoe UI", sans-serif;
-        padding: 11px 15px; border-radius: 11px; box-shadow: 0 10px 32px rgba(0,0,0,.4);
-        max-width: 380px; border: 1px solid rgba(255,255,255,.12); pointer-events: none;
+        background: color-mix(in srgb, var(--surface) 96%, transparent); color: var(--text);
+        font: 500 12px/1.45 var(--font);
+        padding: 11px 15px; border-radius: 11px; box-shadow: var(--shadow);
+        max-width: 380px; border: 0.5px solid var(--line); pointer-events: none;
       }
       .toast[hidden] { display: none; }
 
-      /* Centered, top-most decision modal */
       .modal { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; pointer-events: auto; }
       .modal[data-open="1"] { display: flex; }
-      .modal-backdrop { position: absolute; inset: 0; background: rgba(0,0,0,.6); }
+      .modal-backdrop { position: absolute; inset: 0; background: var(--overlay-bg); }
       .sheet {
         position: relative; max-width: 400px; width: calc(100% - 48px);
-        background: #161b27; color: #e6e9ef; border: 1px solid #2b3344; border-radius: 16px;
-        padding: 22px; box-shadow: 0 28px 70px rgba(0,0,0,.55);
-        font: 400 13px/1.5 Inter, system-ui, "Segoe UI", sans-serif;
+        background: var(--surface); color: var(--text); border: 0.5px solid var(--line); border-radius: 16px;
+        padding: 22px; box-shadow: var(--shadow);
+        font: 400 13px/1.5 var(--font);
       }
-      .m-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.01em; }
-      .m-body { font-size: 13px; color: #aab4c8; line-height: 1.55; margin-bottom: 20px; }
-      .m-body b { color: #e6e9ef; }
+      .m-title { font-size: 16px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.01em; color: var(--text); }
+      .m-body { font-size: 13px; color: var(--muted); line-height: 1.55; margin-bottom: 20px; }
+      .m-body b { color: var(--text); }
       .m-actions { display: flex; flex-direction: column; gap: 9px; }
       .m-btn {
-        padding: 12px 14px; border-radius: 11px; font: 700 13px Inter, system-ui, sans-serif;
+        padding: 12px 14px; border-radius: 11px; font: 700 13px var(--font);
         cursor: pointer; border: 1px solid transparent; text-align: center; transition: filter 140ms ease;
       }
-      .m-btn.back { background: linear-gradient(180deg,#4f8cff,#3574f0); color: #fff; }
-      .m-btn.override { background: #1c2433; color: #e6e9ef; border-color: #2b3344; }
+      .m-btn.back { background: linear-gradient(180deg, var(--accent), var(--accent-2)); color: #fff; }
+      .m-btn.override { background: var(--fill); color: var(--text); border-color: var(--line); }
       .m-btn:hover { filter: brightness(1.1); }
     </style>
     <div class="layer"></div>
@@ -113,6 +290,16 @@
   const mOverrideBtn = overlayShadow.querySelector('.m-btn.override');
   let toastTimer = 0;
 
+  try {
+    if (window.HGR_THEME && window.HGR_THEME.bindLiveThemeHost) {
+      window.HGR_THEME.bindLiveThemeHost(overlayHost);
+    } else if (window.HGR_THEME && window.HGR_THEME.applyStoredThemeToElement) {
+      window.HGR_THEME.applyStoredThemeToElement(overlayHost);
+    }
+  } catch (_) {
+    // ignore
+  }
+
   function mountOverlay() {
     if (!overlayHost.parentNode) document.documentElement.appendChild(overlayHost);
   }
@@ -128,12 +315,15 @@
 
   /* ───────────────────────── seek decision modal ───────────────────────── */
   function openSeekModal(entry) {
-    mTitle.textContent = 'You skipped while recording';
+    const from = snapMediaTime(entry.seekResumeTime);
+    const to = snapMediaTime(entry.video && entry.video.currentTime);
+    mTitle.textContent = 'You skipped ahead';
     mBody.innerHTML =
-      'Recording is <b>paused</b>. Jumping the playhead would leave a gap in the saved file. ' +
-      'Want to go back to where you were, or record from this new spot?';
-    mBackBtn.textContent = '↩ Go back & keep recording';
-    mOverrideBtn.textContent = 'Record from here (override)';
+      'I paused recording and the video so we don’t leave a gap in your file.<br><br>' +
+      `You were at <b>${fmtMediaClock(from)}</b>, now you’re at <b>${fmtMediaClock(to)}</b>.<br><br>` +
+      'Want to jump back to where you were, or keep going from here?';
+    mBackBtn.textContent = 'Go back and keep recording';
+    mOverrideBtn.textContent = 'Keep going from here';
     modalEl.setAttribute('data-open', '1');
   }
   function closeSeekModal() {
@@ -143,20 +333,86 @@
     closeSeekModal();
     if (seekModalEntry === entry) seekModalEntry = null;
     if (!recordings.has(entry.idx)) return;
+    const video = entry.video;
+
     if (choice === 'back') {
-      // Return to the last position before the skip, then continue.
+      // Restore exact pre-seek media time, then resume only after seeked fires.
+      const target = snapMediaTime(entry.seekResumeTime);
       entry.internalSeek = true;
-      try {
-        if (typeof entry.lastTime === 'number' && isFinite(entry.lastTime)) {
-          entry.video.currentTime = entry.lastTime;
+      entry.seekHold = true; // stay gated until seeked + play
+      let done = false;
+      const finishBack = () => {
+        if (done) return;
+        done = true;
+        try {
+          video.removeEventListener('seeked', onSeeked);
+        } catch (_) {
+          // ignore
         }
-      } catch (_) {}
+        if (entry._seekBackTimer) {
+          clearTimeout(entry._seekBackTimer);
+          entry._seekBackTimer = 0;
+        }
+        entry.internalSeek = false;
+        entry.seekHold = false;
+        entry.lastTime = snapMediaTime(video.currentTime);
+        entry.seekResumeTime = entry.lastTime;
+        try {
+          const p = video.play && video.play();
+          if (p && p.catch) p.catch(() => {});
+        } catch (_) {
+          // ignore
+        }
+        applyGate(entry);
+      };
+      const onSeeked = () => {
+        const cur = snapMediaTime(video.currentTime);
+        if (Math.abs(cur - target) > 0.35 && entry.internalSeek) {
+          // Keep waiting briefly — some players settle in two steps.
+          return;
+        }
+        finishBack();
+      };
+      try {
+        video.addEventListener('seeked', onSeeked);
+      } catch (_) {
+        // ignore
+      }
+      // Safety timeout if seeked never fires.
+      entry._seekBackTimer = setTimeout(finishBack, 2500);
+      try {
+        video.pause();
+      } catch (_) {
+        // ignore
+      }
+      try {
+        video.currentTime = target;
+      } catch (_) {
+        finishBack();
+        return;
+      }
+      // If already at target (no seek needed), seeked may not fire.
+      try {
+        if (Math.abs(snapMediaTime(video.currentTime) - target) < 0.05 && !video.seeking) {
+          finishBack();
+        }
+      } catch (_) {
+        // ignore
+      }
+      return;
     }
+
+    // Override: accept the new position as the baseline and keep recording.
     entry.seekHold = false;
+    entry.internalSeek = false;
+    entry.lastTime = snapMediaTime(video.currentTime);
+    entry.seekResumeTime = entry.lastTime;
     try {
-      const p = entry.video.play && entry.video.play();
+      const p = video.play && video.play();
       if (p && p.catch) p.catch(() => {});
-    } catch (_) {}
+    } catch (_) {
+      // ignore
+    }
     applyGate(entry);
   }
   mBackBtn.addEventListener('click', () => { if (seekModalEntry) resolveSeek(seekModalEntry, 'back'); });
@@ -218,6 +474,94 @@
     }
     if (name.length > 80) name = name.slice(0, 80);
     return idx > 0 ? `${name} (${idx + 1})` : name;
+  }
+
+  function clearVideoHighlight() {
+    if (highlightTimer) {
+      clearTimeout(highlightTimer);
+      highlightTimer = 0;
+    }
+    const video = highlightVideo;
+    const prev = highlightPrev;
+    highlightVideo = null;
+    highlightPrev = null;
+    if (!video || !prev) return;
+    try {
+      if (prev.outline == null) video.style.removeProperty('outline');
+      else video.style.outline = prev.outline;
+      if (prev.outlineOffset == null) video.style.removeProperty('outline-offset');
+      else video.style.outlineOffset = prev.outlineOffset;
+      if (prev.boxShadow == null) video.style.removeProperty('box-shadow');
+      else video.style.boxShadow = prev.boxShadow;
+      if (prev.transition == null) video.style.removeProperty('transition');
+      else video.style.transition = prev.transition;
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function listVideos() {
+    const videos = findVideoElements();
+    return {
+      ok: true,
+      count: videos.length,
+      preferredStartIndex,
+      recording: recording || recordings.size > 0,
+      videos: videos.map((video, index) => {
+        const w = video.videoWidth || 0;
+        const h = video.videoHeight || 0;
+        const dur = Number.isFinite(video.duration) ? video.duration : 0;
+        let meta = `Video ${index + 1}`;
+        if (w && h) meta += ` · ${w}×${h}`;
+        if (dur > 0) meta += ` · ${fmtClock(Math.round(dur))}`;
+        else if (video.paused === false) meta += ' · playing';
+        return {
+          index,
+          label: labelForVideo(video, index),
+          meta,
+          width: w,
+          height: h,
+          duration: dur,
+          paused: !!video.paused,
+        };
+      }),
+    };
+  }
+
+  function focusVideo(index) {
+    const videos = findVideoElements();
+    const i = Math.max(0, Math.min(videos.length - 1, Number(index) | 0));
+    const video = videos[i];
+    if (!video) return { ok: false, error: 'That video disappeared. Open the list again.' };
+    preferredStartIndex = i;
+    try {
+      video.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+    } catch (_) {
+      try { video.scrollIntoView(true); } catch (e2) { /* ignore */ }
+    }
+    clearVideoHighlight();
+    highlightPrev = {
+      outline: video.style.outline || null,
+      outlineOffset: video.style.outlineOffset || null,
+      boxShadow: video.style.boxShadow || null,
+      transition: video.style.transition || null,
+    };
+    highlightVideo = video;
+    try {
+      video.style.setProperty('transition', 'outline 160ms ease, box-shadow 160ms ease', 'important');
+      video.style.setProperty('outline', '3px solid #ff3b30', 'important');
+      video.style.setProperty('outline-offset', '4px', 'important');
+      video.style.setProperty('box-shadow', '0 0 0 8px rgba(255, 59, 48, 0.28)', 'important');
+    } catch (_) {
+      // ignore
+    }
+    highlightTimer = setTimeout(() => clearVideoHighlight(), 3800);
+    return {
+      ok: true,
+      index: i,
+      label: labelForVideo(video, i),
+      preferredStartIndex,
+    };
   }
 
   function fmtClock(s) {
@@ -287,6 +631,22 @@
     if (tick) lastBadgeTick = now;
     for (const entry of recordings.values()) {
       positionOverlay(entry); // every frame: smooth border tracking
+      // High-frequency playhead stamp so "go back" restores accurate media time.
+      if (
+        entry.reason === 'rec' &&
+        !entry.seekHold &&
+        !entry.internalSeek &&
+        entry.video &&
+        !entry.video.seeking &&
+        !entry.video.paused
+      ) {
+        try {
+          entry.lastTime = snapMediaTime(entry.video.currentTime);
+          entry.seekResumeTime = entry.lastTime;
+        } catch (_) {
+          // ignore
+        }
+      }
       if (tick) {
         applyGate(entry); // low-frequency safety net only — events drive the real transitions
         entry.ov.txt.textContent = badgeText(entry);
@@ -334,14 +694,24 @@
     if (resizeToastShown) return;
     resizeToastShown = true;
     showToast(
-      'Looks like you resized the window. Recording pauses while you do that so the frozen ' +
-      'frame stays out of the file, then it picks back up. For the cleanest capture, try not to resize mid-recording.'
+      'Looks like you resized the window. I paused so that frozen stretch doesn’t land in your file. ' +
+      'It’ll pick back up when you stop. For the cleanest take, try not to resize while recording.'
     );
   }
 
   /* ───────────────────────── start / stop one ───────────────────────── */
   function startOne(video, idx) {
     const label = labelForVideo(video, idx);
+
+    // Optional: pin the element fullscreen for the cleanest captureStream quality.
+    let detachSaved = null;
+    if (detachVideoEnabled) {
+      try {
+        detachSaved = detachVideoForRecord(video);
+      } catch (_) {
+        detachSaved = null;
+      }
+    }
 
     // Same path for every site: kick playback, then capture the element's stream.
     try { const p0 = video.play && video.play(); if (p0 && p0.catch) p0.catch(() => {}); } catch (_) {}
@@ -352,30 +722,42 @@
         ? video.captureStream()
         : (video.mozCaptureStream ? video.mozCaptureStream() : null);
     } catch (e) {
+      restoreVideoAfterRecord(video, detachSaved);
       return { idx, label, error: 'this video could not be recorded' };
     }
-    if (!stream) return { idx, label, error: 'this video could not be recorded' };
+    if (!stream) {
+      restoreVideoAfterRecord(video, detachSaved);
+      return { idx, label, error: 'this video could not be recorded' };
+    }
 
     let mime = '';
     for (const m of MIMES) {
       if (MediaRecorder.isTypeSupported(m)) { mime = m; break; }
     }
-    if (!mime) return { idx, label, error: 'no supported recording codec' };
+    if (!mime) {
+      restoreVideoAfterRecord(video, detachSaved);
+      return { idx, label, error: 'no supported recording codec' };
+    }
 
     let recorder;
     try {
       recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: VIDEO_BITRATE });
     } catch (e) {
+      restoreVideoAfterRecord(video, detachSaved);
       return { idx, label, error: String((e && e.message) || e) };
     }
 
     const ov = createOverlayBox(label);
+    const t0 = snapMediaTime(video.currentTime);
     const entry = {
       idx, label, video, recorder, mime,
       chunks: [], startedAt: Date.now(), gate: null, reason: 'rec',
       ov, listeners: [],
       buffering: false, seekHold: false, internalSeek: false,
-      lastTime: (typeof video.currentTime === 'number' ? video.currentTime : 0),
+      lastTime: t0,
+      seekResumeTime: t0,
+      detachSaved,
+      _seekBackTimer: 0,
     };
 
     recorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) entry.chunks.push(e.data); };
@@ -384,6 +766,11 @@
 
     const on = (ev, fn) => { video.addEventListener(ev, fn); entry.listeners.push([ev, fn]); };
     const gate = () => applyGate(entry);
+    const stampTime = () => {
+      if (video.seeking || entry.seekHold || entry.internalSeek) return;
+      entry.lastTime = snapMediaTime(video.currentTime);
+      entry.seekResumeTime = entry.lastTime;
+    };
 
     on('waiting', () => { entry.buffering = true; gate(); });
     on('stalled', () => { entry.buffering = true; gate(); });
@@ -393,19 +780,31 @@
     on('play', gate);
     on('pause', gate);
     on('ratechange', gate);
-    on('timeupdate', () => {
-      if (!video.seeking && !entry.seekHold) entry.lastTime = video.currentTime;
-    });
+    on('timeupdate', stampTime);
     on('seeking', () => {
       if (entry.internalSeek) { gate(); return; }      // our own go-back seek
       if (entry.seekHold || seekModalEntry) { gate(); return; } // a decision is already pending
+      // Ignore tiny scrub jitter — only prompt on real jumps.
+      const from = snapMediaTime(entry.lastTime);
+      const to = snapMediaTime(video.currentTime);
+      if (Math.abs(to - from) < 0.25) {
+        gate();
+        return;
+      }
+      // Freeze the last good media time BEFORE the skip lands for an accurate restore.
+      entry.seekResumeTime = from;
       entry.seekHold = true;
       seekModalEntry = entry;
-      gate();                                          // pause immediately
+      try {
+        video.pause(); // pause playback + recording (via gate) while the user decides
+      } catch (_) {
+        // ignore
+      }
+      gate();                                          // pause MediaRecorder immediately
       openSeekModal(entry);
     });
     on('seeked', () => {
-      if (entry.internalSeek) entry.internalSeek = false;
+      if (entry.internalSeek) return; // resolveSeek finishBack owns this path
       gate();
     });
     on('ended', () => stopOne(idx));
@@ -414,6 +813,7 @@
       recorder.start(1000);
     } catch (e) {
       try { if (ov.box.parentNode) ov.box.parentNode.removeChild(ov.box); } catch (_) {}
+      restoreVideoAfterRecord(video, detachSaved);
       return { idx, label, error: 'could not start (no active media track yet)' };
     }
     recordings.set(idx, entry);
@@ -458,7 +858,7 @@
         const pos = queuePosition();
         if (queueTotal > 1) {
           showToast(
-            `Recording ${pos.current} of ${pos.total}: ${r.label}. Next starts when this one finishes.`,
+            `Recording ${pos.current} of ${pos.total}: ${r.label}. The next one starts when this finishes.`,
             5000
           );
         }
@@ -470,6 +870,7 @@
     recording = false;
     stopLoop();
     unmountOverlay();
+    emitRecState({ reason: 'queue-empty' });
     return null;
   }
 
@@ -478,10 +879,19 @@
     recordings.delete(entry.idx);
     queueFinished += 1;
     if (seekModalEntry === entry) { seekModalEntry = null; closeSeekModal(); }
+    if (entry._seekBackTimer) {
+      clearTimeout(entry._seekBackTimer);
+      entry._seekBackTimer = 0;
+    }
     for (const [ev, fn] of entry.listeners) {
       try { entry.video.removeEventListener(ev, fn); } catch (_) {}
     }
     try { if (entry.ov.box.parentNode) entry.ov.box.parentNode.removeChild(entry.ov.box); } catch (_) {}
+    try {
+      restoreVideoAfterRecord(entry.video, entry.detachSaved);
+    } catch (_) {
+      // ignore
+    }
 
     if (entry.chunks.length) {
       const blob = new Blob(entry.chunks, { type: entry.mime });
@@ -506,7 +916,7 @@
           if (recordings.size > 0) return;
           const next = startNextFromQueue();
           if (!next && queueTotal > 1) {
-            showToast(`Finished the queue (${queueFinished} of ${queueTotal}).`, 5000);
+            showToast(`All done with the queue (${queueFinished} of ${queueTotal}).`, 5000);
           }
         }, 500);
       } else {
@@ -517,8 +927,14 @@
         stopLoop();
         unmountOverlay();
         if (total > 1 && finished > 0) {
-          showToast(`Finished all recordings (${finished} of ${total}).`, 5000);
+          showToast(`All done. Saved ${finished} of ${total} recordings.`, 5000);
         }
+        emitRecState({
+          reason: 'finished',
+          message: total > 1 && finished > 0
+            ? `All done. Saved ${finished} of ${total} recordings.`
+            : 'Recording saved.',
+        });
       }
     }
   }
@@ -533,20 +949,51 @@
     }
   }
 
+  /** Tell FAB / other same-world listeners that recording state changed. */
+  function emitRecState(extra) {
+    const status = getStatus();
+    const detail = Object.assign({}, status, extra || {});
+    try {
+      window.dispatchEvent(new CustomEvent('hls-video-rec', { detail }));
+    } catch (_) {
+      // ignore
+    }
+    return detail;
+  }
+
   /* ───────────────────────── public actions ───────────────────────── */
-  function startRecording() {
+  function startRecording(opts) {
     if (recording) return { ok: false, error: 'Already recording' };
     const videos = findVideoElements();
-    if (!videos.length) return { ok: false, error: 'No video elements found on this page' };
+    if (!videos.length) return { ok: false, error: 'No videos on this page right now' };
+
+    const rawStart = opts && Number.isFinite(Number(opts.startIndex))
+      ? Number(opts.startIndex)
+      : preferredStartIndex;
+    const startIndex = Math.max(0, Math.min(videos.length - 1, rawStart | 0));
+    preferredStartIndex = startIndex;
+
+    // Selected video first, then the rest in page order.
+    const ordered = [videos[startIndex]];
+    for (let i = 0; i < videos.length; i++) {
+      if (i !== startIndex) ordered.push(videos[i]);
+    }
 
     // Queue every video; record one at a time so captureStream stays reliable.
     recordQueue = [];
-    queueTotal = videos.length;
+    queueTotal = ordered.length;
     queueFinished = 0;
     clearQueueAdvanceTimer();
-    for (const v of videos) {
+    clearVideoHighlight();
+    for (let oi = 0; oi < ordered.length; oi++) {
+      const v = ordered[oi];
+      const pageIdx = videos.indexOf(v);
       const idx = nextIdx++;
-      recordQueue.push({ video: v, idx, label: labelForVideo(v, idx) });
+      recordQueue.push({
+        video: v,
+        idx,
+        label: labelForVideo(v, pageIdx >= 0 ? pageIdx : oi),
+      });
     }
 
     recording = true;
@@ -564,16 +1011,17 @@
       recordQueue = [];
       stopLoop();
       unmountOverlay();
-      return { ok: false, error: 'Could not start recording on any video', details };
+      return { ok: false, error: 'Couldn’t get a recording going on any of these videos', details };
     }
 
     const pos = queuePosition();
     showToast(
       queueTotal > 1
-        ? `Queued ${queueTotal} videos — recording one at a time (${pos.current} of ${queueTotal} now).`
-        : 'Recording started. Avoid resizing the window or switching tabs for the cleanest capture.',
+        ? `Got ${queueTotal} videos lined up. Recording them one by one (${pos.current} of ${queueTotal} now).`
+        : 'Recording started. Leave the window alone and stay on this tab for the cleanest take.',
       6000
     );
+    emitRecState({ reason: 'start' });
     return {
       ok: true,
       count: 1,
@@ -604,7 +1052,16 @@
       stopOne(entry.idx);
     }
     recording = false;
-    return { ok: true, stopped, cancelled };
+    const result = { ok: true, stopped, cancelled };
+    // Force recording:false — MediaRecorder.onstop may still be clearing the Map.
+    emitRecState({
+      reason: 'stop',
+      recording: false,
+      message: stopped.length
+        ? `Saved ${stopped.length} recording${stopped.length > 1 ? 's' : ''}`
+        : 'Stopped',
+    });
+    return result;
   }
 
   function getStatus() {
@@ -633,14 +1090,38 @@
     };
   }
 
+  function scanVideos() {
+    const st = getStatus();
+    const listed = listVideos();
+    return {
+      ok: true,
+      count: st.videoCount,
+      recording: st.recording,
+      sequential: st.sequential,
+      total: st.total,
+      position: st.position,
+      remaining: st.queueRemaining,
+      preferredStartIndex: listed.preferredStartIndex,
+      videos: listed.videos,
+    };
+  }
+
   // Popup / options (separate contexts) reach us via chrome.tabs.sendMessage.
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || msg.type !== 'VIDEO_RECORDER') return false;
     if (msg.action === 'scan') {
-      sendResponse({ ok: true, count: findVideoElements().length, recording });
+      sendResponse(scanVideos());
       return true;
     }
-    if (msg.action === 'start') { sendResponse(startRecording()); return true; }
+    if (msg.action === 'list') { sendResponse(listVideos()); return true; }
+    if (msg.action === 'focus') {
+      sendResponse(focusVideo(msg.index));
+      return true;
+    }
+    if (msg.action === 'start') {
+      sendResponse(startRecording({ startIndex: msg.startIndex }));
+      return true;
+    }
     if (msg.action === 'stop') { sendResponse(stopRecording()); return true; }
     if (msg.action === 'status') { sendResponse(getStatus()); return true; }
     return false;
@@ -649,8 +1130,10 @@
   // The floating button (fab.js) is a content script in the same isolated world,
   // so it calls these directly — content scripts have no chrome.tabs API.
   window.HLS_VIDEO_REC = {
-    scan: () => ({ ok: true, count: findVideoElements().length, recording }),
-    start: startRecording,
+    scan: scanVideos,
+    list: listVideos,
+    focus: focusVideo,
+    start: (opts) => startRecording(opts || {}),
     stop: stopRecording,
     status: getStatus,
   };
@@ -680,6 +1163,7 @@
       clearQueueAdvanceTimer();
       recording = false;
       for (const entry of Array.from(recordings.values())) stopOne(entry.idx);
+      emitRecState({ reason: 'pagehide', recording: false });
     }
   });
 })();

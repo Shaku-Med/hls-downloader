@@ -1,5 +1,10 @@
-/* iOS-inspired theme tokens — popup, settings, overlays */
-:root {
+/* iOS-inspired theme tokens — popup, settings, floater, overlays.
+   :root covers extension pages; :host covers Chromium floater shadow DOM;
+   .hls-grabber-fab-root covers Firefox light-DOM floater (avoids ShadyDOM clashes).
+   Edit a color here and every surface picks it up. */
+:root,
+:host,
+.hls-grabber-fab-root {
   --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
     "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
@@ -34,7 +39,9 @@
   --overlay-bg: rgba(0, 0, 0, 0.48);
 }
 
-:root[data-theme="light"] {
+:root[data-theme="light"],
+:host([data-theme="light"]),
+.hls-grabber-fab-root[data-theme="light"] {
   --bg: #f2f2f7;
   --grouped: #f2f2f7;
   --surface: #ffffff;
@@ -60,20 +67,28 @@
   --overlay-bg: rgba(0, 0, 0, 0.28);
 }
 
-:root[data-accent="violet"] { --accent: #bf5af2; --accent-2: #da8fff; }
-:root[data-accent="emerald"] { --accent: #30d158; --accent-2: #63e689; }
-:root[data-accent="rose"] { --accent: #ff375f; --accent-2: #ff6482; }
-:root[data-accent="orange"] { --accent: #ff9f0a; --accent-2: #ffb340; }
+:root[data-accent="violet"], :host([data-accent="violet"]), .hls-grabber-fab-root[data-accent="violet"] { --accent: #bf5af2; --accent-2: #da8fff; }
+:root[data-accent="emerald"], :host([data-accent="emerald"]), .hls-grabber-fab-root[data-accent="emerald"] { --accent: #30d158; --accent-2: #63e689; }
+:root[data-accent="rose"], :host([data-accent="rose"]), .hls-grabber-fab-root[data-accent="rose"] { --accent: #ff375f; --accent-2: #ff6482; }
+:root[data-accent="orange"], :host([data-accent="orange"]), .hls-grabber-fab-root[data-accent="orange"] { --accent: #ff9f0a; --accent-2: #ffb340; }
 
-:root[data-theme="light"][data-accent="violet"] { --accent: #af52de; --accent-2: #bf5af2; }
-:root[data-theme="light"][data-accent="emerald"] { --accent: #34c759; --accent-2: #30d158; }
-:root[data-theme="light"][data-accent="rose"] { --accent: #ff2d55; --accent-2: #ff375f; }
-:root[data-theme="light"][data-accent="orange"] { --accent: #ff9500; --accent-2: #ff9f0a; }
+:root[data-theme="light"][data-accent="violet"], :host([data-theme="light"][data-accent="violet"]), .hls-grabber-fab-root[data-theme="light"][data-accent="violet"] { --accent: #af52de; --accent-2: #bf5af2; }
+:root[data-theme="light"][data-accent="emerald"], :host([data-theme="light"][data-accent="emerald"]), .hls-grabber-fab-root[data-theme="light"][data-accent="emerald"] { --accent: #34c759; --accent-2: #30d158; }
+:root[data-theme="light"][data-accent="rose"], :host([data-theme="light"][data-accent="rose"]), .hls-grabber-fab-root[data-theme="light"][data-accent="rose"] { --accent: #ff2d55; --accent-2: #ff375f; }
+:root[data-theme="light"][data-accent="orange"], :host([data-theme="light"][data-accent="orange"]), .hls-grabber-fab-root[data-theme="light"][data-accent="orange"] { --accent: #ff9500; --accent-2: #ff9f0a; }
 
 :root[data-theme-mode="page"] select,
 :root[data-theme-mode="page"] .hgr-job-preset-select,
 :root[data-theme-mode="page"] .hgr-modal-select,
-:root[data-theme-mode="page"] .ios-select-trigger {
+:root[data-theme-mode="page"] .ios-select-trigger,
+:host([data-theme-mode="page"]) select,
+:host([data-theme-mode="page"]) .hgr-job-preset-select,
+:host([data-theme-mode="page"]) .hgr-modal-select,
+:host([data-theme-mode="page"]) .ios-select-trigger,
+.hls-grabber-fab-root[data-theme-mode="page"] select,
+.hls-grabber-fab-root[data-theme-mode="page"] .hgr-job-preset-select,
+.hls-grabber-fab-root[data-theme-mode="page"] .hgr-modal-select,
+.hls-grabber-fab-root[data-theme-mode="page"] .ios-select-trigger {
   background: var(--fill);
   color: var(--text);
   border-color: transparent;

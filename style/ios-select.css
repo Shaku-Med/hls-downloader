@@ -103,7 +103,13 @@
   bottom: auto !important;
   margin: 0;
   z-index: 2147483647 !important;
+  pointer-events: auto !important;
   animation: ios-dd-in 160ms cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.ios-select-menu.ios-select-menu--fixed,
+.ios-select-menu.ios-select-menu--fixed * {
+  pointer-events: auto !important;
 }
 
 .ios-select-menu.ios-select-menu--fixed.ios-select-menu--above {

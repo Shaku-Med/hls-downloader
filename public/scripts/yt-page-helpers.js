@@ -62,79 +62,92 @@
       return;
     }
 
-    const overlay = document.createElement('div');
-    overlay.style.cssText =
-      'position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:2147483646;display:flex;align-items:center;justify-content:center;padding:12px;box-sizing:border-box;';
-    const box = document.createElement('div');
-    box.style.cssText =
-      'background:#fff;border-radius:12px;padding:16px 18px;max-width:400px;width:100%;box-shadow:0 8px 32px rgba(0,0,0,.2);font-family:system-ui,Segoe UI,sans-serif;font-size:13px;color:#1c1917;';
+    const subtitle = hints.isPlaylistPage
+      ? 'This page is a playlist. Download all videos? (yt-dlp will create multiple files in your save folder.)'
+      : 'This watch URL includes a playlist. Download only this video, or the full playlist? (Full playlist creates multiple files.)';
 
-    const title = document.createElement('div');
-    title.style.cssText = 'font-weight:600;font-size:14px;margin-bottom:8px;';
-    title.textContent = 'YouTube playlist';
+    const choices = hints.isPlaylistPage
+      ? [{ id: 'playlist', label: 'Download full playlist', primary: true }]
+      : [
+          { id: 'single', label: 'This video only', primary: true },
+          { id: 'playlist', label: 'Full playlist' },
+        ];
 
-    const body = document.createElement('div');
-    body.style.cssText = 'font-size:12px;color:#44403c;line-height:1.45;margin-bottom:14px;';
-    if (hints.isPlaylistPage) {
-      body.textContent =
-        'This page is a playlist. Download all videos? (yt-dlp will create multiple files in your save folder.)';
-    } else {
-      body.textContent =
-        'This watch URL includes a playlist. Download only this video, or the full playlist? (Full playlist creates multiple files.)';
+    const finish = (id) => {
+      if (id === 'single' || id === 'playlist') onPick(id);
+      else onPick(null);
+    };
+
+    if (window.HGR_THEME && typeof window.HGR_THEME.showChoicePicker === 'function') {
+      window.HGR_THEME.showChoicePicker(
+        {
+          title: 'YouTube playlist',
+          subtitle,
+          detail: pageUrl || '',
+          choices,
+          cancelLabel: 'Cancel',
+          mount: document.documentElement || document.body,
+        },
+        finish
+      );
+      return;
     }
 
-    const urlLine = document.createElement('div');
-    urlLine.style.cssText =
-      'font-size:10px;color:#78716c;word-break:break-all;margin-bottom:14px;font-family:ui-monospace,Consolas,monospace;';
-    urlLine.textContent = pageUrl;
-
-    const row = document.createElement('div');
-    row.style.cssText = 'display:flex;flex-direction:column;gap:8px;';
-
-    const mkBtn = (label, primary, choice) => {
+    // Fallback if theme helpers didn't load — still use shared modal classes.
+    const overlay = document.createElement('div');
+    overlay.className = 'hgr-modal-overlay';
+    if (window.HGR_THEME && typeof window.HGR_THEME.hardenModalOverlay === 'function') {
+      window.HGR_THEME.hardenModalOverlay(overlay);
+    }
+    overlay.setAttribute('data-theme', 'dark');
+    const box = document.createElement('div');
+    box.className = 'hgr-modal-box';
+    if (window.HGR_THEME && typeof window.HGR_THEME.hardenModalBox === 'function') {
+      window.HGR_THEME.hardenModalBox(box);
+    }
+    const title = document.createElement('div');
+    title.className = 'hgr-modal-title';
+    title.textContent = 'YouTube playlist';
+    const sub = document.createElement('div');
+    sub.className = 'hgr-modal-sub';
+    sub.textContent = subtitle;
+    const detail = document.createElement('div');
+    detail.className = 'hgr-modal-detail';
+    detail.textContent = pageUrl || '';
+    const form = document.createElement('div');
+    form.className = 'hgr-modal-actions';
+    let settled = false;
+    const done = (id) => {
+      if (settled) return;
+      settled = true;
+      if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      finish(id);
+    };
+    choices.forEach((c) => {
       const b = document.createElement('button');
       b.type = 'button';
-      b.textContent = label;
-      b.style.cssText = [
-        'padding:10px 14px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;',
-        primary
-          ? 'background:#c2410c;color:#fff;border:none;'
-          : 'background:#fafaf9;color:#44403c;border:1px solid #d6d3d1;',
-      ].join('');
-      b.addEventListener('click', () => {
-        document.body.removeChild(overlay);
-        onPick(choice);
-      });
-      return b;
-    };
-
-    if (hints.isPlaylistPage) {
-      row.appendChild(mkBtn('Download full playlist', true, 'playlist'));
-      row.appendChild(
-        mkBtn('Cancel', false, null)
-      );
-    } else {
-      row.appendChild(mkBtn('This video only', true, 'single'));
-      row.appendChild(mkBtn('Full playlist', false, 'playlist'));
-      row.appendChild(
-        mkBtn('Cancel', false, null)
-      );
-    }
-
-    const close = () => {
-      if (overlay.parentNode) document.body.removeChild(overlay);
-      onPick(null);
-    };
-    overlay.addEventListener('click', (ev) => {
-      if (ev.target === overlay) close();
+      b.className = c.primary ? 'hgr-modal-btn-primary' : 'hgr-modal-btn-secondary';
+      b.textContent = c.label;
+      b.addEventListener('click', () => done(c.id));
+      form.appendChild(b);
     });
-
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'hgr-modal-btn-ghost';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', () => done(null));
+    form.appendChild(cancel);
     box.appendChild(title);
-    box.appendChild(body);
-    box.appendChild(urlLine);
-    box.appendChild(row);
+    box.appendChild(sub);
+    if (pageUrl) box.appendChild(detail);
+    box.appendChild(form);
     overlay.appendChild(box);
-    document.body.appendChild(overlay);
+    overlay.addEventListener('click', (ev) => {
+      if (ev.target === overlay) done(null);
+    });
+    // Mount on <html>: the floater host follows <body>, so a body-mounted
+    // overlay would stack behind the floating panel.
+    (document.documentElement || document.body).appendChild(overlay);
   }
 
   /**

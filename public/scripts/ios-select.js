@@ -45,6 +45,7 @@
     menu.style.maxHeight = '';
     menu.style.zIndex = '';
     menu.style.visibility = '';
+    menu.style.pointerEvents = '';
     menu.classList.remove('ios-select-menu--fixed', 'ios-select-menu--above');
   }
 
@@ -131,8 +132,10 @@
     const maxW = Math.max(120, vw - PAD * 2);
 
     menu.classList.add('ios-select-menu--fixed');
-    menu.style.position = 'fixed';
-    menu.style.zIndex = '2147483647';
+    menu.style.setProperty('position', 'fixed', 'important');
+    menu.style.setProperty('z-index', '2147483647', 'important');
+    // Hosts (FAB / image hover) use pointer-events:none; the menu must opt back in.
+    menu.style.setProperty('pointer-events', 'auto', 'important');
     menu.style.right = 'auto';
     menu.style.bottom = 'auto';
     menu.style.minWidth = minW + 'px';
@@ -178,6 +181,13 @@
     menu.style.top = Math.round(top) + 'px';
     menu.style.width = Math.round(menuW) + 'px';
     menu.style.visibility = 'visible';
+    menu.style.setProperty('pointer-events', 'auto', 'important');
+    menu.style.setProperty('z-index', '2147483647', 'important');
+
+    // Options must also receive hits under pe:none hosts.
+    menu.querySelectorAll('.ios-select-option').forEach((row) => {
+      row.style.setProperty('pointer-events', 'auto', 'important');
+    });
   }
 
   function repositionActive() {

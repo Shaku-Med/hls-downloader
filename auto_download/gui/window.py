@@ -5,12 +5,18 @@ import tkinter as tk
 from tkinter import ttk
 from typing import List, Optional, Set
 
-from .. import detect
+from .. import detect, osinfo
 from ..executor import run_with_approval
-from ..models import CommandPlan, InstallStatus, PackageView
-from ..paths import app_icon_path
+from ..models import CommandPlan, InstallStatus, Package, PackageView
+from ..paths import app_icon_path, write_error_log
 from ..planner import evaluate_packages, installable_views
-from .dialogs import ask_run_command, choose_plan, show_error, show_info
+from .dialogs import (
+    ask_run_command,
+    choose_plan,
+    show_error,
+    show_info,
+    show_install_failure,
+)
 
 
 def apply_app_icon(root: tk.Tk) -> Optional[tk.PhotoImage]:
@@ -32,6 +38,7 @@ class AutoDownloadApp(ttk.Frame):
         self.views: List[PackageView] = []
         self._busy = False
         self._busy_pulse = 0
+        self._failed = False
         self._rows: dict[str, dict] = {}
 
         master.title("Stuff Grabber Auto Download")
@@ -66,6 +73,19 @@ class AutoDownloadApp(ttk.Frame):
             ),
             wraplength=700,
         ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.system_label = ttk.Label(header, text=self._system_text(), wraplength=700)
+        self.system_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
+
+    def _system_text(self) -> str:
+        managers = osinfo.available_managers()
+        manager_text = ", ".join(managers) if managers else "none found"
+        found = detect.find_python()
+        want = ".".join(str(part) for part in osinfo.MIN_PYTHON)
+        if found:
+            python_text = f"Python {found.version_text()} ({found.executable})"
+        else:
+            python_text = f"no Python {want}+ on PATH"
+        return f"Detected: {osinfo.os_label()}  |  Package managers: {manager_text}  |  {python_text}"
 
     def _build_actions(self) -> None:
         actions = ttk.Frame(self)
@@ -152,6 +172,7 @@ class AutoDownloadApp(ttk.Frame):
         if self._busy:
             return
         self.views = evaluate_packages()
+        self.system_label.configure(text=self._system_text())
         for item in self.tree.get_children():
             self.tree.delete(item)
         self._rows.clear()
@@ -256,9 +277,52 @@ class AutoDownloadApp(ttk.Frame):
     def _log_threadsafe(self, message: str) -> None:
         self.master.after(0, lambda: self.append_log(message))
 
+    def _show_failure(
+        self,
+        title: str,
+        summary: str,
+        details: str,
+        manual_steps: str,
+        log_path: Optional[str],
+    ) -> None:
+        event = threading.Event()
+
+        def show() -> None:
+            show_install_failure(self.master, title, summary, details, manual_steps, log_path)
+            event.set()
+
+        self.master.after(0, show)
+        event.wait()
+
+    def _fail_and_stop(self, package: Package, details: str) -> None:
+        if package.id == "python":
+            manual = osinfo.manual_python_steps()
+        else:
+            manual = package.missing_hint or "Install this tool yourself, then run Auto Download again."
+        managers = ", ".join(osinfo.available_managers()) or "none found"
+        report = (
+            f"Tool: {package.title}\n"
+            f"System: {osinfo.os_label()}\n"
+            f"Package managers: {managers}\n\n"
+            f"{details}\n\n{manual}"
+        )
+        log_path = write_error_log(report)
+        self._failed = True
+        self._log_threadsafe(f"STOPPED. {package.title} could not be installed.")
+        if log_path:
+            self._log_threadsafe(f"Error log saved to: {log_path}")
+        self._show_failure(
+            f"Install failed: {package.title}",
+            f"{package.title} could not be installed, so the rest of the run was stopped.",
+            details,
+            manual,
+            str(log_path) if log_path else None,
+        )
+
     def _install_worker(self, views: List[PackageView]) -> None:
         installed_js = detect.has_js_runtime()
         seen_optional_js: Set[str] = set()
+        self._failed = False
 
         try:
             for view in views:
@@ -310,17 +374,23 @@ class AutoDownloadApp(ttk.Frame):
                 if not result.ok:
                     err = result.combined_output() or "Unknown error"
                     self._log_threadsafe(f"ERROR installing {package.title}:\n{err}")
-                    self.master.after(
-                        0,
-                        lambda title=package.title, message=err: show_error(
-                            self.master,
-                            f"Install failed: {title}",
-                            message[:2000],
-                        ),
-                    )
+                    if package.required:
+                        self._fail_and_stop(package, err)
+                        return
+                    self._log_threadsafe(f"Skipping optional {package.title}.")
                     continue
 
                 self._log_threadsafe(f"{package.title} install finished.")
+
+                if package.id == "python":
+                    self._log_threadsafe("Testing the new Python install...")
+                    ok, report = detect.verify_python_install()
+                    self._log_threadsafe(report)
+                    if not ok:
+                        self._fail_and_stop(package, report)
+                        return
+                    self._log_threadsafe("Python test passed.")
+
                 if package.id in ("deno", "node"):
                     installed_js = True
                     seen_optional_js.add(package.id)
@@ -330,6 +400,8 @@ class AutoDownloadApp(ttk.Frame):
     def _finish_install(self) -> None:
         self.set_busy(False)
         self.refresh()
+        if self._failed:
+            return
         show_info(
             self.master,
             "Done",

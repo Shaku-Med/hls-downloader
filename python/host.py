@@ -4738,6 +4738,109 @@ def run_ffmpeg_with_updates(url, filename, message):
             _JOB_LIVE.pop(job_id, None)
 
 
+def _tool_version(cmd: List[str], timeout: float = 8.0) -> Tuple[bool, str]:
+    """Run a --version style command; return (ok, short_version_or_error)."""
+    try:
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+        out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+        first = (out.splitlines()[0] if out else "").strip()
+        if r.returncode != 0 and not first:
+            return False, f"exit {r.returncode}"
+        return True, first[:160] or "ok"
+    except FileNotFoundError:
+        return False, "not found"
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)[:160]
+
+
+def _handle_health(message: dict) -> None:
+    """One-shot helper health check for the extension Options / popup UI."""
+    req_id = (message.get("requestId") or "").strip()
+    out_dir = (message.get("outputDirectory") or message.get("outputDir") or "").strip()
+    do_write_test = bool(message.get("testWrite"))
+
+    ffmpeg_path = shutil.which("ffmpeg") or ""
+    ffprobe_path = shutil.which("ffprobe") or ""
+    ffmpeg_ok, ffmpeg_ver = (False, "not found")
+    if ffmpeg_path:
+        ffmpeg_ok, ffmpeg_ver = _tool_version([ffmpeg_path, "-version"])
+    ffprobe_ok, ffprobe_ver = (False, "not found")
+    if ffprobe_path:
+        ffprobe_ok, ffprobe_ver = _tool_version([ffprobe_path, "-version"])
+
+    ytdlp_ok = _yt_dlp_importable_in_process()
+    ytdlp_ver = ""
+    if ytdlp_ok:
+        try:
+            import yt_dlp  # type: ignore
+
+            ytdlp_ver = str(
+                getattr(getattr(yt_dlp, "version", None), "__version__", None)
+                or getattr(yt_dlp, "__version__", None)
+                or ""
+            )
+        except Exception as e:
+            ytdlp_ok = False
+            ytdlp_ver = str(e)[:120]
+
+    write_ok = None
+    write_error = None
+    write_path = None
+    if do_write_test:
+        if not out_dir:
+            write_ok = False
+            write_error = "No save folder set in Options"
+        else:
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                probe = os.path.join(out_dir, ".stuff_grabber_health_test")
+                with open(probe, "w", encoding="utf-8") as f:
+                    f.write("ok\n")
+                os.remove(probe)
+                write_ok = True
+                write_path = out_dir
+            except OSError as e:
+                write_ok = False
+                write_error = str(e)
+
+    send_message(
+        {
+            "type": "health_result",
+            "requestId": req_id,
+            "success": True,
+            "python": sys.version.split()[0],
+            "pythonExecutable": sys.executable,
+            "ffmpeg": {
+                "ok": bool(ffmpeg_ok and ffmpeg_path),
+                "path": ffmpeg_path,
+                "version": ffmpeg_ver,
+            },
+            "ffprobe": {
+                "ok": bool(ffprobe_ok and ffprobe_path),
+                "path": ffprobe_path,
+                "version": ffprobe_ver,
+            },
+            "ytdlp": {
+                "ok": bool(ytdlp_ok),
+                "version": ytdlp_ver or ("missing" if not ytdlp_ok else "ok"),
+            },
+            "writeTest": {
+                "ran": do_write_test,
+                "ok": write_ok,
+                "error": write_error,
+                "path": write_path,
+            },
+        }
+    )
+
+
 def main():
     while True:
         message = read_message()
@@ -4770,6 +4873,13 @@ def main():
         if mtype == "delete_output_file":
             threading.Thread(
                 target=_handle_delete_output_file,
+                args=(message,),
+                daemon=True,
+            ).start()
+            continue
+        if mtype in ("health", "ping"):
+            threading.Thread(
+                target=_handle_health,
                 args=(message,),
                 daemon=True,
             ).start()

@@ -7,6 +7,10 @@
   <link rel="stylesheet" href="/style/options.css" />
 </head>
 <body>
+  <nav class="page-nav">
+    <a class="page-nav-link" href="/public/helper.html">Helper on this PC →</a>
+  </nav>
+
   <header class="page-header">
     <h1>Settings</h1>
     <p class="lead">
@@ -41,6 +45,19 @@
           <span>Enable image grabber</span>
         </label>
         <div class="hint">Off by default. When on: hover an image for the download popover, Images list in the popup and floating panel, and right‑click save-as. Applies to open tabs automatically.</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="group">
+    <div class="group-title">Recording</div>
+    <div class="group-card">
+      <div class="row">
+        <label class="row-check" for="rec-detach-on">
+          <input id="rec-detach-on" type="checkbox" checked />
+          <span>Pin video fullscreen while recording</span>
+        </label>
+        <div class="hint">On by default. While recording, the video goes fullscreen on top with controls so you get the cleanest capture. Turn this off if you’d rather leave the page looking normal.</div>
       </div>
     </div>
   </section>
@@ -94,7 +111,7 @@
           <option value="rose">Rose</option>
           <option value="orange">Orange</option>
         </select>
-        <div class="hint">Only used when theme is Always light or Always dark.</div>
+        <div class="hint">Used for Always light, Always dark, and Match my browser. Hidden when matching the page.</div>
       </div>
     </div>
   </section>

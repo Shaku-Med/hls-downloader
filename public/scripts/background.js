@@ -638,6 +638,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   ) {
     upsertYtdlpPagePlaceholder(tabId, {});
   }
+  // Float / image grabber should appear without opening the popup first.
+  if (changeInfo.status === 'complete' && typeof ensurePageScriptsOnTab === 'function') {
+    ensurePageScriptsOnTab(tabId, (tab && tab.url) || '');
+  }
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
@@ -718,6 +722,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
   })();
   return true;
+});
+
+/** Debounced: ping tab, reinject if content scripts are missing, remount FAB if needed. */
+const _ensureTabTimers = Object.create(null);
+function ensurePageScriptsOnTab(tabId, url) {
+  if (tabId == null) return;
+  const u = String(url || '');
+  if (!/^https?:/i.test(u) && !/^file:/i.test(u)) return;
+  if (_ensureTabTimers[tabId]) clearTimeout(_ensureTabTimers[tabId]);
+  _ensureTabTimers[tabId] = setTimeout(() => {
+    delete _ensureTabTimers[tabId];
+    try {
+      chrome.tabs.sendMessage(tabId, { type: 'HLS_GRABBER_PING' }, (res) => {
+        if (chrome.runtime.lastError || !res || !res.ok) {
+          void reinjectPageContentScripts([tabId]);
+          return;
+        }
+        if (!res.fab) {
+          chrome.tabs.sendMessage(tabId, { type: 'HLS_GRABBER_REMOUNT' }, () => {
+            void chrome.runtime.lastError;
+          });
+        }
+      });
+    } catch (_) {
+      void reinjectPageContentScripts([tabId]);
+    }
+  }, 100);
+}
+
+chrome.tabs.onActivated.addListener((activeInfo) => {
+  if (!activeInfo || activeInfo.tabId == null) return;
+  try {
+    chrome.tabs.get(activeInfo.tabId, (tab) => {
+      if (chrome.runtime.lastError || !tab) return;
+      ensurePageScriptsOnTab(tab.id, tab.url || '');
+    });
+  } catch (_) {
+    // ignore
+  }
 });
 
 /** Serialize menu rebuilds — overlapping removeAll/create causes duplicate-id errors. */
@@ -1506,6 +1549,114 @@ function nativePathOp(type, resultType, outputPath, outputDirectory, timeoutErro
   });
 }
 
+/**
+ * Ask the native helper for a health snapshot (ffmpeg / yt-dlp / optional write test).
+ * @param {{ testWrite?: boolean }} [opts]
+ */
+function probeHelperHealth(opts) {
+  const testWrite = !!(opts && opts.testWrite);
+  return new Promise(async (resolve) => {
+    const requestId = genJobId();
+    const savePath = (await getUserDownloadPath()) || '';
+    const extensionId = chrome.runtime.id || '';
+    const base = {
+      extensionId,
+      installHint: `python python/install.py ${extensionId || 'YOUR_EXTENSION_ID'}`,
+      hasPath: !!savePath,
+      savePath,
+    };
+
+    let settled = false;
+    let port;
+    try {
+      port = chrome.runtime.connectNative(NATIVE);
+    } catch (e) {
+      resolve({
+        ok: false,
+        status: 'missing',
+        error: String((e && e.message) || e),
+        ...base,
+      });
+      return;
+    }
+
+    const timeoutMs = 12000;
+    const t = setTimeout(() => {
+      finish({
+        ok: false,
+        status: 'error',
+        error: 'Helper did not respond in time. Fully quit the browser and try again.',
+        ...base,
+      });
+    }, timeoutMs);
+
+    function finish(out) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      try {
+        if (port) port.disconnect();
+      } catch (_) {
+        // ignore
+      }
+      resolve(out);
+    }
+
+    port.onMessage.addListener((msg) => {
+      if (settled) return;
+      if (!msg || msg.type !== 'health_result' || msg.requestId !== requestId) return;
+      const ffmpeg = msg.ffmpeg || {};
+      const ytdlp = msg.ytdlp || {};
+      const writeTest = msg.writeTest || {};
+      const toolsOk = !!(ffmpeg.ok && ytdlp.ok);
+      const writeFailed = testWrite && writeTest.ran && writeTest.ok === false;
+      let status = 'connected';
+      if (!toolsOk || writeFailed) status = 'degraded';
+      finish({
+        ok: true,
+        status,
+        error: writeFailed ? writeTest.error || 'Could not write to the save folder' : null,
+        python: msg.python || '',
+        pythonExecutable: msg.pythonExecutable || '',
+        ffmpeg,
+        ffprobe: msg.ffprobe || {},
+        ytdlp,
+        writeTest,
+        ...base,
+      });
+    });
+
+    port.onDisconnect.addListener(() => {
+      if (settled) return;
+      const err = chrome.runtime.lastError?.message || 'Native host disconnected';
+      const missing =
+        /not found|specified native messaging host|host not found|does not exist/i.test(err);
+      finish({
+        ok: false,
+        status: missing ? 'missing' : 'error',
+        error: err,
+        ...base,
+      });
+    });
+
+    try {
+      port.postMessage({
+        type: 'health',
+        requestId,
+        testWrite,
+        outputDirectory: testWrite && savePath ? savePath : undefined,
+      });
+    } catch (e) {
+      finish({
+        ok: false,
+        status: 'missing',
+        error: String((e && e.message) || e),
+        ...base,
+      });
+    }
+  });
+}
+
 function deleteOutputFileViaNative(outputPath, outputDirectory) {
   if (!outputPath || !outputDirectory) {
     return Promise.resolve({ ok: true, skipped: true });
@@ -1708,6 +1859,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'POPUP_OPENED') {
     broadcastCloseFloatPanel();
     respond(sendResponse, { ok: true });
+    return true;
+  }
+
+  if (message.type === 'GET_HELPER_HEALTH') {
+    probeHelperHealth({ testWrite: !!(message && message.testWrite) })
+      .then((res) => respond(sendResponse, res))
+      .catch((e) =>
+        respond(sendResponse, {
+          ok: false,
+          status: 'error',
+          error: String((e && e.message) || e),
+          extensionId: chrome.runtime.id || '',
+        })
+      );
     return true;
   }
 
