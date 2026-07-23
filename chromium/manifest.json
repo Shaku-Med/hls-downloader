@@ -53,6 +53,7 @@
         "public/scripts/download-progress.js",
         "public/scripts/yt-page-helpers.js",
         "public/scripts/ffmpeg-preset-helpers.js",
+        "public/scripts/zip-store.js",
         "public/scripts/image-hover-download.js",
         "public/scripts/video-recorder.js",
         "public/scripts/fab.js"

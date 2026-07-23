@@ -732,6 +732,9 @@
   }
 
   function downloadBlob(blob, filename) {
+    if (!(blob instanceof Blob)) {
+      throw new Error('downloadBlob expected a Blob');
+    }
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = filename;
@@ -740,6 +743,332 @@
     a.click();
     a.remove();
     setTimeout(() => URL.revokeObjectURL(a.href), 1500);
+  }
+
+  function prefersKnownPathSave() {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get(
+          ['imageSaveToKnownPath', 'userDownloadPath'],
+          (data) => {
+            if (chrome.runtime.lastError) {
+              resolve(false);
+              return;
+            }
+            const path =
+              (data &&
+                data.userDownloadPath &&
+                String(data.userDownloadPath).trim()) ||
+              '';
+            resolve(!!(data && data.imageSaveToKnownPath !== false && path));
+          }
+        );
+      } catch (_) {
+        resolve(false);
+      }
+    });
+  }
+
+  function uint8ToBase64Local(u8) {
+    const bytes = u8 instanceof Uint8Array ? u8 : new Uint8Array(u8 || []);
+    const chunk = 0x8000;
+    let binary = '';
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  function saveBlobToKnownPath(blob, filename) {
+    return new Promise(async (resolve, reject) => {
+      try {
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        chrome.runtime.sendMessage(
+          {
+            type: 'SAVE_TO_KNOWN_PATH',
+            filename,
+            base64: uint8ToBase64Local(buf),
+          },
+          (res) => {
+            const err = chrome.runtime.lastError;
+            if (err) {
+              reject(new Error(err.message || String(err)));
+              return;
+            }
+            if (!res || !res.ok) {
+              reject(new Error((res && res.error) || 'Save to folder failed'));
+              return;
+            }
+            resolve(res);
+          }
+        );
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  /** On-page completion card so the user can see the path and open the file. */
+  function showImageSavedToast(opts) {
+    const path = String((opts && opts.path) || '').trim();
+    const filename =
+      String((opts && opts.filename) || '').trim() ||
+      (path ? path.replace(/^.*[/\\]/, '') : 'image');
+    const folder = path
+      ? path.replace(/[/\\][^/\\]+$/, '') || path
+      : '';
+
+    let host = document.querySelector('[data-sg-img-saved-toast]');
+    if (!host) {
+      host = document.createElement('div');
+      host.setAttribute('data-sg-img-saved-toast', '');
+      const shadow = host.attachShadow({ mode: 'open' });
+      shadow.innerHTML = `
+        <style>
+          :host {
+            all: initial;
+            --bg: #1c1c1e;
+            --text: #fff;
+            --muted: #8e8e93;
+            --line: rgba(84, 84, 88, 0.65);
+            --accent: #0a84ff;
+            --shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+            --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+          }
+          :host([data-theme="light"]) {
+            --bg: #ffffff;
+            --text: #000;
+            --muted: #8e8e93;
+            --line: rgba(60, 60, 67, 0.18);
+            --accent: #007aff;
+            --shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
+          }
+          .wrap {
+            position: fixed; left: 16px; right: 16px; bottom: 16px; z-index: 2147483647;
+            display: none; pointer-events: none; font-family: var(--font);
+          }
+          .wrap[data-open="1"] { display: block; }
+          .card {
+            pointer-events: auto; max-width: 440px; margin: 0 auto;
+            background: color-mix(in srgb, var(--bg) 94%, transparent);
+            color: var(--text); border: 0.5px solid var(--line); border-radius: 14px;
+            box-shadow: var(--shadow); backdrop-filter: blur(18px);
+            -webkit-backdrop-filter: blur(18px); padding: 12px 14px 14px;
+          }
+          .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+          .title { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; }
+          .sub { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.4; word-break: break-word; }
+          .path {
+            margin-top: 8px; font-size: 11px; color: var(--text); line-height: 1.4;
+            word-break: break-all; opacity: 0.92;
+            padding: 8px 10px; border-radius: 10px;
+            background: color-mix(in srgb, var(--muted) 16%, transparent);
+          }
+          .actions { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+          .btn {
+            border: 0; border-radius: 980px; padding: 7px 12px; font: 600 12px/1 var(--font);
+            cursor: pointer;
+          }
+          .btn-primary { background: var(--accent); color: #fff; }
+          .btn-ghost {
+            background: color-mix(in srgb, var(--muted) 18%, transparent); color: var(--text);
+          }
+          .x {
+            flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
+            font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px;
+          }
+        </style>
+        <div class="wrap">
+          <div class="card">
+            <div class="top">
+              <div>
+                <div class="title">Saved</div>
+                <div class="sub"></div>
+              </div>
+              <button type="button" class="x" aria-label="Dismiss">×</button>
+            </div>
+            <div class="path" hidden></div>
+            <div class="actions">
+              <button type="button" class="btn btn-primary btn-open">Open</button>
+              <button type="button" class="btn btn-ghost btn-dismiss">Done</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.documentElement.appendChild(host);
+      try {
+        if (window.HGR_THEME && window.HGR_THEME.bindLiveThemeHost) {
+          window.HGR_THEME.bindLiveThemeHost(host);
+        } else if (window.HGR_THEME && window.HGR_THEME.applyStoredThemeToElement) {
+          window.HGR_THEME.applyStoredThemeToElement(host);
+        }
+      } catch (_) {
+        // ignore
+      }
+    }
+
+    const shadow = host.shadowRoot;
+    const wrap = shadow.querySelector('.wrap');
+    const sub = shadow.querySelector('.sub');
+    const pathEl = shadow.querySelector('.path');
+    const openBtn = shadow.querySelector('.btn-open');
+    const dismissBtn = shadow.querySelector('.btn-dismiss');
+    const closeBtn = shadow.querySelector('.x');
+
+    sub.textContent = filename
+      ? `“${filename}” is in your save location.`
+      : 'File is in your save location.';
+    if (path) {
+      pathEl.hidden = false;
+      pathEl.textContent = path;
+    } else if (folder) {
+      pathEl.hidden = false;
+      pathEl.textContent = folder;
+    } else {
+      pathEl.hidden = true;
+      pathEl.textContent = '';
+    }
+
+    openBtn.hidden = !path;
+    openBtn.onclick = () => {
+      if (!path) return;
+      chrome.runtime.sendMessage({ type: 'OPEN_LOCAL_PATH', path }, () => {
+        void chrome.runtime.lastError;
+      });
+    };
+    const hide = () => {
+      wrap.setAttribute('data-open', '0');
+    };
+    dismissBtn.onclick = hide;
+    closeBtn.onclick = hide;
+    wrap.setAttribute('data-open', '1');
+    if (host._sgHideTimer) clearTimeout(host._sgHideTimer);
+    host._sgHideTimer = setTimeout(hide, 12000);
+  }
+
+  /** Browser download, or Options save folder when that toggle is on. */
+  async function saveOrDownloadBlob(blob, filename) {
+    if (await prefersKnownPathSave()) {
+      const res = await saveBlobToKnownPath(blob, filename);
+      showImageSavedToast({
+        path: (res && res.path) || '',
+        filename,
+      });
+      return { via: 'known-path', path: (res && res.path) || null };
+    }
+    downloadBlob(blob, filename);
+    return { via: 'browser' };
+  }
+
+  /** Decode bytes from extension messages (base64 preferred; ArrayBuffer often arrives as {}). */
+  function bytesFromMessagePayload(msg) {
+    if (msg && typeof msg.base64 === 'string' && msg.base64.length) {
+      const bin = atob(msg.base64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    }
+    const buf = msg && msg.buffer;
+    if (buf instanceof ArrayBuffer) return new Uint8Array(buf);
+    if (ArrayBuffer.isView(buf)) {
+      return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    }
+    if (Array.isArray(buf)) return new Uint8Array(buf);
+    throw new Error('Missing or invalid file bytes (reload the extension and retry)');
+  }
+
+  function stampForZipFilename() {
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  }
+
+  function sanitizeZipStem(s) {
+    let t = String(s || '')
+      .replace(/[<>:"/\\|?*\x00-\x1f]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    t = t.replace(/^\.+|\.+$/g, '');
+    if (t.length > 60) t = t.slice(0, 60).trim();
+    return t || 'image';
+  }
+
+  function extFromImageUrlOrMime(url, mime) {
+    const fromMime = extFromMime(mime);
+    if (fromMime) return fromMime;
+    return extFromUrl(url) || 'jpg';
+  }
+
+  /**
+   * Zip download in-page (blob URL). The MV3 service worker cannot use
+   * createObjectURL, and chrome.downloads rejects large data: ZIP URLs.
+   */
+  async function downloadImagesZip(images, filenameHint) {
+    // When saving to the Options folder, let the background + native helper
+    // write the zip (chunked). Avoid huge base64 through the page→SW channel.
+    if (await prefersKnownPathSave()) {
+      const err = new Error('Defer zip to background known-path save');
+      err.defer = true;
+      throw err;
+    }
+    const zipApi = window.HLS_ZIP_STORE;
+    if (
+      !zipApi ||
+      (typeof zipApi.buildZipStore !== 'function' &&
+        typeof zipApi.buildZipStoreBytes !== 'function')
+    ) {
+      throw new Error('Zip helper unavailable');
+    }
+    const list = Array.isArray(images) ? images : [];
+    if (!list.length) throw new Error('No images to zip');
+
+    const used = new Set();
+    const files = [];
+    let failed = 0;
+    const max = Math.min(list.length, MAX_LIST_PAGE);
+    for (let i = 0; i < max; i++) {
+      const item = list[i] || {};
+      const url = String(item.url || '').trim();
+      if (!url) {
+        failed += 1;
+        continue;
+      }
+      try {
+        let blob;
+        let mime = '';
+        if (url.startsWith('data:')) {
+          blob = await (await fetch(url)).blob();
+          mime = blob.type || '';
+        } else {
+          blob = await fetchAsBlob(url);
+          mime = blob.type || '';
+        }
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        const ext = extFromImageUrlOrMime(url, mime) || 'jpg';
+        const stem = sanitizeZipStem(item.alt || item.stem || `image_${i + 1}`);
+        const name =
+          typeof zipApi.safeZipEntryName === 'function'
+            ? zipApi.safeZipEntryName(`${stem}.${ext}`, used)
+            : `${stem}.${ext}`;
+        files.push({ name, data: bytes });
+      } catch (_) {
+        failed += 1;
+      }
+    }
+    if (!files.length) {
+      throw new Error('Could not fetch any images (site may block downloads).');
+    }
+
+    const zipBlob =
+      typeof zipApi.buildZipStore === 'function'
+        ? zipApi.buildZipStore(files)
+        : new Blob([zipApi.buildZipStoreBytes(files)], { type: 'application/zip' });
+    const zipName = (
+      String(filenameHint || '').trim() ||
+      `stuff-grabber-images-${stampForZipFilename()}.zip`
+    ).replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_');
+    await saveOrDownloadBlob(zipBlob, zipName);
+    return { count: files.length, failed };
   }
 
   function extFromUrl(url) {
@@ -803,7 +1132,7 @@
         const srcExt = extFromMime(blob.type) || 'png';
         const outExt = safeFmt || srcExt;
         const outBlob = outExt === srcExt ? blob : await convertImageBlob(blob, outExt);
-        downloadBlob(outBlob, `${stem}.${outExt}`);
+        await saveOrDownloadBlob(outBlob, `${stem}.${outExt}`);
         return;
       }
       const blob = await fetchAsBlob(url);
@@ -811,7 +1140,7 @@
       const outExt = safeFmt || (srcExt || 'png');
       const outBlob =
         srcExt && (outExt === srcExt || (outExt === 'jpeg' && srcExt === 'jpg')) ? blob : await convertImageBlob(blob, outExt);
-      downloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
+      await saveOrDownloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
     } catch (e) {
       const fallbackExt = extFromUrl(url) || 'jpg';
       await requestBackgroundUrlDownload(url, `${stem}.${fallbackExt}`);
@@ -834,7 +1163,7 @@
         const srcExt = extFromMime(blob.type) || 'png';
         const outExt = fmt || srcExt;
         const outBlob = outExt === srcExt ? blob : await convertImageBlob(blob, outExt);
-        downloadBlob(outBlob, `${stem}.${outExt}`);
+        await saveOrDownloadBlob(outBlob, `${stem}.${outExt}`);
         return;
       }
 
@@ -844,7 +1173,7 @@
       const outExt = fmt || (srcExt || 'png');
 
       const outBlob = (srcExt && (outExt === srcExt || (outExt === 'jpeg' && srcExt === 'jpg'))) ? blob : await convertImageBlob(blob, outExt);
-      downloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
+      await saveOrDownloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
     } catch (e) {
       try {
         const stem = fileStemFromImg(img, url);
@@ -1265,6 +1594,53 @@
       return true;
     }
 
+    if (msg.type === 'DOWNLOAD_IMAGES_ZIP') {
+      Promise.resolve(downloadImagesZip(msg.images, msg.filename))
+        .then((res) => sendResponse({ ok: true, ...(res || {}) }))
+        .catch((e) =>
+          sendResponse({
+            ok: false,
+            error: String(e && e.message ? e.message : e),
+            defer: !!(e && e.defer),
+          })
+        );
+      return true;
+    }
+
+    if (msg.type === 'SHOW_IMAGE_SAVE_DONE') {
+      try {
+        showImageSavedToast({
+          path: msg.path || '',
+          filename: msg.filename || '',
+        });
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e) });
+      }
+      return true;
+    }
+
+    if (msg.type === 'SAVE_BLOB_BYTES') {
+      try {
+        const filename = String(msg.filename || 'download.bin').replace(
+          /[<>:"/\\|?*\x00-\x1f]+/g,
+          '_',
+        );
+        const mime = String(msg.mime || 'application/octet-stream');
+        const bytes = bytesFromMessagePayload(msg);
+        if (!bytes.length) {
+          sendResponse({ ok: false, error: 'Empty file bytes' });
+          return true;
+        }
+        const blob = new Blob([bytes], { type: mime });
+        downloadBlob(blob, filename);
+        sendResponse({ ok: true });
+      } catch (e) {
+        sendResponse({ ok: false, error: String(e) });
+      }
+      return true;
+    }
+
     if (msg.type !== 'CONTEXT_IMAGE_DOWNLOAD_AS') return;
     const p = msg.payload || {};
     const url = (p.url || '').toString().trim();
@@ -1289,6 +1665,7 @@
   window.HLS_IMAGE_DL = {
     listImages,
     downloadUrlAs,
+    downloadImagesZip,
     refreshScan,
     normalizeListScope,
     LIST_SCOPE_KEY,

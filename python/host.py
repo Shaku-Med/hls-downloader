@@ -18,6 +18,7 @@ import hashlib
 import tempfile
 import shutil
 import glob
+import base64
 import urllib.error
 import urllib.request
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
@@ -3642,6 +3643,153 @@ def _handle_delete_output_file(message: dict) -> None:
         reply(success=False, error=str(e))
 
 
+# requestId -> { path, expected, received, fh }
+_SAVE_FILE_SESSIONS: Dict[str, Dict[str, Any]] = {}
+_SAVE_FILE_LOCK = threading.Lock()
+
+
+def _split_filename_ext(filename: str) -> Tuple[str, str]:
+    base = os.path.basename((filename or "file").replace("\\", "/")).strip() or "file"
+    stem, ext = os.path.splitext(base)
+    stem = stem or "file"
+    if not ext:
+        ext = ".bin"
+    if not ext.startswith("."):
+        ext = "." + ext
+    return stem, ext.lower()
+
+
+def _handle_save_file(message: dict) -> None:
+    """Write base64 bytes into the configured save folder (image grabber direct-save)."""
+    req_id = (message.get("requestId") or "").strip()
+    out_dir = _resolve_output_dir(message)
+    raw_name = (message.get("filename") or "file.bin").strip()
+    b64 = message.get("base64") or ""
+    chunk_index = message.get("chunkIndex")
+    chunk_count = message.get("chunkCount")
+    numbered = bool(message.get("numberedOutput", True))
+
+    def reply(**fields: Any) -> None:
+        send_message({"type": "save_file_result", "requestId": req_id, **fields})
+
+    if not req_id:
+        reply(success=False, error="Missing requestId")
+        return
+    if not out_dir:
+        reply(success=False, error="Missing outputDirectory")
+        return
+
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except OSError as e:
+        reply(success=False, error=f"Could not create save folder: {e}")
+        return
+
+    try:
+        data = base64.b64decode(b64, validate=False) if b64 else b""
+    except Exception as e:
+        reply(success=False, error=f"Invalid base64: {e}")
+        return
+
+    try:
+        total = int(chunk_count) if chunk_count is not None else 1
+    except (TypeError, ValueError):
+        total = 1
+    try:
+        index = int(chunk_index) if chunk_index is not None else 0
+    except (TypeError, ValueError):
+        index = 0
+    if total < 1:
+        total = 1
+    if index < 0 or index >= total:
+        reply(success=False, error="Invalid chunk index")
+        return
+
+    stem, ext = _split_filename_ext(raw_name)
+
+    # Single-shot write
+    if total == 1:
+        try:
+            path = (
+                _numbered_output_path(out_dir, stem, ext)
+                if numbered
+                else _safe_output_path(out_dir, stem, ext)
+            )
+            with open(path, "wb") as f:
+                f.write(data)
+            reply(success=True, path=path, bytes=len(data))
+        except OSError as e:
+            reply(success=False, error=str(e))
+        return
+
+    # Chunked write into a temp file, rename on last chunk
+    with _SAVE_FILE_LOCK:
+        sess = _SAVE_FILE_SESSIONS.get(req_id)
+        if index == 0 or sess is None:
+            if sess and sess.get("fh"):
+                try:
+                    sess["fh"].close()
+                except Exception:
+                    pass
+                try:
+                    if sess.get("tmp") and os.path.isfile(sess["tmp"]):
+                        os.remove(sess["tmp"])
+                except OSError:
+                    pass
+            final = (
+                _numbered_output_path(out_dir, stem, ext)
+                if numbered
+                else _safe_output_path(out_dir, stem, ext)
+            )
+            tmp = final + ".part"
+            try:
+                fh = open(tmp, "wb")
+            except OSError as e:
+                reply(success=False, error=str(e))
+                return
+            sess = {
+                "fh": fh,
+                "tmp": tmp,
+                "final": final,
+                "expected": total,
+                "received": 0,
+                "bytes": 0,
+            }
+            _SAVE_FILE_SESSIONS[req_id] = sess
+
+        if index != sess["received"]:
+            reply(success=False, error=f"Out-of-order chunk {index} (expected {sess['received']})")
+            return
+        try:
+            sess["fh"].write(data)
+            sess["received"] += 1
+            sess["bytes"] += len(data)
+        except OSError as e:
+            try:
+                sess["fh"].close()
+            except Exception:
+                pass
+            _SAVE_FILE_SESSIONS.pop(req_id, None)
+            reply(success=False, error=str(e))
+            return
+
+        if sess["received"] < sess["expected"]:
+            # Wait for more chunks; no reply yet.
+            return
+
+        try:
+            sess["fh"].close()
+            os.replace(sess["tmp"], sess["final"])
+            path = sess["final"]
+            nbytes = sess["bytes"]
+        except OSError as e:
+            _SAVE_FILE_SESSIONS.pop(req_id, None)
+            reply(success=False, error=str(e))
+            return
+        _SAVE_FILE_SESSIONS.pop(req_id, None)
+        reply(success=True, path=path, bytes=nbytes)
+
+
 def _ffprobe_duration_seconds(path: str) -> float:
     if not path or not os.path.isfile(path):
         return 0.0
@@ -4876,6 +5024,10 @@ def main():
                 args=(message,),
                 daemon=True,
             ).start()
+            continue
+        if mtype == "save_file":
+            # Keep on the reader thread so chunked writes stay ordered on one connection.
+            _handle_save_file(message)
             continue
         if mtype in ("health", "ping"):
             threading.Thread(

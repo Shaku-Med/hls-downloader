@@ -908,6 +908,14 @@ async function ctxDownloadImageAs(url, fmt) {
   }
 
   if (blob) {
+    if (await shouldSaveImagesToKnownPath()) {
+      const name = `${stem}.${ext || 'png'}`;
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      const saved = await saveBytesViaNative(buf, name);
+      if (!saved.ok) throw new Error(saved.error || 'Could not save to folder');
+      await notifyImageSavedToast(null, saved.path || '', name);
+      return;
+    }
     const dataUrl = await blobToDataUrl(blob);
     await downloadUrlPromise({
       url: dataUrl,
@@ -915,6 +923,15 @@ async function ctxDownloadImageAs(url, fmt) {
       saveAs: false,
       conflictAction: 'uniquify',
     });
+    return;
+  }
+
+  if (await shouldSaveImagesToKnownPath()) {
+    const name = `${stem}.${ext || 'jpg'}`;
+    const fetched = await fetchImageBytes(url);
+    const saved = await saveBytesViaNative(fetched.bytes, name);
+    if (!saved.ok) throw new Error(saved.error || 'Could not save to folder');
+    await notifyImageSavedToast(null, saved.path || '', name);
     return;
   }
 
@@ -946,6 +963,7 @@ chrome.contextMenus.onClicked.addListener((info, tab) => {
 const NATIVE = 'com.medzy.hlsgrabber';
 const JOBS_KEY = 'hlsGrabJobsState';
 const USER_PATH_KEY = 'userDownloadPath';
+const IMG_SAVE_PATH_KEY = 'imageSaveToKnownPath';
 const YTDLP_MAX_HEIGHT_KEY = 'ytDlpMaxHeight';
 const KEEP_ALARM = 'hlsGrabKeepAlive';
 const MAX_SLOTS = 4;
@@ -974,6 +992,13 @@ function respond(sendResponse, payload) {
 async function getUserDownloadPath() {
   const data = await chrome.storage.local.get(USER_PATH_KEY);
   return (data[USER_PATH_KEY] && String(data[USER_PATH_KEY]).trim()) || '';
+}
+
+/** Images go to the Options save folder when the toggle is on (default) and a path is set. */
+async function shouldSaveImagesToKnownPath() {
+  const data = await chrome.storage.local.get([USER_PATH_KEY, IMG_SAVE_PATH_KEY]);
+  const path = (data[USER_PATH_KEY] && String(data[USER_PATH_KEY]).trim()) || '';
+  return !!(data[IMG_SAVE_PATH_KEY] !== false && path);
 }
 
 async function readJobsState() {
@@ -1670,6 +1695,103 @@ function deleteOutputFileViaNative(outputPath, outputDirectory) {
   );
 }
 
+/**
+ * Write bytes into the Options save folder via the native helper (chunked for large ZIPs).
+ * @param {Uint8Array|ArrayBuffer} bytes
+ * @param {string} filename
+ * @returns {Promise<{ ok: boolean, path?: string, error?: string }>}
+ */
+function saveBytesViaNative(bytes, filename) {
+  return new Promise(async (resolve) => {
+    const outDir = await getUserDownloadPath();
+    if (!outDir) {
+      resolve({ ok: false, error: 'No save location set in Options' });
+      return;
+    }
+    const name = String(filename || 'file.bin').replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_');
+    const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    const requestId = genJobId();
+    // Stay under Chrome native-messaging ~1MB limit (base64 expands ~4/3).
+    const CHUNK = 450000;
+    const chunkCount = Math.max(1, Math.ceil(Math.max(u8.length, 1) / CHUNK) || 1);
+    let settled = false;
+    let port;
+    try {
+      port = chrome.runtime.connectNative(NATIVE);
+    } catch (e) {
+      resolve({ ok: false, error: String((e && e.message) || e) });
+      return;
+    }
+    const timeoutMs = Math.max(30000, chunkCount * 5000);
+    const t = setTimeout(() => finish({ ok: false, error: 'Timed out saving to folder' }), timeoutMs);
+
+    function finish(out) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(t);
+      try {
+        if (port) port.disconnect();
+      } catch (_) {
+        // ignore
+      }
+      resolve(out);
+    }
+
+    port.onMessage.addListener((msg) => {
+      if (settled) return;
+      if (msg && msg.type === 'save_file_result' && msg.requestId === requestId) {
+        finish({
+          ok: msg.success !== false,
+          path: msg.path || null,
+          error: msg.error || null,
+        });
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      if (settled) return;
+      finish({
+        ok: false,
+        error: chrome.runtime.lastError?.message || 'Native host disconnected',
+      });
+    });
+
+    try {
+      for (let i = 0; i < chunkCount; i++) {
+        const start = i * CHUNK;
+        const end = Math.min(u8.length, start + CHUNK);
+        const slice = u8.subarray(start, end);
+        port.postMessage({
+          type: 'save_file',
+          requestId,
+          filename: name,
+          outputDirectory: outDir,
+          numberedOutput: true,
+          chunkIndex: i,
+          chunkCount,
+          base64: uint8ToBase64(slice),
+        });
+      }
+    } catch (e) {
+      finish({ ok: false, error: String(e) });
+    }
+  });
+}
+
+/** Tell the page to show the “Saved” card with path + Open. */
+async function notifyImageSavedToast(tabId, path, filename) {
+  const id = tabId != null ? tabId : await resolveActiveTabId(null, null);
+  if (id == null) return;
+  try {
+    await tabsSend(id, {
+      type: 'SHOW_IMAGE_SAVE_DONE',
+      path: path || '',
+      filename: filename || '',
+    });
+  } catch (_) {
+    // Page may not have the content script.
+  }
+}
+
 /** Turn a local disk path into a file:// URL the browser can open in a tab. */
 function localPathToFileUrl(filePath) {
   let p = String(filePath || '').trim().replace(/\\/g, '/');
@@ -1806,13 +1928,58 @@ async function fetchImageBytes(url) {
     const buf = await res.arrayBuffer();
     return { bytes: new Uint8Array(buf), mime: res.headers.get('content-type') || '' };
   }
-  const res = await fetch(url, { credentials: 'omit', cache: 'no-cache' });
+  const res = await fetch(url, { credentials: 'include', cache: 'no-cache' });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const buf = await res.arrayBuffer();
   return { bytes: new Uint8Array(buf), mime: res.headers.get('content-type') || '' };
 }
 
-/** MV3 service workers have no URL.createObjectURL — use data: URLs for chrome.downloads. */
+/** Prefer in-page blob download; data: URLs break for large ZIPs in MV3. */
+async function downloadZipBytes(zipBytes, zipName) {
+  const filename = String(zipName || 'images.zip').replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_');
+  const u8 = zipBytes instanceof Uint8Array ? zipBytes : new Uint8Array(zipBytes || []);
+
+  if (await shouldSaveImagesToKnownPath()) {
+    const saved = await saveBytesViaNative(u8, filename);
+    if (saved && saved.ok) {
+      await notifyImageSavedToast(null, saved.path || '', filename);
+      return { downloadId: null, via: 'known-path', path: saved.path || null };
+    }
+    if (saved && saved.error) {
+      throw new Error(saved.error);
+    }
+  }
+
+  const tabId = await resolveActiveTabId(null, null);
+  if (tabId != null) {
+    try {
+      // Never send raw ArrayBuffer — Chrome often clones it as {} and
+      // `new Blob([{}])` becomes the literal text "[object Object]".
+      const res = await tabsSend(tabId, {
+        type: 'SAVE_BLOB_BYTES',
+        filename,
+        mime: 'application/zip',
+        base64: uint8ToBase64(u8),
+      });
+      if (res && res.ok) return { downloadId: res.downloadId || null, via: 'tab' };
+    } catch (_) {
+      // fall through
+    }
+  }
+  if (u8.length > 1.5 * 1024 * 1024) {
+    throw new Error('Zip too large to save from background — open the page tab and try again.');
+  }
+  const dataUrl = bytesToDataUrl(u8, 'application/zip');
+  const downloadId = await downloadUrlPromise({
+    url: dataUrl,
+    filename,
+    saveAs: false,
+    conflictAction: 'uniquify',
+  });
+  return { downloadId, via: 'data-url' };
+}
+
+/** MV3 service workers have no URL.createObjectURL — use data: URLs for small files. */
 function uint8ToBase64(bytes) {
   const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
   const chunk = 0x8000;
@@ -1928,26 +2095,90 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === 'DOWNLOAD_IMAGE_URL') {
-    const url = (message.url || '').toString().trim();
-    const filename = (message.filename || '').toString().trim();
-    if (!url) {
-      respond(sendResponse, { ok: false, error: 'Missing URL' });
-      return true;
-    }
-    const opts = {
-      url,
-      saveAs: false,
-      conflictAction: 'uniquify',
-    };
-    if (filename) opts.filename = filename;
-    chrome.downloads.download(opts, (downloadId) => {
-      const err = chrome.runtime.lastError;
-      if (err) {
-        respond(sendResponse, { ok: false, error: err.message || String(err) });
-        return;
+    (async () => {
+      try {
+        const url = (message.url || '').toString().trim();
+        const filename = (message.filename || '').toString().trim();
+        if (!url) {
+          respond(sendResponse, { ok: false, error: 'Missing URL' });
+          return;
+        }
+        if (await shouldSaveImagesToKnownPath()) {
+          const data = await fetchImageBytes(url);
+          const name =
+            filename ||
+            `image.${extFromImageUrlOrMime(url, data.mime) || 'jpg'}`;
+          const saved = await saveBytesViaNative(data.bytes, name);
+          if (saved.ok) {
+            await notifyImageSavedToast(sender.tab && sender.tab.id, saved.path || '', name);
+          }
+          respond(sendResponse, {
+            ok: !!saved.ok,
+            path: saved.path || null,
+            error: saved.error || null,
+            via: 'known-path',
+          });
+          return;
+        }
+        const opts = {
+          url,
+          saveAs: false,
+          conflictAction: 'uniquify',
+        };
+        if (filename) opts.filename = filename;
+        const downloadId = await downloadUrlPromise(opts);
+        respond(sendResponse, { ok: true, downloadId });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
       }
-      respond(sendResponse, { ok: true, downloadId });
-    });
+    })();
+    return true;
+  }
+
+  if (message.type === 'SAVE_TO_KNOWN_PATH') {
+    (async () => {
+      try {
+        const filename = String(message.filename || 'file.bin').replace(
+          /[<>:"/\\|?*\x00-\x1f]+/g,
+          '_',
+        );
+        let bytes = null;
+        if (typeof message.base64 === 'string' && message.base64.length) {
+          const bin = atob(message.base64);
+          bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        } else if (message.buffer) {
+          const buf = message.buffer;
+          if (buf instanceof ArrayBuffer) bytes = new Uint8Array(buf);
+          else if (ArrayBuffer.isView(buf)) {
+            bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+          }
+        }
+        if (!bytes || !bytes.length) {
+          respond(sendResponse, { ok: false, error: 'Missing file bytes' });
+          return;
+        }
+        if (!(await shouldSaveImagesToKnownPath())) {
+          respond(sendResponse, {
+            ok: false,
+            error: 'Save-to-folder is off or no save location is set',
+          });
+          return;
+        }
+        const saved = await saveBytesViaNative(bytes, filename);
+        // Content-script callers show their own toast; only notify for other senders.
+        if (saved.ok && !(sender.tab && sender.tab.id >= 0)) {
+          await notifyImageSavedToast(null, saved.path || '', filename);
+        }
+        respond(sendResponse, {
+          ok: !!saved.ok,
+          path: saved.path || null,
+          error: saved.error || null,
+        });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
+      }
+    })();
     return true;
   }
 
@@ -2004,6 +2235,33 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           respond(sendResponse, { ok: false, error: 'No images to zip' });
           return;
         }
+        const tabId = await resolveActiveTabId(message.tabId, sender);
+        // Preferred path: page content script (cookies + blob URL download).
+        if (tabId != null) {
+          try {
+            const res = await tabsSend(tabId, {
+              type: 'DOWNLOAD_IMAGES_ZIP',
+              images,
+              filename: message.filename,
+            });
+            if (res && res.ok) {
+              respond(sendResponse, res);
+              return;
+            }
+            if (res && res.defer) {
+              // Content script asked us to save via known-path / native helper.
+            } else if (res && res.error) {
+              // Fall through to SW path only if the tab has no zip helper yet.
+              const err = String(res.error || '');
+              if (!/zip helper unavailable/i.test(err)) {
+                respond(sendResponse, res);
+                return;
+              }
+            }
+          } catch (_) {
+            // Fall through to SW fallback.
+          }
+        }
         if (
           !self.HLS_ZIP_STORE ||
           (typeof self.HLS_ZIP_STORE.buildZipStoreBytes !== 'function' &&
@@ -2048,18 +2306,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const zipName =
           String(message.filename || '').trim() ||
           `stuff-grabber-images-${stampForFilename()}.zip`;
-        const dataUrl = bytesToDataUrl(zipBytes, 'application/zip');
-        const downloadId = await downloadUrlPromise({
-          url: dataUrl,
-          filename: zipName.replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_'),
-          saveAs: false,
-          conflictAction: 'uniquify',
-        });
+        const saved = await downloadZipBytes(zipBytes, zipName);
         respond(sendResponse, {
           ok: true,
-          downloadId,
+          downloadId: saved.downloadId,
           count: files.length,
           failed,
+          via: saved.via,
         });
       } catch (e) {
         respond(sendResponse, { ok: false, error: String(e) });
@@ -2200,6 +2453,36 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
         respond(sendResponse, { ok: true });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'OPEN_LOCAL_PATH') {
+    (async () => {
+      try {
+        const path = String(message.path || '').trim();
+        if (!path) {
+          respond(sendResponse, { ok: false, error: 'Missing path' });
+          return;
+        }
+        const outDir = await getUserDownloadPath();
+        if (outDir) {
+          const norm = (s) => String(s).replace(/\\/g, '/').toLowerCase();
+          const ap = norm(path);
+          const ad = norm(outDir).replace(/\/+$/, '');
+          if (!(ap === ad || ap.startsWith(ad + '/'))) {
+            respond(sendResponse, { ok: false, error: 'Path is outside the save folder' });
+            return;
+          }
+        }
+        const opened = await openLocalFileInBrowserTab(path);
+        respond(sendResponse, {
+          ok: !!opened.ok,
+          error: opened.error || null,
+        });
       } catch (e) {
         respond(sendResponse, { ok: false, error: String(e) });
       }

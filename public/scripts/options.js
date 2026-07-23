@@ -1,6 +1,7 @@
 const KEY = 'userDownloadPath';
 const FLOAT_KEY = 'floatGrabberEnabled';
 const IMG_DL_KEY = 'imageHoverDownloadEnabled';
+const IMG_SAVE_PATH_KEY = 'imageSaveToKnownPath';
 const REC_DETACH_KEY = 'recordDetachVideoEnabled';
 const YTDLP_MODE_KEY = 'ytDlpQualityMode';
 const FFMPEG_PRESET_MODE_KEY = 'ffmpegPresetMode';
@@ -23,8 +24,20 @@ function syncAccentRowVisibility() {
   row.hidden = mode === 'page';
 }
 
+function syncImgSavePathRow() {
+  const row = document.getElementById('img-save-path-row');
+  const imgDlEl = document.getElementById('img-dl-on');
+  const pathEl = document.getElementById('path');
+  if (!row || !imgDlEl || !pathEl) return;
+  const grabberOn = !!imgDlEl.checked;
+  const hasPath = pathEl.value.trim().length >= 3;
+  row.hidden = !(grabberOn && hasPath);
+}
+
 function load() {
-  chrome.storage.local.get([KEY, FLOAT_KEY, IMG_DL_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY], (data) => {
+  chrome.storage.local.get(
+    [KEY, FLOAT_KEY, IMG_DL_KEY, IMG_SAVE_PATH_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY],
+    (data) => {
     const err = chrome.runtime.lastError;
     if (err) {
       showStatus(String(err), 'err');
@@ -35,6 +48,8 @@ function load() {
     if (floatEl) floatEl.checked = data[FLOAT_KEY] !== false;
     const imgDlEl = document.getElementById('img-dl-on');
     if (imgDlEl) imgDlEl.checked = data[IMG_DL_KEY] === true; // default OFF
+    const imgSavePathEl = document.getElementById('img-save-path-on');
+    if (imgSavePathEl) imgSavePathEl.checked = data[IMG_SAVE_PATH_KEY] !== false; // default ON when shown
     const recDetachEl = document.getElementById('rec-detach-on');
     if (recDetachEl) recDetachEl.checked = data[REC_DETACH_KEY] !== false; // default ON
     const qEl = document.getElementById('ytdlp-quality');
@@ -51,6 +66,7 @@ function load() {
     const ta = document.getElementById('ui-theme-accent');
     if (ta) ta.value = data[THEME_ACCENT_KEY] || 'blue';
     syncAccentRowVisibility();
+    syncImgSavePathRow();
     if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhanceAll) {
       HLS_IOS_SELECT.enhanceAll(document);
     }
@@ -69,6 +85,7 @@ function saveToLocalStorage({ quiet } = {}) {
       showStatus(String(err), 'err');
       return;
     }
+    syncImgSavePathRow();
     if (!quiet) {
       showStatus('Saved. That folder will be used for new downloads.', 'ok');
     } else {
@@ -85,6 +102,7 @@ let debounceTimer;
 const pathInput = document.getElementById('path');
 pathInput.addEventListener('input', () => {
   clearTimeout(debounceTimer);
+  syncImgSavePathRow();
   debounceTimer = setTimeout(() => {
     const p = pathInput.value.trim();
     if (p.length >= 3) saveToLocalStorage({ quiet: true });
@@ -110,6 +128,14 @@ const imgDlOn = document.getElementById('img-dl-on');
 if (imgDlOn) {
   imgDlOn.addEventListener('change', () => {
     chrome.storage.local.set({ [IMG_DL_KEY]: !!imgDlOn.checked });
+    syncImgSavePathRow();
+  });
+}
+
+const imgSavePathOn = document.getElementById('img-save-path-on');
+if (imgSavePathOn) {
+  imgSavePathOn.addEventListener('change', () => {
+    chrome.storage.local.set({ [IMG_SAVE_PATH_KEY]: !!imgSavePathOn.checked });
   });
 }
 
