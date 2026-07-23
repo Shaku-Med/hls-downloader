@@ -886,6 +886,64 @@ async function ctxConvertImageBlob(blob, fmt) {
   return out;
 }
 
+/**
+ * Fetch (and convert) an image in the background, then write it to the save
+ * folder via the helper. Runs here rather than in the page so the request is
+ * not subject to page CORS, which used to fail and dump files into the
+ * browser Downloads folder instead.
+ */
+async function bgFetchConvertSaveImage(url, fmt, stemHint, tabId, opts) {
+  const stem =
+    String(stemHint || '').replace(/[<>:"/\\|?*\x00-\x1f]+/g, '_').trim() ||
+    ctxSafeStemFromUrl(url);
+  const want = String(fmt || '').toLowerCase();
+
+  let blob = null;
+  let ext = want === 'jpeg' ? 'jpg' : want;
+  try {
+    const res = await fetchWithTimeout(url, { credentials: 'include' }, 45000);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const srcBlob = await res.blob();
+    const srcExt = ctxExtFromMime(srcBlob.type);
+    if (!want || (srcExt && (want === srcExt || (want === 'jpeg' && srcExt === 'jpg')))) {
+      blob = srcBlob;
+      ext = srcExt || ext || 'jpg';
+    } else {
+      blob = await ctxConvertImageBlob(srcBlob, want);
+      ext = want === 'jpeg' ? 'jpg' : want;
+    }
+  } catch (_) {
+    blob = null;
+  }
+
+  const name = `${stem}.${ext || 'jpg'}`;
+  let bytes = null;
+  if (blob) {
+    bytes = new Uint8Array(await blob.arrayBuffer());
+  } else {
+    const fetched = await fetchImageBytes(url);
+    bytes = fetched.bytes;
+  }
+  if (!bytes || !bytes.length) {
+    return { ok: false, via: 'known-path', error: 'Could not read the image' };
+  }
+
+  const saved = await saveBytesViaNative(bytes, name);
+  if (!saved.ok) {
+    return {
+      ok: false,
+      via: 'known-path',
+      error: saved.error || 'Could not save to folder',
+    };
+  }
+  // Only ping the tab for callers with no reply channel (context menu). The
+  // message flow shows its own card from the response.
+  if (opts && opts.notify) {
+    await notifyImageSavedToast(tabId, saved.path || '', name);
+  }
+  return { ok: true, via: 'known-path', path: saved.path || null, filename: name };
+}
+
 async function ctxDownloadImageAs(url, fmt) {
   const stem = ctxSafeStemFromUrl(url);
   let blob = null;
@@ -1921,6 +1979,20 @@ function extFromImageUrlOrMime(url, mime) {
   return 'jpg';
 }
 
+/** fetch that cannot hang forever and leave a message port unanswered. */
+async function fetchWithTimeout(url, init, ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1000, ms || 45000));
+  try {
+    return await fetch(url, { ...(init || {}), signal: controller.signal });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('Timed out fetching the image');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchImageBytes(url) {
   if (String(url).startsWith('data:')) {
     const res = await fetch(url);
@@ -1928,7 +2000,7 @@ async function fetchImageBytes(url) {
     const buf = await res.arrayBuffer();
     return { bytes: new Uint8Array(buf), mime: res.headers.get('content-type') || '' };
   }
-  const res = await fetch(url, { credentials: 'include', cache: 'no-cache' });
+  const res = await fetchWithTimeout(url, { credentials: 'include', cache: 'no-cache' }, 45000);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const buf = await res.arrayBuffer();
   return { bytes: new Uint8Array(buf), mime: res.headers.get('content-type') || '' };
@@ -2094,6 +2166,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'SAVE_IMAGE_TO_FOLDER') {
+    (async () => {
+      try {
+        const url = (message.url || '').toString().trim();
+        if (!url) {
+          respond(sendResponse, { ok: false, error: 'Missing URL' });
+          return;
+        }
+        if (!(await shouldSaveImagesToKnownPath())) {
+          // Caller should use the browser download path instead.
+          respond(sendResponse, { ok: false, via: 'browser', notConfigured: true });
+          return;
+        }
+        const res = await bgFetchConvertSaveImage(
+          url,
+          message.fmt,
+          message.stem,
+          sender.tab && sender.tab.id,
+        );
+        respond(sendResponse, res);
+      } catch (e) {
+        respond(sendResponse, {
+          ok: false,
+          via: 'known-path',
+          error: String((e && e.message) || e),
+        });
+      }
+    })();
+    return true;
+  }
+
   if (message.type === 'DOWNLOAD_IMAGE_URL') {
     (async () => {
       try {
@@ -2127,7 +2230,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         };
         if (filename) opts.filename = filename;
         const downloadId = await downloadUrlPromise(opts);
-        respond(sendResponse, { ok: true, downloadId });
+        respond(sendResponse, { ok: true, downloadId, via: 'browser' });
       } catch (e) {
         respond(sendResponse, { ok: false, error: String(e) });
       }

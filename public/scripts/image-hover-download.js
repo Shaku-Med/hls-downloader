@@ -745,26 +745,33 @@
     setTimeout(() => URL.revokeObjectURL(a.href), 1500);
   }
 
-  function prefersKnownPathSave() {
+  /**
+   * Reads the save preference. `readFailed` matters: a storage error must not
+   * be mistaken for "user wants browser downloads", or files silently land in
+   * the browser folder instead of the configured one.
+   */
+  function readImageSaveConfig() {
     return new Promise((resolve) => {
+      const failed = { known: false, hasPath: false, readFailed: true };
       try {
         chrome.storage.local.get(
           ['imageSaveToKnownPath', 'userDownloadPath'],
           (data) => {
-            if (chrome.runtime.lastError) {
-              resolve(false);
+            if (chrome.runtime.lastError || !data) {
+              resolve(failed);
               return;
             }
             const path =
-              (data &&
-                data.userDownloadPath &&
-                String(data.userDownloadPath).trim()) ||
-              '';
-            resolve(!!(data && data.imageSaveToKnownPath !== false && path));
+              (data.userDownloadPath && String(data.userDownloadPath).trim()) || '';
+            resolve({
+              known: !!(data.imageSaveToKnownPath !== false && path),
+              hasPath: !!path,
+              readFailed: false,
+            });
           }
         );
       } catch (_) {
-        resolve(false);
+        resolve(failed);
       }
     });
   }
@@ -857,6 +864,8 @@
           }
           .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
           .title { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; }
+          .card[data-kind="error"] .title { color: #ff453a; }
+          :host([data-theme="light"]) .card[data-kind="error"] .title { color: #ff3b30; }
           .sub { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.4; word-break: break-word; }
           .path {
             margin-top: 8px; font-size: 11px; color: var(--text); line-height: 1.4;
@@ -909,15 +918,29 @@
 
     const shadow = host.shadowRoot;
     const wrap = shadow.querySelector('.wrap');
+    const card = shadow.querySelector('.card');
+    const titleEl = shadow.querySelector('.title');
     const sub = shadow.querySelector('.sub');
     const pathEl = shadow.querySelector('.path');
     const openBtn = shadow.querySelector('.btn-open');
     const dismissBtn = shadow.querySelector('.btn-dismiss');
     const closeBtn = shadow.querySelector('.x');
 
-    sub.textContent = filename
-      ? `“${filename}” is in your save location.`
-      : 'File is in your save location.';
+    const kind = (opts && opts.kind) || 'saved';
+    const named = filename ? `“${filename}”` : 'The image';
+    card.setAttribute('data-kind', kind);
+
+    if (kind === 'error') {
+      titleEl.textContent = 'Could not save';
+      sub.textContent = `${named} was not saved. ${(opts && opts.error) || ''}`.trim();
+    } else if (kind === 'browser') {
+      titleEl.textContent = 'Downloaded';
+      sub.textContent = `${named} went to your browser downloads folder.`;
+    } else {
+      titleEl.textContent = 'Saved';
+      sub.textContent = `${named} is in your save location.`;
+    }
+
     if (path) {
       pathEl.hidden = false;
       pathEl.textContent = path;
@@ -946,17 +969,22 @@
     host._sgHideTimer = setTimeout(hide, 12000);
   }
 
-  /** Browser download, or Options save folder when that toggle is on. */
+  /** Save folder when that toggle is on, otherwise a browser download. */
   async function saveOrDownloadBlob(blob, filename) {
-    if (await prefersKnownPathSave()) {
+    const cfg = await readImageSaveConfig();
+    if (cfg.known || cfg.readFailed) {
+      // Let the caller retry via the background helper before ever falling
+      // back to the browser folder.
       const res = await saveBlobToKnownPath(blob, filename);
       showImageSavedToast({
         path: (res && res.path) || '',
         filename,
+        kind: 'saved',
       });
       return { via: 'known-path', path: (res && res.path) || null };
     }
     downloadBlob(blob, filename);
+    showImageSavedToast({ filename, kind: 'browser' });
     return { via: 'browser' };
   }
 
@@ -1006,7 +1034,8 @@
   async function downloadImagesZip(images, filenameHint) {
     // When saving to the Options folder, let the background + native helper
     // write the zip (chunked). Avoid huge base64 through the page→SW channel.
-    if (await prefersKnownPathSave()) {
+    const zipCfg = await readImageSaveConfig();
+    if (zipCfg.known) {
       const err = new Error('Defer zip to background known-path save');
       err.defer = true;
       throw err;
@@ -1085,6 +1114,49 @@
     }
   }
 
+  /** Turn extension plumbing errors into something a user can act on. */
+  function friendlyPortError(raw) {
+    const msg = String(raw || '');
+    if (/message port closed|Receiving end does not exist|context invalidated/i.test(msg)) {
+      return 'Stuff Grabber was updated or restarted. Reload this page and try again.';
+    }
+    return msg || 'Could not save to folder';
+  }
+
+  /** Background fetches + saves to the folder; the page never fetches. */
+  function requestBackgroundFolderSave(url, fmt, stem) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = (res) => {
+        if (settled) return;
+        settled = true;
+        resolve(res);
+      };
+      // The helper can take a while on big images; never leave the UI stuck.
+      const timer = setTimeout(
+        () => done({ ok: false, error: 'The save is taking too long. Check the helper.' }),
+        120000
+      );
+      try {
+        chrome.runtime.sendMessage(
+          { type: 'SAVE_IMAGE_TO_FOLDER', url, fmt, stem },
+          (res) => {
+            clearTimeout(timer);
+            const err = chrome.runtime.lastError;
+            if (err) {
+              done({ ok: false, error: friendlyPortError(err.message || err) });
+              return;
+            }
+            done(res || { ok: false, error: 'No response from the extension' });
+          }
+        );
+      } catch (e) {
+        clearTimeout(timer);
+        done({ ok: false, error: friendlyPortError((e && e.message) || e) });
+      }
+    });
+  }
+
   function requestBackgroundUrlDownload(url, filename) {
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage({ type: 'DOWNLOAD_IMAGE_URL', url, filename }, (res) => {
@@ -1126,6 +1198,25 @@
     const safeFmt = (fmt || 'png').toLowerCase();
     const stem = sanitizeFileStem(stemHint) || 'image';
     if (!url) return;
+
+    const cfg = await readImageSaveConfig();
+    if ((cfg.known || cfg.readFailed) && !url.startsWith('data:')) {
+      const res = await requestBackgroundFolderSave(url, safeFmt, stem);
+      if (res && res.ok) {
+        showImageSavedToast({
+          path: res.path || '',
+          filename: res.filename || stem,
+          kind: 'saved',
+        });
+        return;
+      }
+      if (!(res && res.notConfigured)) {
+        const msg = String((res && res.error) || 'Could not save to folder');
+        showImageSavedToast({ filename: stem, kind: 'error', error: msg });
+        throw new Error(msg);
+      }
+    }
+
     try {
       if (url.startsWith('data:')) {
         const blob = await (await fetch(url)).blob();
@@ -1143,7 +1234,17 @@
       await saveOrDownloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
     } catch (e) {
       const fallbackExt = extFromUrl(url) || 'jpg';
-      await requestBackgroundUrlDownload(url, `${stem}.${fallbackExt}`);
+      const name = `${stem}.${fallbackExt}`;
+      try {
+        await requestBackgroundUrlDownload(url, name);
+      } catch (err2) {
+        showImageSavedToast({
+          filename: name,
+          kind: 'error',
+          error: String((err2 && err2.message) || err2 || ''),
+        });
+        throw err2;
+      }
     }
   }
 
@@ -1157,35 +1258,65 @@
     elDl.disabled = true;
     elDl.textContent = 'Working…';
     try {
-      if (url.startsWith('data:')) {
-        const blob = await (await fetch(url)).blob();
-        const stem = fileStemFromImg(img, url);
-        const srcExt = extFromMime(blob.type) || 'png';
-        const outExt = fmt || srcExt;
-        const outBlob = outExt === srcExt ? blob : await convertImageBlob(blob, outExt);
-        await saveOrDownloadBlob(outBlob, `${stem}.${outExt}`);
+      const stem = fileStemFromImg(img, url);
+      const cfg = await readImageSaveConfig();
+
+      // Save location on: the background does the request and writes the file.
+      // data: URLs have no network request, so those still go direct.
+      if ((cfg.known || cfg.readFailed) && !url.startsWith('data:')) {
+        const res = await requestBackgroundFolderSave(url, fmt, stem);
+        if (res && res.ok) {
+          showImageSavedToast({
+            path: res.path || '',
+            filename: res.filename || stem,
+            kind: 'saved',
+          });
+          return;
+        }
+        if (res && res.notConfigured) {
+          await browserDownloadImage(img, url, fmt, stem);
+          return;
+        }
+        showImageSavedToast({
+          filename: stem,
+          kind: 'error',
+          error: String((res && res.error) || 'Could not save to folder'),
+        });
         return;
       }
 
-      const blob = await fetchAsBlob(url);
-      const stem = fileStemFromImg(img, url);
-      const srcExt = extFromMime(blob.type);
-      const outExt = fmt || (srcExt || 'png');
-
-      const outBlob = (srcExt && (outExt === srcExt || (outExt === 'jpeg' && srcExt === 'jpg'))) ? blob : await convertImageBlob(blob, outExt);
-      await saveOrDownloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
+      await browserDownloadImage(img, url, fmt, stem);
     } catch (e) {
-      try {
-        const stem = fileStemFromImg(img, url);
-        const fallbackExt = extFromUrl(url) || 'jpg';
-        await requestBackgroundUrlDownload(url, `${stem}.${fallbackExt}`);
-      } catch (_) {
-        console.warn('Image download failed', e);
-      }
+      console.warn('Image download failed', e);
+      showImageSavedToast({
+        filename: fileStemFromImg(img, url),
+        kind: 'error',
+        error: String((e && e.message) || e || ''),
+      });
     } finally {
       elDl.disabled = false;
       elDl.textContent = 'Download';
     }
+  }
+
+  /** Page-side fetch + convert, used when saving to the folder is off. */
+  async function browserDownloadImage(img, url, fmt, stem) {
+    if (url.startsWith('data:')) {
+      const blob = await (await fetch(url)).blob();
+      const srcExt = extFromMime(blob.type) || 'png';
+      const outExt = fmt || srcExt;
+      const outBlob = outExt === srcExt ? blob : await convertImageBlob(blob, outExt);
+      await saveOrDownloadBlob(outBlob, `${stem}.${outExt}`);
+      return;
+    }
+    const blob = await fetchAsBlob(url);
+    const srcExt = extFromMime(blob.type);
+    const outExt = fmt || srcExt || 'png';
+    const outBlob =
+      srcExt && (outExt === srcExt || (outExt === 'jpeg' && srcExt === 'jpg'))
+        ? blob
+        : await convertImageBlob(blob, outExt);
+    await saveOrDownloadBlob(outBlob, `${stem}.${outExt === 'jpeg' ? 'jpg' : outExt}`);
   }
 
   function listImages(options) {
