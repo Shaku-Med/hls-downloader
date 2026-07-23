@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
 from .osinfo import MIN_PYTHON, is_windows
+from .paths import PROJECT_ROOT
 
 _PROBE_SNIPPET = "import sys;print('%d.%d.%d' % sys.version_info[:3]);print(sys.executable)"
 
@@ -138,14 +140,44 @@ def find_python_anywhere(minimum: Tuple[int, int] = MIN_PYTHON) -> Optional[Pyth
     return None
 
 
-def helper_python(minimum: Tuple[int, int] = MIN_PYTHON) -> Optional[PythonInfo]:
-    """The interpreter the native host will run, mirroring python/install.py.
+def _python_from_host_wrapper() -> Optional[str]:
+    """The wrapper the native-messaging manifest points at names the real interpreter.
 
-    yt-dlp has to be installed into this one, not just any Python on PATH.
+    That file is the ground truth: PATH lookups can resolve to a different
+    Python than the one the host actually runs, which silently installs
+    packages where the host will never see them.
+    """
+    for name in ("python/host_wrapper.bat", "host_wrapper.bat"):
+        wrapper = PROJECT_ROOT / name
+        if not wrapper.is_file():
+            continue
+        try:
+            text = wrapper.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in re.finditer(r'"([^"]+?python(?:w)?\.exe)"', text, re.IGNORECASE):
+            candidate = match.group(1)
+            if "%" in candidate:
+                continue
+            if Path(candidate).is_file():
+                return candidate
+    return None
+
+
+def helper_python(minimum: Tuple[int, int] = MIN_PYTHON) -> Optional[PythonInfo]:
+    """The interpreter the native host actually runs.
+
+    yt-dlp and curl-cffi have to be installed into this one, not just any
+    Python on PATH.
     """
     override = os.environ.get("HLS_GRABBER_PYTHON")
     if override and Path(override).is_file():
         info = _probe_python([override])
+        if info and info.meets(minimum):
+            return info
+    from_wrapper = _python_from_host_wrapper()
+    if from_wrapper:
+        info = _probe_python([from_wrapper])
         if info and info.meets(minimum):
             return info
     for name in ("python3", "python"):
@@ -215,6 +247,12 @@ def has_ffmpeg() -> bool:
 
 def has_ytdlp() -> bool:
     ok, _ = run_probe(helper_python_argv() + ["-m", "yt_dlp", "--version"])
+    return ok
+
+
+def has_curl_cffi() -> bool:
+    """Browser impersonation backend; sites like Dailymotion refuse yt-dlp without it."""
+    ok, _ = run_probe(helper_python_argv() + ["-c", "import curl_cffi"])
     return ok
 
 

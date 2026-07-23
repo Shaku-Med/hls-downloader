@@ -5,6 +5,7 @@ from typing import Dict, List
 from . import detect, osinfo
 from .models import Package
 from .platform_cmds import (
+    curl_cffi_plans,
     deno_plans,
     ffmpeg_plans,
     node_plans,
@@ -75,6 +76,16 @@ def build_catalog() -> List[Package]:
             prerequisites=("python", "pip"),
             build_plans=ytdlp_plans,
             missing_hint="Python and pip must work before yt-dlp can install.",
+        ),
+        Package(
+            id="curl_cffi",
+            title="curl-cffi",
+            summary="Browser impersonation for yt-dlp. Dailymotion and similar sites need it.",
+            required=False,
+            detect=detect.has_curl_cffi,
+            prerequisites=("python", "pip"),
+            build_plans=curl_cffi_plans,
+            missing_hint="Without it yt-dlp fails with 'attempting impersonation, but none of these impersonate targets are available'.",
         ),
         Package(
             id="deno",

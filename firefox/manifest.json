@@ -51,6 +51,18 @@
         "file:///*"
       ],
       "js": [
+        "public/scripts/video-recorder.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "http://*/*",
+        "https://*/*",
+        "file:///*"
+      ],
+      "js": [
         "public/scripts/ios-select.js",
         "public/scripts/theme-helpers.js",
         "public/scripts/social-post-urls.js",
@@ -59,7 +71,6 @@
         "public/scripts/ffmpeg-preset-helpers.js",
         "public/scripts/zip-store.js",
         "public/scripts/image-hover-download.js",
-        "public/scripts/video-recorder.js",
         "public/scripts/fab.js"
       ],
       "css": [

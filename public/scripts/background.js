@@ -79,12 +79,26 @@ const SOCIAL_CDN_HOSTS = [
   'music.apple.com', 'itunes.apple.com', 'mzstatic.com',
 ];
 
+/**
+ * Social hosts that still serve a usable manifest. Dailymotion hands out plain
+ * HLS that ffmpeg can pull straight, so list those rows next to the page
+ * download instead of hiding them. Instagram/TikTok stay page-only because
+ * their blobs are signed and expire.
+ */
+const PAGE_PLUS_STREAM_HOSTS = ['dailymotion.com', 'dm-event.net', 'dmcdn.net'];
+
 function hostOfUrl(url) {
   try {
     return new URL(url).hostname.toLowerCase().replace(/^www\./, '');
   } catch {
     return '';
   }
+}
+
+function isPagePlusStreamHost(url) {
+  const h = hostOfUrl(url);
+  if (!h) return false;
+  return PAGE_PLUS_STREAM_HOSTS.some((d) => h === d || h.endsWith('.' + d));
 }
 
 function isSocialCdnHost(url) {
@@ -164,6 +178,13 @@ function classifyVideoFromUrl(url) {
   // Social and platform CDNs first, before the generic extension checks below. A signed
   // Instagram blob ends in .mp4?token and would otherwise look like a plain direct file,
   // when what we really want is to hand yt-dlp the page URL like we do for YouTube.
+  // Dailymotion-style hosts: a real manifest is a valid ffmpeg input, so surface
+  // it as its own row. The page-download row still comes from the DOM scan.
+  if (isPagePlusStreamHost(url)) {
+    if (/[/.](m3u8|m3u)(?:[?#]|$)/.test(u)) return { kind: 'hls', reason: 'manifest' };
+    if (/[/.]mpd(?:[?#]|$)/.test(u)) return { kind: 'dash', reason: 'manifest' };
+  }
+
   if (socialPageMediaHit(url)) {
     return { kind: 'social', reason: 'host' };
   }
@@ -525,7 +546,7 @@ chrome.webRequest.onHeadersReceived.addListener(
     // A social CDN media response (e.g. an Instagram video/mp4 blob) should become the
     // page download, not a raw stream row. Otherwise we would try to pull the signed blob
     // straight and end up with a broken few-hundred-byte file.
-    if (socialPageMediaHit(url)) {
+    if (socialPageMediaHit(url) && !isPagePlusStreamHost(url)) {
       upsertYtdlpPagePlaceholder(tabId, {});
       return;
     }
@@ -617,6 +638,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     }
     delete _ytdlpPageCap[tabId];
     detectedStreams[tabId] = [];
+    delete recorderFrames[tabId];
     chrome.action.setBadgeText({ text: '', tabId });
     notifyStreamsChanged(tabId);
   }
@@ -651,7 +673,114 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   }
   delete _ytdlpPageCap[tabId];
   delete detectedStreams[tabId];
+  delete recorderFrames[tabId];
 });
+
+/**
+ * Sub-frames that have the recorder injected, per tab: { [tabId]: { [frameId]: {url} } }.
+ * The top frame cannot read a cross-origin player, but the extension runs inside
+ * that frame too, so we talk to it directly by frameId.
+ */
+const recorderFrames = {};
+
+function noteRecorderFrame(tabId, frameId, url) {
+  if (tabId == null || tabId < 0 || !frameId) return;
+  if (!recorderFrames[tabId]) recorderFrames[tabId] = {};
+  recorderFrames[tabId][frameId] = { url: String(url || ''), seen: Date.now() };
+}
+
+function knownRecorderFrameIds(tabId) {
+  return Object.keys(recorderFrames[tabId] || {})
+    .map((n) => Number(n))
+    .filter((n) => Number.isFinite(n) && n > 0);
+}
+
+/** Ask one frame something; never rejects, so one dead frame cannot stall the rest. */
+function askFrame(tabId, frameId, payload) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v);
+    };
+    const timer = setTimeout(() => done(null), 4000);
+    try {
+      chrome.tabs.sendMessage(tabId, payload, { frameId }, (res) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          done(null);
+          return;
+        }
+        done(res || null);
+      });
+    } catch (_) {
+      clearTimeout(timer);
+      done(null);
+    }
+  });
+}
+
+/**
+ * Scan every frame and merge the results into one list. Each video carries the
+ * frameId that owns it so focus/record can be routed back to the right frame.
+ */
+async function scanAllFrames(tabId) {
+  const frameIds = [0, ...knownRecorderFrameIds(tabId)];
+  const payload = { type: 'VIDEO_RECORDER', action: 'scan' };
+  const results = await Promise.all(frameIds.map((fid) => askFrame(tabId, fid, payload)));
+
+  const merged = [];
+  let recording = false;
+  let embeddedPlayers = [];
+  let stale = false;
+
+  results.forEach((res, i) => {
+    const frameId = frameIds[i];
+    if (!res || !res.ok) {
+      if (frameId > 0) stale = true;
+      return;
+    }
+    if (res.recording) recording = true;
+    const frameUrl = (recorderFrames[tabId] && recorderFrames[tabId][frameId]?.url) || '';
+    let host = '';
+    try {
+      if (frameUrl) host = new URL(frameUrl).hostname.replace(/^www\./, '');
+    } catch (_) {
+      host = '';
+    }
+    for (const v of res.videos || []) {
+      merged.push({ ...v, frameId, frameIndex: v.index, frameHost: host });
+    }
+    // Only the top frame can see iframes worth offering as a fallback.
+    if (frameId === 0 && Array.isArray(res.embeddedPlayers)) {
+      embeddedPlayers = res.embeddedPlayers;
+    }
+  });
+
+  // Drop frames that stopped answering so the registry does not grow stale.
+  if (stale && recorderFrames[tabId]) {
+    results.forEach((res, i) => {
+      const fid = frameIds[i];
+      if (fid > 0 && !res) delete recorderFrames[tabId][fid];
+    });
+  }
+
+  // Re-index so the UI has one flat list.
+  merged.forEach((v, i) => {
+    v.index = i;
+  });
+
+  return {
+    ok: true,
+    count: merged.length,
+    recording,
+    videos: merged,
+    embeddedPlayers,
+    preferredStartIndex: 0,
+    frames: frameIds.length,
+  };
+}
 
 const IMAGE_GRABBER_KEY = 'imageHoverDownloadEnabled';
 const FLOAT_GRABBER_KEY = 'floatGrabberEnabled';
@@ -2558,6 +2687,89 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         respond(sendResponse, { ok: true });
       } catch (e) {
         respond(sendResponse, { ok: false, error: String(e) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'RECORDER_FRAME_READY') {
+    noteRecorderFrame(
+      sender.tab && sender.tab.id,
+      sender.frameId,
+      message.url || (sender.frame && sender.frame.url) || ''
+    );
+    respond(sendResponse, { ok: true });
+    return true;
+  }
+
+  // Recorder actions that must cover embedded players, not just the top frame.
+  if (message.type === 'VIDEO_RECORDER_ALL') {
+    (async () => {
+      try {
+        const tabId = await resolveActiveTabId(message.tabId, sender);
+        if (tabId == null) {
+          respond(sendResponse, { ok: false, error: 'No active tab' });
+          return;
+        }
+        if (message.action === 'scan') {
+          respond(sendResponse, await scanAllFrames(tabId));
+          return;
+        }
+        // focus / start / stop go to the frame that owns the video.
+        const frameId = Number.isFinite(Number(message.frameId)) ? Number(message.frameId) : 0;
+        const forward = { type: 'VIDEO_RECORDER', action: message.action };
+        if (message.index != null) forward.index = message.index;
+        if (message.startIndex != null) forward.startIndex = message.startIndex;
+        if (message.action === 'stop') {
+          // Stop everywhere: a recording may be running in more than one frame.
+          const ids = [0, ...knownRecorderFrameIds(tabId)];
+          const all = await Promise.all(ids.map((fid) => askFrame(tabId, fid, forward)));
+          const stopped = [];
+          for (const r of all) {
+            if (r && r.ok && Array.isArray(r.stopped)) stopped.push(...r.stopped);
+          }
+          respond(sendResponse, { ok: true, stopped });
+          return;
+        }
+        const res = await askFrame(tabId, frameId, forward);
+        respond(sendResponse, res || { ok: false, error: 'That frame stopped responding' });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String((e && e.message) || e) });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === 'OPEN_URL_IN_TAB') {
+    (async () => {
+      // The URL comes from page markup, so only ever allow real web pages.
+      let target = null;
+      try {
+        const parsed = new URL(String(message.url || ''));
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+          target = parsed.href;
+        }
+      } catch (_) {
+        target = null;
+      }
+      if (!target) {
+        respond(sendResponse, { ok: false, error: 'Only http and https links can be opened' });
+        return;
+      }
+      try {
+        const openerId = sender.tab && sender.tab.id;
+        await new Promise((resolve) => {
+          chrome.tabs.create(
+            { url: target, active: true, ...(openerId != null ? { openerTabId: openerId } : {}) },
+            () => {
+              void chrome.runtime.lastError;
+              resolve();
+            }
+          );
+        });
+        respond(sendResponse, { ok: true });
+      } catch (e) {
+        respond(sendResponse, { ok: false, error: String((e && e.message) || e) });
       }
     })();
     return true;

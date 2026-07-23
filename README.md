@@ -139,7 +139,31 @@ python -m yt_dlp --version
 ```
 
 
-5. A JavaScript runtime for YouTube (recommended)
+5. curl-cffi (needed for Dailymotion and similar)
+
+Some sites check the TLS fingerprint of whatever is talking to them and refuse anything that is not a real browser. yt-dlp can fake that, but only if curl-cffi is installed. Without it Dailymotion fails with:
+
+```text
+The extractor is attempting impersonation, but none of these
+impersonate targets are available: firefox
+```
+
+It comes with `requirements.txt`, or install it on its own:
+
+```text
+python -m pip install -U curl-cffi
+```
+
+Check that targets are actually available:
+
+```text
+python -m yt_dlp --list-impersonate-targets
+```
+
+If every row says `(unavailable)`, curl-cffi is not installed in the Python the helper runs. That is the important part: it has to go into the same interpreter as the helper, not just any Python on your PATH. Auto Download handles that for you and reads the helper wrapper to find the right one.
+
+
+6. A JavaScript runtime for YouTube (recommended)
 
 For a lot of YouTube downloads, yt-dlp wants Deno or Node on your PATH. Install one of them if YouTube keeps failing with challenge or solver style errors.
 
@@ -160,7 +184,7 @@ winget install OpenJS.NodeJS.LTS
 or install Node from nodejs.org.
 
 
-6. This project folder
+7. This project folder
 
 Clone the repo from GitHub, then keep this Stuff Grabber folder somewhere stable on disk. If you move it later, you have to run the helper installer again.
 
@@ -331,6 +355,15 @@ python -m yt_dlp --version
 
 Then run `python python/install.py` again with the same Python.
 
+A site fails with "attempting impersonation, but none of these impersonate targets are available". Install curl-cffi into the helper Python:
+
+```text
+python -m pip install -U curl-cffi
+python -m yt_dlp --list-impersonate-targets
+```
+
+If that list still shows `(unavailable)` on every row, you installed it into a different Python than the helper uses. Open `python/host_wrapper.bat` (or the shell equivalent) and use the exact interpreter path it names, or just run Auto Download and let it pick.
+
 Saves fail with path or permission errors. Change the Options folder to a place your user can write.
 
 The list is noisy. Pick the page download when you see one, or pick the main playlist style URL and ignore the tiny junk links.
@@ -364,9 +397,10 @@ Before first use you should have:
 
 ```text
 A Chromium browser (Chrome, Edge, Brave, or similar)
-Python 3 with pip
+Python 3.9 or newer with pip
 ffmpeg on PATH
 yt-dlp installed for that Python
+curl-cffi installed for that Python (Dailymotion and similar)
 Deno or Node on PATH if you care about YouTube
 This repo cloned and the folder loaded as an unpacked extension
 python python/install.py run with your Extension ID

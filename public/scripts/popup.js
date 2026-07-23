@@ -1447,6 +1447,7 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
   let isRecording = false;
   let pollTimer = null;
   let videos = [];
+  let embeds = [];
   let selectedIndex = 0;
   let selectEnhanced = false;
 
@@ -1460,12 +1461,80 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
     }
   }
 
+  function shortHost(text, max) {
+    const t = String(text || '').trim();
+    return t.length > max ? `${t.slice(0, max - 1)}…` : t;
+  }
+
+  /** Cross-origin player: give the user a real button, not instructions. */
+  function renderEmbedHint(list) {
+    if (Array.isArray(list) && list.length) embeds = list;
+    if (!embeds.length) return false;
+    statusEl.textContent = '';
+    statusEl.hidden = false;
+
+    const box = document.createElement('div');
+    box.className = 'embed-notice';
+
+    const title = document.createElement('div');
+    title.className = 'embed-notice-title';
+    title.textContent = 'Can’t record this player';
+    box.appendChild(title);
+
+    const text = document.createElement('div');
+    text.className = 'embed-notice-text';
+    text.textContent =
+      'The video is played through another site. To record it, open that site on its own. To just save the file, use a stream below instead.';
+    box.appendChild(text);
+
+    embeds.forEach((e) => {
+      const openBtn = document.createElement('button');
+      openBtn.type = 'button';
+      openBtn.className = 'embed-open-btn';
+      openBtn.textContent = `Open ${shortHost(e.host, 30)}`;
+      openBtn.title = e.url;
+      openBtn.addEventListener('click', () => {
+        openBtn.disabled = true;
+        openBtn.textContent = 'Opening…';
+        chrome.runtime.sendMessage({ type: 'OPEN_URL_IN_TAB', url: e.url }, () => {
+          void chrome.runtime.lastError;
+          window.close();
+        });
+      });
+      box.appendChild(openBtn);
+
+      const link = document.createElement('div');
+      link.className = 'embed-notice-url';
+      link.textContent = e.url;
+      box.appendChild(link);
+    });
+
+    statusEl.appendChild(box);
+    return true;
+  }
+
+  /** frameId of the video the user picked, so embedded players are reachable. */
+  function frameIdForIndex(idx) {
+    const v = videos[idx];
+    return v && Number.isFinite(Number(v.frameId)) ? Number(v.frameId) : 0;
+  }
+
+  /** The merged list is re-indexed; each frame still uses its own numbering. */
+  function frameLocalIndex(idx) {
+    const v = videos[idx];
+    return v && Number.isFinite(Number(v.frameIndex)) ? Number(v.frameIndex) : idx;
+  }
+
   function sendToTab(action, cb, extra) {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tab = tabs && tabs[0];
       if (!tab || !tab.id) { cb({ ok: false, error: 'No active tab' }); return; }
-      const msg = Object.assign({ type: 'VIDEO_RECORDER', action }, extra || {});
-      chrome.tabs.sendMessage(tab.id, msg, (res) => {
+      // Goes through the background so every frame is covered, not just the top one.
+      const msg = Object.assign(
+        { type: 'VIDEO_RECORDER_ALL', action, tabId: tab.id },
+        extra || {}
+      );
+      chrome.runtime.sendMessage(msg, (res) => {
         if (chrome.runtime.lastError) {
           cb({ ok: false, error: "I can't record on this page. Try reloading it. Some browser pages just won't allow it." });
           return;
@@ -1527,6 +1596,7 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
 
   function applyVideoList(res) {
     videos = Array.isArray(res && res.videos) ? res.videos : [];
+    embeds = Array.isArray(res && res.embeddedPlayers) ? res.embeddedPlayers : [];
     const pref = Number.isFinite(Number(res && res.preferredStartIndex))
       ? Number(res.preferredStartIndex)
       : selectedIndex;
@@ -1614,6 +1684,11 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
               : `Found ${res.count} videos. Pick which one to start with, then hit Rec.`
           );
         }
+      } else if (embeds.length) {
+        // Nothing recordable here, but we can hand over the player URL.
+        setRecordUiVisible(true);
+        btn.disabled = true;
+        renderEmbedHint();
       } else {
         setRecordUiVisible(false);
       }
@@ -1627,11 +1702,14 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
     if (isRecording) return;
     sendToTab('focus', (res) => {
       if (!res || !res.ok) {
+        // The listed video is gone. If a cross-origin player is what is really
+        // on the page, offer to open it rather than just complaining.
+        if (renderEmbedHint(res && res.embeddedPlayers)) return;
         setStatus(res?.error || 'Couldn’t find that video. Try again.');
         return;
       }
       setStatus(`Got it. Brought you to “${shortLabel(res.label, 48)}”.`);
-    }, { index: idx });
+    }, { index: frameLocalIndex(idx), frameId: frameIdForIndex(idx) });
   });
 
   btn.addEventListener('click', () => {
@@ -1666,10 +1744,10 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
             if (fail.length) msg += ` (${fail.length} skipped)`;
             setStatus(msg);
           }
-        } else {
+        } else if (!renderEmbedHint(res && res.embeddedPlayers)) {
           setStatus(res?.error || 'Couldn’t start recording');
         }
-      }, { startIndex: selectedIndex });
+      }, { startIndex: frameLocalIndex(selectedIndex), frameId: frameIdForIndex(selectedIndex) });
     }
   });
 

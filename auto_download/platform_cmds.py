@@ -189,6 +189,16 @@ def ytdlp_plans() -> List[CommandPlan]:
     ]
 
 
+def curl_cffi_plans() -> List[CommandPlan]:
+    argv = detect.helper_python_argv()
+    return [
+        CommandPlan(
+            label="Install curl-cffi with pip",
+            argv=[*argv, "-m", "pip", "install", "-U", "curl-cffi"],
+        )
+    ]
+
+
 def deno_plans() -> List[CommandPlan]:
     plans: List[CommandPlan] = []
     family = osinfo.os_family()

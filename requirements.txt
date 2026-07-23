@@ -4,3 +4,8 @@
 #   python -m pip install -r requirements.txt
 #
 yt-dlp>=2024.8.0
+
+# Browser impersonation (TLS/JA3 fingerprint). Dailymotion and a growing number
+# of sites refuse yt-dlp without it: "The extractor is attempting impersonation,
+# but none of these impersonate targets are available".
+curl-cffi>=0.7.0

@@ -505,6 +505,9 @@
     return {
       ok: true,
       count: videos.length,
+      // >0 means a cross-origin player is on the page that this frame cannot read.
+      blockedFrames: blockedFrameCount(),
+      embeddedPlayers: embeddedPlayerUrls(),
       preferredStartIndex,
       recording: recording || recordings.size > 0,
       videos: videos.map((video, index) => {
@@ -528,11 +531,88 @@
     };
   }
 
+  function frameIsReachable(iframe) {
+    try {
+      const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+      return !!doc;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** Players embedded from another domain are unreachable from this frame. */
+  function blockedFrameCount() {
+    let n = 0;
+    for (const iframe of document.querySelectorAll('iframe')) {
+      if (!frameIsReachable(iframe)) n += 1;
+    }
+    return n;
+  }
+
+  /**
+   * Cross-origin iframes we cannot read into, but whose src attribute the parent
+   * can still read. Opening one as a top-level tab makes its video reachable.
+   * Small frames are skipped so ad/tracking iframes do not show up.
+   */
+  function embeddedPlayerUrls() {
+    const found = [];
+    const seen = new Set();
+    for (const iframe of document.querySelectorAll('iframe')) {
+      if (frameIsReachable(iframe)) continue;
+      let rect;
+      try {
+        rect = iframe.getBoundingClientRect();
+      } catch (_) {
+        continue;
+      }
+      // Skip ad/tracker frames, but stay loose enough not to miss a real player.
+      if (!rect || rect.width < 120 || rect.height < 80) continue;
+      let raw = '';
+      try {
+        raw = iframe.src || iframe.getAttribute('src') || '';
+      } catch (_) {
+        continue;
+      }
+      if (!raw) continue;
+      let abs;
+      try {
+        abs = new URL(raw, location.href);
+      } catch (_) {
+        continue;
+      }
+      // Only ever hand back real web pages, never javascript:/data:/blob:.
+      if (abs.protocol !== 'http:' && abs.protocol !== 'https:') continue;
+      if (seen.has(abs.href)) continue;
+      seen.add(abs.href);
+      found.push({
+        url: abs.href,
+        host: abs.hostname.replace(/^www\./, ''),
+        area: Math.round(rect.width * rect.height),
+      });
+    }
+    // Biggest frame first: the player is almost always the largest one.
+    found.sort((a, b) => b.area - a.area);
+    return found.slice(0, 4);
+  }
+
+  function noVideoReason() {
+    // Only blame an embedded player when we actually found one to point at.
+    if (embeddedPlayerUrls().length > 0) {
+      return 'This player is embedded from another site, so the page cannot reach it. Open it in its own tab, or use a stream row from the list.';
+    }
+    if (blockedFrameCount() > 0) {
+      return 'No video element is reachable on this page. Use a stream row from the list instead.';
+    }
+    return 'That video disappeared. Open the list again.';
+  }
+
   function focusVideo(index) {
     const videos = findVideoElements();
     const i = Math.max(0, Math.min(videos.length - 1, Number(index) | 0));
     const video = videos[i];
-    if (!video) return { ok: false, error: 'That video disappeared. Open the list again.' };
+    if (!video) {
+      return { ok: false, error: noVideoReason(), embeddedPlayers: embeddedPlayerUrls() };
+    }
     preferredStartIndex = i;
     try {
       video.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
@@ -965,7 +1045,13 @@
   function startRecording(opts) {
     if (recording) return { ok: false, error: 'Already recording' };
     const videos = findVideoElements();
-    if (!videos.length) return { ok: false, error: 'No videos on this page right now' };
+    if (!videos.length) {
+      return {
+        ok: false,
+        error: noVideoReason(),
+        embeddedPlayers: embeddedPlayerUrls(),
+      };
+    }
 
     const rawStart = opts && Number.isFinite(Number(opts.startIndex))
       ? Number(opts.startIndex)
@@ -1103,6 +1189,8 @@
       remaining: st.queueRemaining,
       preferredStartIndex: listed.preferredStartIndex,
       videos: listed.videos,
+      blockedFrames: listed.blockedFrames,
+      embeddedPlayers: listed.embeddedPlayers,
     };
   }
 
@@ -1137,6 +1225,40 @@
     stop: stopRecording,
     status: getStatus,
   };
+
+  const isTopFrame = (() => {
+    try {
+      return window.top === window.self;
+    } catch (_) {
+      return false;
+    }
+  })();
+
+  /**
+   * This runs in every frame. Sub-frames announce themselves so the background
+   * learns their frameId and can reach an embedded player directly, which the
+   * top frame cannot do across origins.
+   */
+  function announceFrame() {
+    if (isTopFrame) return;
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: 'RECORDER_FRAME_READY',
+          url: String(location.href || '').slice(0, 500),
+          videoCount: findVideoElements().length,
+        },
+        () => void chrome.runtime.lastError
+      );
+    } catch (_) {
+      // Extension reloaded; the next scan re-announces.
+    }
+  }
+
+  announceFrame();
+  // Players often attach their <video> well after document_idle.
+  setTimeout(announceFrame, 1500);
+  setTimeout(announceFrame, 5000);
 
   // Window resize: pause all active recordings during the resize burst, resume
   // once it settles (debounced). Avoids freeze-on-resize getting into the file.

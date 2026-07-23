@@ -1199,6 +1199,22 @@ def _looks_like_spotify_drm_or_unsupported(err_tail: str) -> bool:
     return any(n in t for n in needles)
 
 
+def _looks_like_missing_impersonation(err_tail: str) -> bool:
+    t = (err_tail or "").lower()
+    return "impersonat" in t and (
+        "not available" in t or "none of these" in t or "no impersonate" in t
+    )
+
+
+def _impersonation_help_message() -> str:
+    py = sys.executable or "python"
+    return (
+        "This site needs browser impersonation, which yt-dlp cannot do without "
+        "curl-cffi. Install it into the helper Python and retry:\n"
+        f'  "{py}" -m pip install -U curl-cffi'
+    )
+
+
 def _spotify_oembed_query(spotify_url: str) -> Optional[str]:
     u = (spotify_url or "").strip()
     if not u:
@@ -2060,6 +2076,8 @@ def run_yt_dlp_with_updates(
     err = f"yt-dlp exited with code {code}"
     if tail:
         err = err + ": " + tail[-600:]
+    if _looks_like_missing_impersonation(tail):
+        err = _impersonation_help_message()
     if spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
         err = (
             "Spotify source protected (DRM/unsupported). "

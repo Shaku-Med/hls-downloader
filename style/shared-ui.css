@@ -528,6 +528,56 @@
 .rec-status { margin-top: 0; font-size: 11px; }
 .rec-status:empty { display: none; }
 
+/* ── Embedded-player notice ──
+   Deliberately quieter than a stream card: this is a helper action, not the
+   main download, so it must not read as the primary button. */
+.embed-notice {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: var(--radius-ctrl);
+  background: var(--fill-secondary);
+  border: 0.5px solid var(--line);
+}
+.embed-notice-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+.embed-notice-text {
+  margin-top: 3px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--muted);
+}
+.embed-open-btn {
+  margin-top: 8px;
+  width: 100%;
+  border: none;
+  border-radius: 980px;
+  padding: 8px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  background: var(--fill);
+  color: var(--accent);
+  transition: background var(--transition), transform 120ms ease;
+}
+.embed-open-btn:hover { background: var(--fill-secondary); }
+.embed-open-btn:active { transform: scale(0.98); }
+.embed-open-btn:disabled { opacity: 0.5; cursor: default; }
+.embed-notice-url {
+  margin-top: 5px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--muted);
+  word-break: break-all;
+  opacity: 0.8;
+}
+
 /* ── Page images ── */
 .images-root:not([hidden]):not(:empty), #fab-images:not(:empty) {
   margin-top: 14px;
