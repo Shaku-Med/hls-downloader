@@ -1695,7 +1695,72 @@
     // ignore
   }
 
+  /**
+   * Where the user last right-clicked. The browser only reports srcUrl when it
+   * hit-tests the image itself, which an overlay or `pointer-events: none`
+   * prevents, so remember the point and resolve the image ourselves.
+   */
+  let _lastCtxPoint = null;
+  window.addEventListener(
+    'contextmenu',
+    (ev) => {
+      _lastCtxPoint = { x: ev.clientX, y: ev.clientY, at: Date.now() };
+    },
+    true
+  );
+
+  /** Hit-test by geometry, which ignores pointer-events entirely. */
+  function imageUrlAtPoint(pt) {
+    if (!pt) return '';
+    const hits = [];
+    let nodes;
+    try {
+      nodes = document.querySelectorAll('img, image, [style*="background-image"]');
+    } catch (_) {
+      return '';
+    }
+    for (const el of nodes) {
+      let r;
+      try {
+        r = el.getBoundingClientRect();
+      } catch (_) {
+        continue;
+      }
+      if (!r || r.width < 8 || r.height < 8) continue;
+      if (pt.x < r.left || pt.x > r.right || pt.y < r.top || pt.y > r.bottom) continue;
+
+      let url = '';
+      if (el instanceof HTMLImageElement) {
+        url = pickImgUrl(el);
+      } else {
+        try {
+          const bg = getComputedStyle(el).backgroundImage || '';
+          const m = /url\((['"]?)(.*?)\1\)/i.exec(bg);
+          if (m && m[2]) url = new URL(m[2], location.href).href;
+        } catch (_) {
+          url = '';
+        }
+      }
+      if (!url || !/^https?:|^data:/i.test(url)) continue;
+      // Smallest match wins: that is the most specific thing under the cursor.
+      hits.push({ url, area: r.width * r.height });
+    }
+    if (!hits.length) return '';
+    hits.sort((a, b) => a.area - b.area);
+    return hits[0].url;
+  }
+
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    if (msg && msg.type === 'CONTEXT_IMAGE_AT_POINT') {
+      let url = '';
+      try {
+        url = imageUrlAtPoint(_lastCtxPoint);
+      } catch (_) {
+        url = '';
+      }
+      sendResponse({ ok: !!url, url });
+      return true;
+    }
     if (!stillOwner()) return;
     if (!msg || !msg.type) return;
 
@@ -1743,6 +1808,8 @@
         showImageSavedToast({
           path: msg.path || '',
           filename: msg.filename || '',
+          kind: msg.kind || 'saved',
+          error: msg.error || '',
         });
         sendResponse({ ok: true });
       } catch (e) {

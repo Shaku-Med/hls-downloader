@@ -2,6 +2,20 @@ const KEY = 'userDownloadPath';
 const FLOAT_KEY = 'floatGrabberEnabled';
 const IMG_DL_KEY = 'imageHoverDownloadEnabled';
 const IMG_SAVE_PATH_KEY = 'imageSaveToKnownPath';
+
+// Right-click menu. Absent means on, so it works without visiting Options.
+const CTX_MENU_ENABLED_KEY = 'ctxMenuEnabled';
+const CTX_MENU_IMAGE_KEY = 'ctxMenuImage';
+const CTX_MENU_MEDIA_KEY = 'ctxMenuMedia';
+const CTX_MENU_LINK_KEY = 'ctxMenuLink';
+const CTX_MENU_PAGE_KEY = 'ctxMenuPage';
+const CTX_MENU_BOXES = [
+  ['ctx-on', CTX_MENU_ENABLED_KEY],
+  ['ctx-image-on', CTX_MENU_IMAGE_KEY],
+  ['ctx-media-on', CTX_MENU_MEDIA_KEY],
+  ['ctx-link-on', CTX_MENU_LINK_KEY],
+  ['ctx-page-on', CTX_MENU_PAGE_KEY],
+];
 const REC_DETACH_KEY = 'recordDetachVideoEnabled';
 const YTDLP_MODE_KEY = 'ytDlpQualityMode';
 const FFMPEG_PRESET_MODE_KEY = 'ffmpegPresetMode';
@@ -34,9 +48,18 @@ function syncImgSavePathRow() {
   row.hidden = !(grabberOn && hasPath);
 }
 
+/** Per-entry choices only matter while the menu itself is on. */
+function syncCtxItemsRow() {
+  const row = document.getElementById('ctx-items-row');
+  const master = document.getElementById('ctx-on');
+  if (!row || !master) return;
+  row.hidden = !master.checked;
+}
+
 function load() {
   chrome.storage.local.get(
-    [KEY, FLOAT_KEY, IMG_DL_KEY, IMG_SAVE_PATH_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY],
+    [KEY, FLOAT_KEY, IMG_DL_KEY, IMG_SAVE_PATH_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY,
+     CTX_MENU_ENABLED_KEY, CTX_MENU_IMAGE_KEY, CTX_MENU_MEDIA_KEY, CTX_MENU_LINK_KEY, CTX_MENU_PAGE_KEY],
     (data) => {
     const err = chrome.runtime.lastError;
     if (err) {
@@ -65,8 +88,13 @@ function load() {
     if (tm) tm.value = data[THEME_MODE_KEY] || 'system';
     const ta = document.getElementById('ui-theme-accent');
     if (ta) ta.value = data[THEME_ACCENT_KEY] || 'blue';
+    for (const [id, key] of CTX_MENU_BOXES) {
+      const el = document.getElementById(id);
+      if (el) el.checked = data[key] !== false; // default on
+    }
     syncAccentRowVisibility();
     syncImgSavePathRow();
+    syncCtxItemsRow();
     if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhanceAll) {
       HLS_IOS_SELECT.enhanceAll(document);
     }
@@ -129,6 +157,15 @@ if (imgDlOn) {
   imgDlOn.addEventListener('change', () => {
     chrome.storage.local.set({ [IMG_DL_KEY]: !!imgDlOn.checked });
     syncImgSavePathRow();
+  });
+}
+
+for (const [id, key] of CTX_MENU_BOXES) {
+  const el = document.getElementById(id);
+  if (!el) continue;
+  el.addEventListener('change', () => {
+    chrome.storage.local.set({ [key]: !!el.checked });
+    if (key === CTX_MENU_ENABLED_KEY) syncCtxItemsRow();
   });
 }
 

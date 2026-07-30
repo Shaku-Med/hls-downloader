@@ -419,6 +419,30 @@
       fabCtl.closePanel();
       return;
     }
+    if (msg.type === 'HLS_GRABBER_OPEN_FLOAT_PANEL') {
+      // Asked for explicitly from the right-click menu, so open even when the
+      // floating button is switched off — mount it just for this.
+      try {
+        if (!liveFabHost || !liveFabHost.isConnected) mountGrabberUi();
+      } catch (_) {
+        // ignore
+      }
+      try {
+        fabCtl.openPanel();
+      } catch (_) {
+        // ignore
+      }
+      // Mounting finishes wiring a tick later; retry so the panel is not missed.
+      setTimeout(() => {
+        try {
+          fabCtl.openPanel();
+        } catch (_) {
+          // ignore
+        }
+      }, 80);
+      if (typeof sendResponse === 'function') sendResponse({ ok: true });
+      return true;
+    }
     if (msg.type === 'HLS_GRABBER_LIVE_UPDATE') {
       fabCtl.liveRefresh(msg.kind || 'jobs');
       return;

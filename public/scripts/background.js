@@ -4,6 +4,37 @@ const CTX_IMG_ROOT = 'sg_ctx_img_root';
 const CTX_IMG_FMT_PREFIX = 'sg_ctx_img_fmt_';
 const CTX_IMG_FMTS = ['png', 'jpg', 'jpeg', 'webp'];
 
+const CTX_ROOT = 'sg_ctx_root';
+const CTX_IMG_MENU_FMTS = ['png', 'jpg', 'webp'];
+// Deliberately not sharing a prefix with CTX_IMG_PT_PREFIX: the click handler
+// matches on that prefix and would otherwise read the parent as a format.
+const CTX_IMG_PT_ROOT = 'sg_ctx_imgpoint_root';
+const CTX_IMG_PT_PREFIX = 'sg_ctx_imgpt_';
+/**
+ * Every context except 'image'. A poster wrapped in a link reports as 'link',
+ * not 'page', so a page-only entry would never show on exactly the images this
+ * is meant to rescue. 'image' is excluded because the direct entries cover it.
+ */
+const CTX_IMG_PT_CONTEXTS = ['page', 'link', 'frame', 'video', 'audio'];
+const CTX_MEDIA_VIDEO = 'sg_ctx_media_video';
+const CTX_MEDIA_AUDIO = 'sg_ctx_media_audio';
+const CTX_LINK_DL = 'sg_ctx_link_dl';
+const CTX_PAGE_PANEL = 'sg_ctx_page_panel';
+
+// Context menu settings. Absent means on, so the menu works out of the box.
+const CTX_MENU_ENABLED_KEY = 'ctxMenuEnabled';
+const CTX_MENU_IMAGE_KEY = 'ctxMenuImage';
+const CTX_MENU_MEDIA_KEY = 'ctxMenuMedia';
+const CTX_MENU_LINK_KEY = 'ctxMenuLink';
+const CTX_MENU_PAGE_KEY = 'ctxMenuPage';
+const CTX_MENU_KEYS = [
+  CTX_MENU_ENABLED_KEY,
+  CTX_MENU_IMAGE_KEY,
+  CTX_MENU_MEDIA_KEY,
+  CTX_MENU_LINK_KEY,
+  CTX_MENU_PAGE_KEY,
+];
+
 // Service worker (Chromium): pull in helpers. Firefox uses background.scripts
 // in firefox/manifest.json instead — importScripts is not available there.
 if (typeof importScripts === 'function') {
@@ -248,9 +279,70 @@ function streamKindFromContentType(contentType) {
     return 'by_header';
   }
   if (c === 'application/octet-stream' || c === 'binary/octet-stream') {
+    // Not conclusive on its own — genericBinaryMediaKind() judges these by the
+    // rest of the response instead.
     return null;
   }
   return null;
+}
+
+/** Plain binaries that are large and range-servable but are not media. */
+const NON_MEDIA_FILE_RE =
+  /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|exe|msi|dmg|pkg|deb|rpm|apk|ipa|iso|img|vhd|bin|jar|pdf|docx?|xlsx?|pptx?|epub|torrent)(?:[?#]|$)/i;
+
+const MEDIA_FILE_RE =
+  /\.(mp4|m4v|mov|webm|mkv|avi|flv|ogv|ts|m2ts|mp3|m4a|aac|flac|wav|opus|ogg)(?:[?#]|$)/i;
+
+/** Below this a generic binary is more likely a font/blob than a video. */
+const GENERIC_MEDIA_MIN_BYTES = 1024 * 1024;
+
+function filenameFromContentDisposition(value) {
+  if (!value) return '';
+  const star = /filename\*\s*=\s*(?:[\w-]+'')?([^;]+)/i.exec(value);
+  if (star) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ''));
+    } catch (_) {
+      // fall through to the plain form
+    }
+  }
+  const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(value);
+  return plain ? plain[1].trim() : '';
+}
+
+/** Total body size, preferring Content-Range since range requests are partial. */
+function totalSizeFromHeaders(headers) {
+  const range = getHeaderValue(headers, 'content-range');
+  const m = /\/\s*(\d+)\s*$/.exec(range || '');
+  if (m) return Number(m[1]) || 0;
+  const len = Number(getHeaderValue(headers, 'content-length'));
+  return Number.isFinite(len) ? len : 0;
+}
+
+/**
+ * Media served as a generic binary. Plenty of hosts hand out an extensionless
+ * URL with Content-Type: application/octet-stream, so the type alone tells us
+ * nothing — judge it by the shape of the response instead. A large body the
+ * server will seek into is a media file in practice.
+ * @returns {string | null}
+ */
+function genericBinaryMediaKind(url, headers) {
+  const ct = (getHeaderValue(headers, 'content-type') || '').toLowerCase().split(';')[0].trim();
+  if (ct && ct !== 'application/octet-stream' && ct !== 'binary/octet-stream') return null;
+
+  const disposition = filenameFromContentDisposition(
+    getHeaderValue(headers, 'content-disposition')
+  );
+  if (NON_MEDIA_FILE_RE.test(disposition) || NON_MEDIA_FILE_RE.test(String(url))) return null;
+  // The server named the file: trust that over any guessing.
+  if (MEDIA_FILE_RE.test(disposition)) return 'direct';
+
+  const seekable =
+    /bytes/i.test(getHeaderValue(headers, 'accept-ranges')) ||
+    !!getHeaderValue(headers, 'content-range');
+  if (!seekable) return null;
+
+  return totalSizeFromHeaders(headers) >= GENERIC_MEDIA_MIN_BYTES ? 'direct' : null;
 }
 
 function upsertStream(tabId, url, capturedHeaders, streamKind) {
@@ -555,7 +647,8 @@ chrome.webRequest.onHeadersReceived.addListener(
       return;
     }
     const ct = getHeaderValue(details.responseHeaders, 'content-type');
-    const k = streamKindFromContentType(ct);
+    const k =
+      streamKindFromContentType(ct) || genericBinaryMediaKind(url, details.responseHeaders);
     if (!k) return;
     if (k === 'by_header' && /[/.](ts|m2ts|mts|m4s)(?:[?#]|$)/i.test(lower)) return;
     if (k === 'hls_by_header' || k === 'dash') {
@@ -921,24 +1014,103 @@ function ctxMenusCreate(createProperties) {
   });
 }
 
-function setupImageContextMenus() {
+/**
+ * Right-click menu. Independent of the image grabber toggle — this is on by
+ * default and each group can be hidden from Options.
+ */
+function setupContextMenus() {
   _ctxMenusChain = _ctxMenusChain
     .then(async () => {
-      const data = await chrome.storage.local.get([IMAGE_GRABBER_KEY]);
-      const enabled = data && data[IMAGE_GRABBER_KEY] === true;
+      const data = await chrome.storage.local.get(CTX_MENU_KEYS);
+      // Every key defaults to on, so only an explicit false hides a group.
+      const on = (key) => data[key] !== false;
+
       await ctxMenusRemoveAll();
-      if (!enabled) return;
+      if (!on(CTX_MENU_ENABLED_KEY)) return;
+
+      const showImage = on(CTX_MENU_IMAGE_KEY);
+      const showMedia = on(CTX_MENU_MEDIA_KEY);
+      const showLink = on(CTX_MENU_LINK_KEY);
+      const showPage = on(CTX_MENU_PAGE_KEY);
+      if (!showImage && !showMedia && !showLink && !showPage) return;
+
+      // A child only shows if its context is also on the parent, so the root
+      // has to carry the union. The image group needs 'page' too for its
+      // under-the-cursor entry.
+      const ctxSet = new Set();
+      if (showImage) {
+        ctxSet.add('image');
+        for (const c of CTX_IMG_PT_CONTEXTS) ctxSet.add(c);
+      }
+      if (showMedia) ctxSet.add('video').add('audio');
+      if (showLink) ctxSet.add('link');
+      if (showPage) ctxSet.add('page');
+      const rootContexts = [...ctxSet];
+
       await ctxMenusCreate({
-        id: CTX_IMG_ROOT,
-        title: 'Stuff Grabber: Download image (PNG)',
-        contexts: ['image'],
+        id: CTX_ROOT,
+        title: 'Stuff Grabber',
+        contexts: rootContexts,
       });
-      for (const fmt of CTX_IMG_FMTS) {
+
+      if (showImage) {
+        for (const fmt of CTX_IMG_MENU_FMTS) {
+          await ctxMenusCreate({
+            id: `${CTX_IMG_FMT_PREFIX}${fmt}`,
+            parentId: CTX_ROOT,
+            title: `Save image as ${fmt.toUpperCase()}`,
+            contexts: ['image'],
+          });
+        }
+        // The browser only offers the image context when it hit-tests the image
+        // itself. An overlay or `pointer-events: none` hides it, so offer the
+        // same thing from the page context and find the image by coordinates.
         await ctxMenusCreate({
-          id: `${CTX_IMG_FMT_PREFIX}${fmt}`,
-          parentId: CTX_IMG_ROOT,
-          title: `Save as ${fmt.toUpperCase()}`,
-          contexts: ['image'],
+          id: CTX_IMG_PT_ROOT,
+          parentId: CTX_ROOT,
+          title: 'Save image under the cursor',
+          contexts: CTX_IMG_PT_CONTEXTS,
+        });
+        for (const fmt of CTX_IMG_MENU_FMTS) {
+          await ctxMenusCreate({
+            id: `${CTX_IMG_PT_PREFIX}${fmt}`,
+            parentId: CTX_IMG_PT_ROOT,
+            title: fmt.toUpperCase(),
+            contexts: CTX_IMG_PT_CONTEXTS,
+          });
+        }
+      }
+
+      if (showMedia) {
+        await ctxMenusCreate({
+          id: CTX_MEDIA_VIDEO,
+          parentId: CTX_ROOT,
+          title: 'Download this video',
+          contexts: ['video'],
+        });
+        await ctxMenusCreate({
+          id: CTX_MEDIA_AUDIO,
+          parentId: CTX_ROOT,
+          title: 'Download this audio',
+          contexts: ['audio'],
+        });
+      }
+
+      if (showLink) {
+        await ctxMenusCreate({
+          id: CTX_LINK_DL,
+          parentId: CTX_ROOT,
+          title: 'Download what this link points to',
+          contexts: ['link'],
+        });
+      }
+
+      if (showPage) {
+        await ctxMenusCreate({
+          id: CTX_PAGE_PANEL,
+          parentId: CTX_ROOT,
+          title: 'Show what I found on this page',
+          contexts: ['page'],
         });
       }
     })
@@ -949,19 +1121,21 @@ function setupImageContextMenus() {
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  setupImageContextMenus();
+  setupContextMenus();
   scheduleReinjectPageContentScripts();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  setupImageContextMenus();
+  setupContextMenus();
   scheduleReinjectPageContentScripts();
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local') return;
+  if (CTX_MENU_KEYS.some((k) => changes[k])) {
+    setupContextMenus();
+  }
   if (changes[IMAGE_GRABBER_KEY]) {
-    setupImageContextMenus();
     scheduleReinjectPageContentScripts();
   }
   if (changes[FLOAT_GRABBER_KEY]) {
@@ -970,7 +1144,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 });
 
 // Single boot setup (onInstalled also fires on reload — chain serializes both).
-setupImageContextMenus();
+setupContextMenus();
 
 function ctxMimeFromFormat(fmt) {
   const f = String(fmt || '').toLowerCase();
@@ -1130,19 +1304,184 @@ async function ctxDownloadImageAs(url, fmt) {
   });
 }
 
-chrome.contextMenus.onClicked.addListener((info, tab) => {
-  const id = String(info.menuItemId || '');
-  const srcUrl = (info.srcUrl || '').toString();
-  if (!srcUrl) return;
-  let fmt = 'png';
-  if (id.startsWith(CTX_IMG_FMT_PREFIX)) {
-    fmt = id.slice(CTX_IMG_FMT_PREFIX.length).toLowerCase();
-  } else if (id !== CTX_IMG_ROOT) {
+/**
+ * The browser only fills in srcUrl when it hit-tests the image itself. An
+ * overlay or `pointer-events: none` hides it, so fall back to asking the page
+ * what sits under the last right-click.
+ */
+function imageUrlUnderCursor(tabId, frameId) {
+  return new Promise((resolve) => {
+    if (tabId == null || tabId < 0) {
+      resolve('');
+      return;
+    }
+    let settled = false;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      resolve(v || '');
+    };
+    const timer = setTimeout(() => done(''), 3000);
+    try {
+      const opts = frameId != null ? { frameId } : undefined;
+      chrome.tabs.sendMessage(tabId, { type: 'CONTEXT_IMAGE_AT_POINT' }, opts, (res) => {
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) {
+          done('');
+          return;
+        }
+        done(res && res.ok ? res.url : '');
+      });
+    } catch (_) {
+      clearTimeout(timer);
+      done('');
+    }
+  });
+}
+
+/**
+ * Open the floating panel from the right-click menu. Works regardless of the
+ * floating-button setting and even on a tab whose content scripts have not
+ * loaded yet, so "show what I found" never quietly does nothing.
+ */
+async function openFloatPanelOnTab(tabId) {
+  if (tabId == null || tabId < 0) return;
+  const ask = () =>
+    new Promise((resolve) => {
+      try {
+        chrome.tabs.sendMessage(tabId, { type: 'HLS_GRABBER_OPEN_FLOAT_PANEL' }, (res) => {
+          resolve(!chrome.runtime.lastError && !!res);
+        });
+      } catch (_) {
+        resolve(false);
+      }
+    });
+
+  if (await ask()) return;
+  // Nothing listening yet: inject, then try once more.
+  try {
+    await reinjectPageContentScripts([tabId]);
+  } catch (_) {
     return;
   }
-  ctxDownloadImageAs(srcUrl, fmt).catch((e) => {
-    console.warn('Stuff Grabber context image download failed', e);
-  });
+  setTimeout(() => void ask(), 250);
+}
+
+/** Surface a context-menu image failure on the page instead of failing quietly. */
+function notifyImageSaveProblem(tabId, error) {
+  if (tabId == null || tabId < 0) return;
+  try {
+    chrome.tabs.sendMessage(
+      tabId,
+      { type: 'SHOW_IMAGE_SAVE_DONE', kind: 'error', error: String(error || '') },
+      () => void chrome.runtime.lastError
+    );
+  } catch (_) {
+    // Page has no content script; nothing to show.
+  }
+}
+
+/** A URL that names an actual media file, rather than a page that plays one. */
+const DIRECT_MEDIA_URL_RE =
+  /\.(mp4|m4v|mov|webm|mkv|avi|flv|ogv|ts|m3u8|m3u|mpd|mp3|m4a|aac|flac|wav|opus|ogg)(?:[?#]|$)/i;
+
+/**
+ * Queue a URL from the context menu (video / audio / link).
+ *
+ * A link usually points at a page, not a file. Handing that to ffmpeg fails
+ * with "Invalid data found when processing input", so anything that does not
+ * name a media file goes to yt-dlp as a page instead.
+ */
+async function ctxDownloadMediaUrl(url, tab, kindHint) {
+  const stem = ctxSafeStemFromUrl(url);
+  const looksDirect = DIRECT_MEDIA_URL_RE.test(String(url));
+  const tabUrl = (tab && tab.url) || undefined;
+
+  const payload = {
+    url,
+    filename: stem,
+    referer: tabUrl,
+  };
+  if (looksDirect) {
+    if (kindHint) payload.streamKind = kindHint;
+    payload.pageUrl = tabUrl;
+  } else {
+    // Page URL: let yt-dlp work it out from the page itself.
+    payload.streamKind = 'social';
+    payload.pageUrl = url;
+    payload.referer = tabUrl || url;
+    try {
+      payload.origin = new URL(url).origin;
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  const res = await startDownloadJob(payload, (tab && tab.id) ?? null);
+  if (!res.ok) {
+    console.warn('Stuff Grabber context download failed:', res.error);
+  }
+  return res;
+}
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  const id = String(info.menuItemId || '');
+  const tabId = (tab && tab.id) ?? null;
+
+  if (id === CTX_PAGE_PANEL) {
+    void openFloatPanelOnTab(tabId);
+    return;
+  }
+
+  if (id === CTX_MEDIA_VIDEO || id === CTX_MEDIA_AUDIO) {
+    const url = (info.srcUrl || '').toString();
+    if (!url || !/^https?:/i.test(url)) return;
+    void ctxDownloadMediaUrl(url, tab, null);
+    return;
+  }
+
+  if (id === CTX_LINK_DL) {
+    const url = (info.linkUrl || '').toString();
+    if (!url || !/^https?:/i.test(url)) return;
+    void ctxDownloadMediaUrl(url, tab, null);
+    return;
+  }
+
+  // Page-context twin: there is never a srcUrl, so always resolve by position.
+  if (id.startsWith(CTX_IMG_PT_PREFIX)) {
+    const fmt = id.slice(CTX_IMG_PT_PREFIX.length).toLowerCase();
+    (async () => {
+      const url = await imageUrlUnderCursor(tabId, info.frameId);
+      if (!url) {
+        // Say so rather than doing nothing at all.
+        notifyImageSaveProblem(tabId, 'No image found where you right-clicked.');
+        return;
+      }
+      try {
+        await ctxDownloadImageAs(url, fmt);
+      } catch (e) {
+        console.warn('Stuff Grabber context image download failed', e);
+        notifyImageSaveProblem(tabId, String((e && e.message) || e));
+      }
+    })();
+    return;
+  }
+
+  if (!id.startsWith(CTX_IMG_FMT_PREFIX) && id !== CTX_IMG_ROOT) return;
+  const fmt = id.startsWith(CTX_IMG_FMT_PREFIX)
+    ? id.slice(CTX_IMG_FMT_PREFIX.length).toLowerCase()
+    : 'png';
+
+  (async () => {
+    let srcUrl = (info.srcUrl || '').toString();
+    if (!srcUrl) srcUrl = await imageUrlUnderCursor(tabId, info.frameId);
+    if (!srcUrl) return;
+    try {
+      await ctxDownloadImageAs(srcUrl, fmt);
+    } catch (e) {
+      console.warn('Stuff Grabber context image download failed', e);
+    }
+  })();
 });
 
 // Download queue: up to 4 native host processes, shared pending queue
@@ -3073,112 +3412,119 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'START_DOWNLOAD') {
     (async () => {
-      const payload = message.payload;
-      if (!payload?.url) {
-        respond(sendResponse, { ok: false, error: 'No stream URL' });
-        return;
-      }
-      const path = await getUserDownloadPath();
-      if (!path) {
-        respond(sendResponse, {
-          ok: false,
-          error: 'Open Options and set a save folder first.',
-        });
-        return;
-      }
-      const tabIdForJob = payload.tabId != null ? payload.tabId : sender.tab?.id ?? null;
-      let tabUrl = '';
-      if (tabIdForJob != null) {
-        try {
-          const t = await chrome.tabs.get(tabIdForJob);
-          tabUrl = (t && t.url) || '';
-        } catch (_) {
-          // ignore
-        }
-      }
-      let cookie = (payload.cookie && String(payload.cookie).trim()) || '';
-      if (!cookie) {
-        cookie = await getCookieStringPromise(payload.url, tabUrl);
-      }
-      const ytdlpKind = payload.streamKind === 'social' || payload.streamKind === 'yt';
-      const cookiePageUrl =
-        payload.pageUrl && /^https?:/i.test(payload.pageUrl) ? payload.pageUrl : tabUrl;
-      const cookieJar = ytdlpKind ? await getCookieJarPromise(cookiePageUrl) : [];
-      const { jobId: _jid, outputDirectory: _od, ...rest } = payload;
-      const base = {
-        ...rest,
-        tabId: tabIdForJob ?? undefined,
-        cookie: cookie || undefined,
-      };
-      if (cookieJar.length) base.cookieJar = cookieJar;
-      if (!base.userAgent) {
-        try {
-          base.userAgent = (typeof navigator !== 'undefined' && navigator.userAgent) || undefined;
-        } catch (_) {
-          // ignore
-        }
-      }
-      if (!base.referer && tabUrl && /^https?:/i.test(tabUrl)) {
-        base.referer = tabUrl;
-        try {
-          base.origin = new URL(tabUrl).origin;
-        } catch (_) {
-          // ignore
-        }
-      }
-      base.pageUrl = resolveYtdlpPageUrl(base.url || payload.url, tabUrl, base.pageUrl);
-      try {
-        const mhStore = await chrome.storage.local.get(YTDLP_MAX_HEIGHT_KEY);
-        const mhRaw = mhStore[YTDLP_MAX_HEIGHT_KEY];
-        if (base.ytDlpMaxHeight == null && mhRaw !== undefined && mhRaw !== null && String(mhRaw).trim() !== '') {
-          const n = parseInt(String(mhRaw), 10);
-          if (!Number.isNaN(n)) base.ytDlpMaxHeight = n;
-        }
-      } catch (_) {
-        // ignore
-      }
-      const jobId = payload.jobId || genJobId();
-      const label = (payload.filename || 'video').toString() || 'video';
-      const seedMediaId =
-        mediaIdFromUrl(payload.url) ||
-        mediaIdFromUrl(base.pageUrl) ||
-        mediaIdFromUrl(tabUrl) ||
-        null;
-      await upsertJob({
-        id: jobId,
-        label,
-        status: 'queued',
-        detail: 'Waiting',
-        error: null,
-        outputPath: null,
-        tabId: tabIdForJob ?? null,
-        streamUrl: payload.url,
-        streamKind: payload.streamKind || null,
-        mediaId: seedMediaId,
-        fileStem: (payload.filename || label).toString(),
-        ffmpegPreset: base.ffmpegPreset || null,
-        downloadPayload: base,
-        lastAuthRefresh: Date.now(),
-        startedAt: Date.now(),
-      });
-      enqueueDownload(jobId, base);
-      tryDispatch();
-      if (tabIdForJob != null) {
-        notifyTabDownloadProgress(tabIdForJob, {
-          id: jobId,
-          label,
-          status: 'queued',
-          detail: 'Waiting',
-          mediaId: seedMediaId,
-          streamUrl: payload.url,
-          pageUrl: base.pageUrl || tabUrl || '',
-          downloadPayload: base,
-        });
-      }
-      respond(sendResponse, { ok: true, jobId });
+      respond(sendResponse, await startDownloadJob(message.payload, sender.tab?.id ?? null));
     })();
     return true;
   }
 
   return false;
 });
+
+/**
+ * Queue a download. Shared by the popup/floater message path and the
+ * browser context menu so both behave identically.
+ * @returns {Promise<{ ok: boolean, jobId?: string, error?: string }>}
+ */
+async function startDownloadJob(payload, fallbackTabId) {
+  if (!payload?.url) {
+    return { ok: false, error: 'No stream URL' };
+  }
+  const path = await getUserDownloadPath();
+  if (!path) {
+    return {
+      ok: false,
+      error: 'Open Options and set a save folder first.',
+    };
+  }
+  const tabIdForJob = payload.tabId != null ? payload.tabId : fallbackTabId ?? null;
+  let tabUrl = '';
+  if (tabIdForJob != null) {
+    try {
+      const t = await chrome.tabs.get(tabIdForJob);
+      tabUrl = (t && t.url) || '';
+    } catch (_) {
+      // ignore
+    }
+  }
+  let cookie = (payload.cookie && String(payload.cookie).trim()) || '';
+  if (!cookie) {
+    cookie = await getCookieStringPromise(payload.url, tabUrl);
+  }
+  const ytdlpKind = payload.streamKind === 'social' || payload.streamKind === 'yt';
+  const cookiePageUrl =
+    payload.pageUrl && /^https?:/i.test(payload.pageUrl) ? payload.pageUrl : tabUrl;
+  const cookieJar = ytdlpKind ? await getCookieJarPromise(cookiePageUrl) : [];
+  const { jobId: _jid, outputDirectory: _od, ...rest } = payload;
+  const base = {
+    ...rest,
+    tabId: tabIdForJob ?? undefined,
+    cookie: cookie || undefined,
+  };
+  if (cookieJar.length) base.cookieJar = cookieJar;
+  if (!base.userAgent) {
+    try {
+      base.userAgent = (typeof navigator !== 'undefined' && navigator.userAgent) || undefined;
+    } catch (_) {
+      // ignore
+    }
+  }
+  if (!base.referer && tabUrl && /^https?:/i.test(tabUrl)) {
+    base.referer = tabUrl;
+    try {
+      base.origin = new URL(tabUrl).origin;
+    } catch (_) {
+      // ignore
+    }
+  }
+  base.pageUrl = resolveYtdlpPageUrl(base.url || payload.url, tabUrl, base.pageUrl);
+  try {
+    const mhStore = await chrome.storage.local.get(YTDLP_MAX_HEIGHT_KEY);
+    const mhRaw = mhStore[YTDLP_MAX_HEIGHT_KEY];
+    if (base.ytDlpMaxHeight == null && mhRaw !== undefined && mhRaw !== null && String(mhRaw).trim() !== '') {
+      const n = parseInt(String(mhRaw), 10);
+      if (!Number.isNaN(n)) base.ytDlpMaxHeight = n;
+    }
+  } catch (_) {
+    // ignore
+  }
+  const jobId = payload.jobId || genJobId();
+  const label = (payload.filename || 'video').toString() || 'video';
+  const seedMediaId =
+    mediaIdFromUrl(payload.url) ||
+    mediaIdFromUrl(base.pageUrl) ||
+    mediaIdFromUrl(tabUrl) ||
+    null;
+  await upsertJob({
+    id: jobId,
+    label,
+    status: 'queued',
+    detail: 'Waiting',
+    error: null,
+    outputPath: null,
+    tabId: tabIdForJob ?? null,
+    streamUrl: payload.url,
+    streamKind: payload.streamKind || null,
+    mediaId: seedMediaId,
+    fileStem: (payload.filename || label).toString(),
+    ffmpegPreset: base.ffmpegPreset || null,
+    downloadPayload: base,
+    lastAuthRefresh: Date.now(),
+    startedAt: Date.now(),
+  });
+  enqueueDownload(jobId, base);
+  tryDispatch();
+  if (tabIdForJob != null) {
+    notifyTabDownloadProgress(tabIdForJob, {
+      id: jobId,
+      label,
+      status: 'queued',
+      detail: 'Waiting',
+      mediaId: seedMediaId,
+      streamUrl: payload.url,
+      pageUrl: base.pageUrl || tabUrl || '',
+      downloadPayload: base,
+    });
+  }
+  return { ok: true, jobId };
+}
+
