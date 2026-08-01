@@ -738,6 +738,63 @@ function makeExpandableUrl(url, className, maxLen) {
   };
 }
 
+/**
+ * Populate the "jump to" picker from whatever sections actually rendered, so a
+ * long list does not bury the section the user wants (network captures sit
+ * below the page download, and that is often the one that works).
+ */
+function refreshSectionJump() {
+  const wrap = document.getElementById('section-jump');
+  const sel = document.getElementById('section-jump-select');
+  const root = document.getElementById('streams-root');
+  if (!wrap || !sel || !root) return;
+
+  const heads = [...root.querySelectorAll('.stream-source-label')];
+  if (heads.length < 2) {
+    wrap.hidden = true;
+    return;
+  }
+
+  sel.textContent = '';
+  const first = document.createElement('option');
+  first.value = '';
+  first.textContent = 'Jump to…';
+  sel.appendChild(first);
+
+  heads.forEach((h, i) => {
+    const id = `sg-sec-${i}`;
+    h.id = id;
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = (h.textContent || `Section ${i + 1}`).trim();
+    sel.appendChild(opt);
+  });
+
+  wrap.hidden = false;
+  sel.onchange = () => {
+    const target = sel.value && document.getElementById(sel.value);
+    if (!target) return;
+    try {
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (_) {
+      target.scrollIntoView();
+    }
+    target.classList.remove('is-jump-target');
+    // Restart the flash so repeat picks still highlight.
+    void target.offsetWidth;
+    target.classList.add('is-jump-target');
+    sel.value = '';
+  };
+
+  if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+    try {
+      HLS_IOS_SELECT.enhance(sel, { compact: true });
+    } catch (_) {
+      // plain select still works
+    }
+  }
+}
+
 function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
   setContextLine(pageTitle);
   const content = document.getElementById('streams-root') || document.getElementById('content');
@@ -1305,6 +1362,7 @@ function loadUi() {
         const streams = response?.streams || [];
         _lastStreamsSig = streamsSignature(streams);
         renderStreams(streams, response?.pageTitle || '', hasPath, spotifyCtx);
+        refreshSectionJump();
         renderJobsBanner(response?.jobs || [], {
           running: response?.running,
           queueLength: response?.queueLength,
@@ -1345,6 +1403,7 @@ function refreshStreamsIfChanged() {
       const hasPath = !!(response.userDownloadPath || '').trim();
       setPathBar(response.userDownloadPath);
       renderStreams(streams, response.pageTitle || '', hasPath, spotifyCtx);
+      refreshSectionJump();
       renderJobsBanner(response.jobs || [], {
         running: response.running,
         queueLength: response.queueLength,
@@ -1487,7 +1546,17 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
       'The video is played through another site. To record it, open that site on its own. To just save the file, use a stream below instead.';
     box.appendChild(text);
 
-    embeds.forEach((e) => {
+    const listEl = document.createElement('div');
+    listEl.className = 'embed-notice-list';
+    box.appendChild(listEl);
+
+    // Some pages carry a dozen frames; only a couple are ever the player.
+    const COLLAPSE_AT = 2;
+    embeds.forEach((e, i) => {
+      const item = document.createElement('div');
+      item.className = 'embed-notice-item';
+      if (i >= COLLAPSE_AT) item.hidden = true;
+
       const openBtn = document.createElement('button');
       openBtn.type = 'button';
       openBtn.className = 'embed-open-btn';
@@ -1501,13 +1570,34 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
           window.close();
         });
       });
-      box.appendChild(openBtn);
+      item.appendChild(openBtn);
 
       const link = document.createElement('div');
       link.className = 'embed-notice-url';
       link.textContent = e.url;
-      box.appendChild(link);
+      item.appendChild(link);
+      listEl.appendChild(item);
     });
+
+    const hiddenCount = Math.max(0, embeds.length - COLLAPSE_AT);
+    if (hiddenCount) {
+      const more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'embed-notice-more';
+      let open = false;
+      const sync = () => {
+        more.textContent = open ? 'Show fewer' : `Show ${hiddenCount} more`;
+        listEl.querySelectorAll('.embed-notice-item').forEach((el, i) => {
+          el.hidden = !open && i >= COLLAPSE_AT;
+        });
+      };
+      more.addEventListener('click', () => {
+        open = !open;
+        sync();
+      });
+      sync();
+      box.appendChild(more);
+    }
 
     statusEl.appendChild(box);
     return true;

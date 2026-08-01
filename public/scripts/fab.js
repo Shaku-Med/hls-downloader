@@ -863,6 +863,9 @@
 <div class="panel" hidden>
   <div class="panel-head">
     <span class="panel-title">Stuff Grabber</span>
+    <div class="section-jump" id="fab-section-jump" hidden>
+      <select id="fab-section-jump-select" aria-label="Jump to a section"></select>
+    </div>
     <button type="button" class="close-p" aria-label="Close">×</button>
   </div>
   <div class="panel-top">
@@ -1519,6 +1522,7 @@
       _fabStreamsSig = fabStreamsSignature(streams);
       renderJobs(response.jobs || [], response);
       renderStreams(streams, response.pageTitle || '', hasPath);
+      refreshFabSectionJump();
       renderImages(hasPath);
       updateQueueBadge(response);
       if (panel.classList.contains('open')) positionPanel();
@@ -1552,6 +1556,7 @@
       }
       renderJobs(response.jobs || [], response);
       renderStreams(streams, response.pageTitle || '', hasPath);
+      refreshFabSectionJump();
       renderImages(hasPath);
       updateQueueBadge(response);
       if (panel.classList.contains('open')) positionPanel();
@@ -1829,6 +1834,57 @@
     box.appendChild(document.createElement('br'));
     box.appendChild(reloadBtn);
     scroll.insertBefore(box, scroll.firstChild);
+  }
+
+  /** Same "jump to" picker as the popup, so a long list cannot bury a section. */
+  function refreshFabSectionJump() {
+    const wrap = shadow.getElementById('fab-section-jump');
+    const sel = shadow.getElementById('fab-section-jump-select');
+    if (!wrap || !sel || !fabStreams) return;
+
+    const heads = [...fabStreams.querySelectorAll('.stream-source-label')];
+    if (heads.length < 2) {
+      wrap.hidden = true;
+      return;
+    }
+
+    sel.textContent = '';
+    const first = document.createElement('option');
+    first.value = '';
+    first.textContent = 'Jump to…';
+    sel.appendChild(first);
+
+    heads.forEach((h, i) => {
+      const id = `sg-fab-sec-${i}`;
+      h.id = id;
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = (h.textContent || `Section ${i + 1}`).trim();
+      sel.appendChild(opt);
+    });
+
+    wrap.hidden = false;
+    sel.onchange = () => {
+      const target = sel.value && shadow.getElementById(sel.value);
+      if (!target) return;
+      try {
+        target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (_) {
+        target.scrollIntoView();
+      }
+      target.classList.remove('is-jump-target');
+      void target.offsetWidth;
+      target.classList.add('is-jump-target');
+      sel.value = '';
+    };
+
+    if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhance) {
+      try {
+        HLS_IOS_SELECT.enhance(sel, { compact: true });
+      } catch (_) {
+        // plain select still works
+      }
+    }
   }
 
   function renderStreams(streams, pageTitle, hasPath) {
@@ -2712,7 +2768,17 @@
       'The video is played through another site. To record it, open that site on its own. To just save the file, use a stream below instead.';
     box.appendChild(text);
 
-    fabEmbeds.forEach((e) => {
+    const listEl = document.createElement('div');
+    listEl.className = 'embed-notice-list';
+    box.appendChild(listEl);
+
+    // Some pages carry a dozen frames; only a couple are ever the player.
+    const COLLAPSE_AT = 2;
+    fabEmbeds.forEach((e, i) => {
+      const item = document.createElement('div');
+      item.className = 'embed-notice-item';
+      if (i >= COLLAPSE_AT) item.hidden = true;
+
       const label = `Open ${fabShortLabel(e.host, 30)}`;
       const btn = document.createElement('button');
       btn.type = 'button';
@@ -2734,13 +2800,34 @@
           btn.textContent = label;
         }
       });
-      box.appendChild(btn);
+      item.appendChild(btn);
 
       const link = document.createElement('div');
       link.className = 'embed-notice-url';
       link.textContent = e.url;
-      box.appendChild(link);
+      item.appendChild(link);
+      listEl.appendChild(item);
     });
+
+    const hiddenCount = Math.max(0, fabEmbeds.length - COLLAPSE_AT);
+    if (hiddenCount) {
+      const more = document.createElement('button');
+      more.type = 'button';
+      more.className = 'embed-notice-more';
+      let open = false;
+      const sync = () => {
+        more.textContent = open ? 'Show fewer' : `Show ${hiddenCount} more`;
+        listEl.querySelectorAll('.embed-notice-item').forEach((el, i) => {
+          el.hidden = !open && i >= COLLAPSE_AT;
+        });
+      };
+      more.addEventListener('click', () => {
+        open = !open;
+        sync();
+      });
+      sync();
+      box.appendChild(more);
+    }
 
     fabRecStatus.appendChild(box);
     return true;

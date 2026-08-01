@@ -189,6 +189,10 @@
   padding: 10px 16px 14px;
   background: color-mix(in srgb, var(--surface) 72%, transparent);
   border-bottom: 0.5px solid var(--separator);
+  /* Never let the header grow so tall it squeezes the list below out of view. */
+  max-height: 52%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 /* Save-folder line in the panel header stays on one line (popup wraps). */
 .panel-top .path-line {

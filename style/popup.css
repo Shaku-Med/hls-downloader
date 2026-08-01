@@ -65,13 +65,18 @@ body {
   align-items: center;
   gap: 8px;
   min-width: 0;
+  /* Give the header line up to the jump picker before the title wraps. */
+  flex: 0 1 auto;
+  overflow: hidden;
 }
-
 .brand-title {
   font-size: 17px;
   font-weight: 650;
   letter-spacing: -0.022em;
   color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .brand-sub {

@@ -1199,6 +1199,20 @@ def _looks_like_spotify_drm_or_unsupported(err_tail: str) -> bool:
     return any(n in t for n in needles)
 
 
+def _looks_like_cookie_db_locked(err_tail: str) -> bool:
+    """Windows holds the cookie DB open while the browser runs, so yt-dlp cannot copy it."""
+    t = (err_tail or "").lower()
+    if "cookie" not in t:
+        return False
+    return (
+        "could not copy" in t
+        or "database is locked" in t
+        or "permission denied" in t
+        or "failed to decrypt" in t
+        or "unable to read" in t
+    )
+
+
 def _looks_like_missing_impersonation(err_tail: str) -> bool:
     t = (err_tail or "").lower()
     return "impersonat" in t and (
@@ -1990,7 +2004,28 @@ def run_yt_dlp_with_updates(
         )
         code, err_lines = run_one(stream_url)
 
+    # Windows locks Chrome's cookie DB while Chrome is running, so yt-dlp cannot
+    # copy it. Most sites do not need those cookies at all, so drop them and try
+    # again rather than failing the whole download.
     tail = "".join(err_lines[-35:]).strip()
+    if code != 0 and _looks_like_cookie_db_locked(tail):
+        run_message["ytDlpCookiesFromBrowser"] = "none"
+        send_message(
+            with_job_id(
+                {
+                    "type": "progress",
+                    "phase": "downloading",
+                    "detail": "Browser cookies are locked; retrying without them…",
+                    "output": output_path,
+                },
+                job_id,
+            )
+        )
+        code, err_lines = run_one(primary)
+        if code != 0 and stream_url and primary != stream_url:
+            code, err_lines = run_one(stream_url)
+        tail = "".join(err_lines[-35:]).strip()
+
     if code != 0 and spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
         q = _spotify_oembed_query(primary) or _spotify_oembed_query(stream_url)
         if q:
@@ -2042,6 +2077,11 @@ def run_yt_dlp_with_updates(
 
     tail = "".join(err_lines[-35:]).strip()
     if code == 0:
+        # yt-dlp may have written a different name than we asked for (search
+        # fallbacks especially). Point at the real file before judging it, so a
+        # download that plainly worked is not reported as a failure.
+        if not message.get("ytDlpDownloadPlaylist"):
+            output_path = _resolve_actual_output(output_path)
         if audio_flow:
             ok_v, verr = _verify_yt_dlp_audio_output(output_path)
         else:
@@ -2078,6 +2118,12 @@ def run_yt_dlp_with_updates(
         err = err + ": " + tail[-600:]
     if _looks_like_missing_impersonation(tail):
         err = _impersonation_help_message()
+    elif _looks_like_cookie_db_locked(tail):
+        err = (
+            "This site needs your browser cookies, but the browser is holding the "
+            "cookie file open so they could not be read. Close the browser fully and "
+            "run the download again, or sign in to the site in a different browser."
+        )
     if spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
         err = (
             "Spotify source protected (DRM/unsupported). "
@@ -4085,6 +4131,66 @@ def _yt_dlp_playlist_mp4_paths(output_path: str) -> List[str]:
     base = os.path.basename(output_path)
     stem_prefix = base.split(" %(playlist_index)", 1)[0]
     return sorted(glob.glob(os.path.join(d, glob.escape(stem_prefix) + "*.mp4")))
+
+
+_MEDIA_OUTPUT_EXTS = (
+    ".mp4", ".mkv", ".webm", ".m4v", ".mov", ".avi", ".flv", ".ts",
+    ".mp3", ".m4a", ".opus", ".aac", ".flac", ".wav", ".ogg",
+)
+
+
+def _resolve_actual_output(output_path: str, window_s: float = 900.0) -> str:
+    """
+    Find what yt-dlp really wrote.
+
+    The output path is chosen before the download runs, but yt-dlp can pick a
+    different extension, sanitize the name, or (on a search fallback such as
+    Spotify going through YouTube) title the file after whatever it found. The
+    file is then sitting on disk under a different name, so reporting the
+    original path tells the user it failed when it plainly did not.
+
+    Returns the real path when one is found, otherwise the path unchanged.
+    """
+    if not output_path or os.path.isfile(output_path):
+        return output_path
+    folder = os.path.dirname(output_path) or "."
+    if not os.path.isdir(folder):
+        return output_path
+
+    stem = os.path.splitext(os.path.basename(output_path))[0]
+    stem = stem.replace("%(ext)s", "").strip()
+
+    # Same name, different extension: by far the most common case.
+    base = os.path.splitext(output_path)[0]
+    for ext in _MEDIA_OUTPUT_EXTS:
+        cand = base + ext
+        if os.path.isfile(cand):
+            return cand
+
+    # Otherwise take the newest sizeable media file written during this run.
+    now = time.time()
+    best: Optional[Tuple[float, str]] = None
+    try:
+        entries = os.listdir(folder)
+    except OSError:
+        return output_path
+    for name in entries:
+        if os.path.splitext(name)[1].lower() not in _MEDIA_OUTPUT_EXTS:
+            continue
+        p = os.path.join(folder, name)
+        try:
+            if not os.path.isfile(p):
+                continue
+            mt = os.path.getmtime(p)
+            if now - mt > window_s:
+                continue
+            if os.path.getsize(p) < 32 * 1024:
+                continue
+        except OSError:
+            continue
+        if best is None or mt > best[0]:
+            best = (mt, p)
+    return best[1] if best else output_path
 
 
 def _verify_yt_dlp_media_file(path: str) -> Tuple[bool, str]:

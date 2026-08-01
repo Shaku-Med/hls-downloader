@@ -578,6 +578,68 @@
   opacity: 0.8;
 }
 
+/* A page can hold many iframes. Cap the list so it can never squeeze the
+   panel body down to nothing, and scroll inside itself instead. */
+.embed-notice-list {
+  max-height: 168px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.embed-notice-more {
+  margin-top: 8px;
+  width: 100%;
+  border: none;
+  border-radius: 980px;
+  padding: 6px 12px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  background: transparent;
+  color: var(--accent);
+}
+.embed-notice-more:hover { background: var(--fill-secondary); }
+.embed-notice-item + .embed-notice-item {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 0.5px solid var(--line);
+}
+
+/* ── Jump to a section ──
+   Sits on the header line beside the settings gear / close button, so it
+   costs no vertical space. Shrinks before the title does. */
+.section-jump {
+  flex: 0 1 auto;
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 150px;
+  margin-left: auto;
+}
+.section-jump[hidden] { display: none !important; }
+.section-jump .ios-select,
+.section-jump select { width: 100%; min-width: 0; }
+.section-jump .ios-select-trigger {
+  min-height: 28px;
+  padding: 4px 8px 4px 10px;
+  font-size: 12px;
+  border-radius: 980px;
+  background: var(--fill);
+  color: var(--accent);
+  font-weight: 600;
+}
+.section-jump .ios-select-trigger:hover { background: var(--fill-secondary); }
+.section-jump .ios-select-chevron { width: 14px; height: 14px; color: var(--accent); }
+.stream-source-label:target,
+.is-jump-target {
+  animation: sg-jump-flash 1.2s ease-out;
+}
+@keyframes sg-jump-flash {
+  0% { background: color-mix(in srgb, var(--accent) 26%, transparent); }
+  100% { background: transparent; }
+}
+
 /* ── Page images ── */
 .images-root:not([hidden]):not(:empty), #fab-images:not(:empty) {
   margin-top: 14px;
