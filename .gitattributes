@@ -1,0 +1,18 @@
+# Normalize to LF in the repo and let each machine check out what it prefers.
+* text=auto
+
+# Shell scripts break with CRLF, so pin them regardless of platform.
+*.sh text eol=lf
+
+# Batch files are the opposite: Windows wants CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Leave binaries alone.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.pyc binary
