@@ -1805,6 +1805,37 @@ function findSlotIndexByJobId(jobId) {
   return -1;
 }
 
+/**
+ * ffmpeg and yt-dlp emit progress many times a second. Writing every one of
+ * those to storage pins the service worker and the popup cannot open, so only
+ * persist a progress tick about once a second. Anything that changes state
+ * (status, output path, playlist position) still writes straight away.
+ */
+const JOB_PROGRESS_WRITE_MS = 1000;
+const _lastProgressWrite = new Map();
+/** Last known job row, so a skipped write can still feed the on-page bar. */
+const _jobCache = new Map();
+
+function forgetJobProgress(jobId) {
+  _lastProgressWrite.delete(jobId);
+  _jobCache.delete(jobId);
+}
+
+function progressWriteIsDue(jobId, patch, prevDetail) {
+  const now = Date.now();
+  const last = _lastProgressWrite.get(jobId) || 0;
+  if (now - last >= JOB_PROGRESS_WRITE_MS) {
+    _lastProgressWrite.set(jobId, now);
+    return true;
+  }
+  // Detail text changing means a real phase change, not just a percent tick.
+  if (patch.detail && patch.detail !== prevDetail) {
+    _lastProgressWrite.set(jobId, now);
+    return true;
+  }
+  return false;
+}
+
 function onHostMessage(msg, slotIndex) {
   const jobId = msg && msg.jobId;
   if (!jobId) return;
@@ -1822,8 +1853,26 @@ function onHostMessage(msg, slotIndex) {
       if (msg.playlistIndex != null) patch.playlistIndex = Number(msg.playlistIndex) || msg.playlistIndex;
       if (msg.playlistCount != null) patch.playlistCount = Number(msg.playlistCount) || msg.playlistCount;
       if (msg.mediaId) patch.mediaId = String(msg.mediaId);
+
+      const known = _jobCache.get(jobId);
+      const structural =
+        !known ||
+        known.status !== 'downloading' ||
+        patch.playlistIndex != null ||
+        patch.outputPath !== known.outputPath;
+
+      if (!structural && !progressWriteIsDue(jobId, patch, known.detail)) {
+        // Skip the storage write, but keep the on-page bar moving: the message
+        // itself is cheap, it is persisting that is not.
+        const merged = { ...known, ...patch, id: jobId };
+        _jobCache.set(jobId, merged);
+        if (merged.tabId != null) notifyTabDownloadProgress(merged.tabId, merged);
+        return;
+      }
+
       const jobs = await patchJob(jobId, patch);
       const job = (jobs || []).find((j) => j && j.id === jobId);
+      if (job) _jobCache.set(jobId, job);
       if (job && job.tabId != null) {
         notifyTabDownloadProgress(job.tabId, job);
       }
@@ -1835,6 +1884,7 @@ function onHostMessage(msg, slotIndex) {
     if (msg.idle) {
       return;
     }
+    forgetJobProgress(jobId);
     slots[slotIndex].jobId = null;
     if (msg.canceled) {
       const st = await readJobsState();

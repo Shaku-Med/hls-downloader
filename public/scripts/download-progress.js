@@ -207,35 +207,79 @@
     return out;
   }
 
-  function needleForJob(job) {
-    const candidates = [];
-    const push = (x) => {
-      const t = String(x || '').trim();
-      if (!t || t.length < 3) return;
+  /**
+   * Ids that identify one specific video, for matching against links on the
+   * page. Only pattern-extracted ids and whole URLs are used. Picking the
+   * shortest string (as this used to) meant a bare number like 12345 became
+   * the needle and every link containing those digits lit up.
+   */
+  function idsForJob(job) {
+    const ids = new Set();
+    const add = (x) => {
+      const t = String(x || '').trim().toLowerCase();
+      if (t.length < 6) return; // too short to identify anything on its own
       if (/^(downloading|extracting|playlist|webpage|starting)$/i.test(t)) return;
-      if (!candidates.includes(t)) candidates.push(t);
+      ids.add(t);
     };
-    push(job && job.mediaId);
-    for (const id of idsFromAnything(job && job.streamUrl)) push(id);
-    candidates.sort((a, b) => a.length - b.length);
-    return candidates.find((c) => c.length >= 4 && c.length <= 64) || candidates[0] || '';
+    add(job && job.mediaId);
+    for (const id of idsFromAnything(job && job.streamUrl)) add(id);
+    for (const id of idsFromAnything(job && job.pageUrl)) add(id);
+    return ids;
+  }
+
+  /** Short label for the progress bar, not used for matching. */
+  function needleForJob(job) {
+    const first = [...idsForJob(job)].sort((a, b) => a.length - b.length)[0];
+    return first || '';
   }
 
   /**
-   * Highlight every <a href> whose href includes any active job's media id
-   * (href.toLowerCase().includes(id.toLowerCase())).
+   * A link points at the same video only when it carries the same id, not
+   * merely the same characters somewhere in the href.
    */
-  function highlightActiveJobs() {
+  function anchorMatches(href, ids) {
+    const lc = href.toLowerCase();
+    let maybe = false;
+    for (const id of ids) {
+      if (lc.includes(id)) {
+        maybe = true;
+        break;
+      }
+    }
+    if (!maybe) return false;
+    for (const cand of idsFromAnything(href)) {
+      if (ids.has(String(cand).trim().toLowerCase())) return true;
+    }
+    return false;
+  }
+
+  /** Marking more links than this means the id was not specific enough. */
+  const MAX_HIGHLIGHTS = 12;
+  let lastScanKey = '';
+
+  /**
+   * Mark links that point at a video being downloaded right now.
+   *
+   * Scanning every anchor is expensive, and progress messages arrive many times
+   * a second, so this only re-scans when the set of active ids actually
+   * changes. A percent tick alone never touches the DOM.
+   */
+  function highlightActiveJobs(force) {
+    const needles = new Set();
+    for (const ids of activeByJob.values()) {
+      for (const id of ids) needles.add(id);
+    }
+    const key = [...needles].sort().join('|');
+    if (!force && key === lastScanKey) return;
+    lastScanKey = key;
+
     ensureHighlightStyle();
     clearHighlights();
-    const needles = [...new Set([...activeByJob.values()].map((n) => String(n).toLowerCase()))].filter(
-      (n) => n.length >= 4
-    );
-    if (!needles.length) return;
+    if (!needles.size) return;
 
     const anchors = document.querySelectorAll('a[href]');
     const limit = Math.min(anchors.length, 8000);
-    let scrolled = false;
+    const hits = [];
     for (let i = 0; i < limit; i++) {
       const a = anchors[i];
       if (!a || a.closest('[data-hls-grabber-fab],[data-hls-dl-progress],[data-hls-image-dl]')) {
@@ -243,14 +287,21 @@
       }
       const href = a.getAttribute('href') || '';
       if (!href || href === '#' || href.startsWith('javascript:')) continue;
-      const hrefLc = href.toLowerCase();
-      if (!needles.some((n) => hrefLc.includes(n))) continue;
+      if (!anchorMatches(href, needles)) continue;
+      hits.push(a);
+      if (hits.length > MAX_HIGHLIGHTS) break;
+    }
 
+    // Matching this many links means the id was not specific enough. Marking
+    // half the page is worse than marking nothing, so mark nothing.
+    if (hits.length > MAX_HIGHLIGHTS) return;
+
+    let scrolled = false;
+    for (const a of hits) {
       a.classList.add(HIGHLIGHT_CLASS);
       a.setAttribute('data-hls-dl-highlight', '1');
       a.setAttribute('title', 'Currently downloading this one');
       highlighted.push(a);
-
       if (!scrolled) {
         scrolled = true;
         try {
@@ -259,7 +310,6 @@
           // ignore
         }
       }
-      if (highlighted.length >= 24) break;
     }
   }
 
@@ -294,7 +344,10 @@
       return;
     }
 
-    if (jobId && needle) activeByJob.set(jobId, needle);
+    if (jobId) {
+      const ids = idsForJob(job);
+      if (ids.size) activeByJob.set(jobId, ids);
+    }
 
     if (hideTimer) {
       clearTimeout(hideTimer);
