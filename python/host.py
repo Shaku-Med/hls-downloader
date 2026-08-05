@@ -1026,6 +1026,7 @@ _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
         ),
     ),
     ("Bandcamp", ("bandcamp.com",)),
+    ("Audiomack", ("audiomack.com", "audiomack.io", "aac.audiomack.com")),
     ("Crunchyroll", ("crunchyroll.com", "vrv.co")),
     ("Rumble", ("rumble.com",)),
     ("Kick", ("kick.com",)),
@@ -1149,7 +1150,17 @@ def _wants_yt_dlp_audio_extract(message: dict, target_url: str = "") -> bool:
         return True
     if _is_apple_music_drm_context(target_url, page_url):
         return True
+    # Audio only sites: asking for video gives nothing useful.
+    if _is_audio_only_site(target_url) or _is_audio_only_site(page_url):
+        return True
     return False
+
+
+_AUDIO_ONLY_HOSTS = ("audiomack.com", "audiomack.io", "soundcloud.com", "bandcamp.com")
+
+
+def _is_audio_only_site(url: str) -> bool:
+    return _host_matches_any(_netloc_host(url), _AUDIO_ONLY_HOSTS)
 
 
 def _is_spotify_url(url: str) -> bool:

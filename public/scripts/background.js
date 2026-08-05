@@ -229,6 +229,11 @@ function classifyVideoFromUrl(url) {
   if (/[/.](mp4|webm|mkv|mov|m4v|ogv)(?:[?#]|$)/.test(u)) {
     return { kind: 'direct', reason: 'ext' };
   }
+  // Audio only sites (Audiomack, SoundCloud, podcasts) never hit the video
+  // checks above, so nothing was being listed for them at all.
+  if (/[/.](mp3|m4a|aac|flac|wav|opus|oga|ogg|weba)(?:[?#]|$)/.test(u)) {
+    return { kind: 'direct', reason: 'audio-ext' };
+  }
   if (u.includes('b-cdn.net') && /(video|m3u8|mp4|mediadelivery)/.test(u)) {
     return { kind: 'direct', reason: 'b-cdn' };
   }
@@ -276,6 +281,11 @@ function streamKindFromContentType(contentType) {
     return 'dash';
   }
   if (c.startsWith('video/') && c !== 'video/fake') {
+    return 'by_header';
+  }
+  // Only audio/mpegurl (an HLS playlist) was handled above, so plain audio
+  // responses were invisible. Audio only sites depend on this.
+  if (c.startsWith('audio/')) {
     return 'by_header';
   }
   if (c === 'application/octet-stream' || c === 'binary/octet-stream') {

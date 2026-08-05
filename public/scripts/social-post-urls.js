@@ -39,6 +39,7 @@
     'vimeo.com',
     'soundcloud.com',
     'bandcamp.com',
+    'audiomack.com',
   ];
 
   function hostOf(urlOrHost) {
@@ -165,8 +166,9 @@
     if (/^\d{5,}$/.test(s)) return true;
     // Facebook pfbid…
     if (/^pfbid[A-Za-z0-9]+$/i.test(s)) return true;
-    // Shortcodes / opaque ids (Instagram, yt, etc.)
-    if (/^[A-Za-z0-9][A-Za-z0-9_-]{4,}$/.test(s)) return true;
+    // Shortcodes / opaque ids (Instagram, yt, etc.). YouTube ids are base64url
+    // and often start with _ or -, so the first character allows those too.
+    if (/^[A-Za-z0-9_-]{5,}$/.test(s)) return true;
     return false;
   }
 
@@ -371,6 +373,15 @@
     // Bandcamp
     if (h === 'bandcamp.com' || h.endsWith('.bandcamp.com')) {
       return /^(track|album)$/i.test(segs[0] || '') && !!segs[1];
+    }
+
+    // Audiomack — /{artist}/song|album|playlist|episode/{slug}
+    if (h === 'audiomack.com' || h.endsWith('.audiomack.com')) {
+      if (RESERVED_SEG.has(String(segs[0] || '').toLowerCase())) return false;
+      if (/^(trending|charts|playlists|search|feed|browse|settings|upload)$/i.test(segs[0] || '')) {
+        return false;
+      }
+      return /^(song|album|playlist|episode)$/i.test(segs[1] || '') && !!segs[2];
     }
 
     return false;
