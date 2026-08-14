@@ -1026,7 +1026,8 @@ _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
         ),
     ),
     ("Bandcamp", ("bandcamp.com",)),
-    ("Audiomack", ("audiomack.com", "audiomack.io", "aac.audiomack.com")),
+    # Audiomack is deliberately absent: yt-dlp's extractor 404s on their
+    # metadata API, and the page serves plain audio we can capture instead.
     ("Crunchyroll", ("crunchyroll.com", "vrv.co")),
     ("Rumble", ("rumble.com",)),
     ("Kick", ("kick.com",)),
@@ -1156,7 +1157,7 @@ def _wants_yt_dlp_audio_extract(message: dict, target_url: str = "") -> bool:
     return False
 
 
-_AUDIO_ONLY_HOSTS = ("audiomack.com", "audiomack.io", "soundcloud.com", "bandcamp.com")
+_AUDIO_ONLY_HOSTS = ("soundcloud.com", "bandcamp.com")
 
 
 def _is_audio_only_site(url: str) -> bool:

@@ -39,7 +39,9 @@
     'vimeo.com',
     'soundcloud.com',
     'bandcamp.com',
-    'audiomack.com',
+    // Audiomack is deliberately absent: yt-dlp cannot read its metadata API, so
+    // a page download row would only fail. Its audio is captured from the
+    // network instead, like any ordinary site.
   ];
 
   function hostOf(urlOrHost) {
@@ -375,14 +377,6 @@
       return /^(track|album)$/i.test(segs[0] || '') && !!segs[1];
     }
 
-    // Audiomack — /{artist}/song|album|playlist|episode/{slug}
-    if (h === 'audiomack.com' || h.endsWith('.audiomack.com')) {
-      if (RESERVED_SEG.has(String(segs[0] || '').toLowerCase())) return false;
-      if (/^(trending|charts|playlists|search|feed|browse|settings|upload)$/i.test(segs[0] || '')) {
-        return false;
-      }
-      return /^(song|album|playlist|episode)$/i.test(segs[1] || '') && !!segs[2];
-    }
 
     return false;
   }
