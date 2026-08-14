@@ -80,6 +80,34 @@
         100% { transform: translateX(280%); }
       }
       .meta { margin-top: 7px; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+      /* Several downloads at once get a row each rather than sharing one bar. */
+      .more {
+        margin-top: 8px; width: 100%; border: 0; background: transparent;
+        color: var(--accent); font: 600 11px/1 var(--font); cursor: pointer;
+        padding: 6px 0; text-align: left;
+      }
+      .more[hidden] { display: none; }
+      .list { margin-top: 6px; display: none; }
+      .list[data-open="1"] { display: block; }
+      .row + .row { margin-top: 8px; padding-top: 8px; border-top: 0.5px solid var(--line); }
+      .row-top {
+        display: flex; align-items: baseline; justify-content: space-between;
+        gap: 8px; margin-bottom: 4px;
+      }
+      .row-name {
+        font-size: 11px; color: var(--text); font-weight: 600;
+        overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+      }
+      .row-pct {
+        flex: 0 0 auto; font-size: 11px; color: var(--muted);
+        font-variant-numeric: tabular-nums;
+      }
+      .row-track { height: 4px; border-radius: 980px; background: var(--fill); overflow: hidden; }
+      .row-fill {
+        height: 100%; width: 0%; border-radius: 980px; background: var(--accent);
+        transition: width 220ms ease;
+      }
+      .row-fill.indeterminate { width: 38% !important; animation: slide 1.1s ease-in-out infinite; }
     </style>
     <div class="bar-wrap" part="wrap">
       <div class="card">
@@ -92,6 +120,8 @@
         </div>
         <div class="track"><div class="fill"></div></div>
         <div class="meta"></div>
+        <button type="button" class="more" hidden></button>
+        <div class="list"></div>
       </div>
     </div>
   `;
@@ -101,6 +131,8 @@
   const subEl = shadow.querySelector('.sub');
   const fillEl = shadow.querySelector('.fill');
   const metaEl = shadow.querySelector('.meta');
+  const moreBtn = shadow.querySelector('.more');
+  const listEl = shadow.querySelector('.list');
   const closeBtn = shadow.querySelector('.x');
 
   let unbindProgressTheme = null;
@@ -313,6 +345,89 @@
     }
   }
 
+  /** jobId -> live numbers, so several downloads each get their own bar. */
+  const jobProgress = new Map();
+  const rowEls = new Map();
+  let listOpen = false;
+
+  function setRowProgress(els, p) {
+    const pct = Number(p.percent);
+    if (Number.isFinite(pct)) {
+      els.fill.classList.remove('indeterminate');
+      els.fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+      els.pct.textContent = `${pct.toFixed(pct >= 10 ? 0 : 1)}%`;
+    } else {
+      els.fill.classList.add('indeterminate');
+      els.pct.textContent = p.detail || '…';
+    }
+    els.name.textContent = p.label || 'Download';
+    els.name.title = p.label || '';
+  }
+
+  /**
+   * One shared bar cannot represent several downloads at once, so past the
+   * first job the card grows a collapsible list with a row each.
+   */
+  function renderJobList() {
+    const entries = [...jobProgress.entries()];
+    if (entries.length < 2) {
+      moreBtn.hidden = true;
+      listEl.setAttribute('data-open', '0');
+      listEl.textContent = '';
+      rowEls.clear();
+      return;
+    }
+
+    moreBtn.hidden = false;
+    moreBtn.textContent = listOpen
+      ? 'Hide the other downloads'
+      : `Show all ${entries.length} downloads`;
+    listEl.setAttribute('data-open', listOpen ? '1' : '0');
+
+    for (const [id, els] of [...rowEls]) {
+      if (!jobProgress.has(id)) {
+        try {
+          els.root.remove();
+        } catch (_) {
+          // ignore
+        }
+        rowEls.delete(id);
+      }
+    }
+
+    for (const [id, p] of entries) {
+      let els = rowEls.get(id);
+      if (!els) {
+        const root = document.createElement('div');
+        root.className = 'row';
+        const top = document.createElement('div');
+        top.className = 'row-top';
+        const name = document.createElement('div');
+        name.className = 'row-name';
+        const pct = document.createElement('div');
+        pct.className = 'row-pct';
+        top.appendChild(name);
+        top.appendChild(pct);
+        const track = document.createElement('div');
+        track.className = 'row-track';
+        const fill = document.createElement('div');
+        fill.className = 'row-fill';
+        track.appendChild(fill);
+        root.appendChild(top);
+        root.appendChild(track);
+        els = { root, name, pct, fill };
+        rowEls.set(id, els);
+        listEl.appendChild(root);
+      }
+      setRowProgress(els, p);
+    }
+  }
+
+  moreBtn.addEventListener('click', () => {
+    listOpen = !listOpen;
+    renderJobList();
+  });
+
   function showProgress(job) {
     if (!job || dismissed) return;
     mount();
@@ -322,7 +437,11 @@
     const needle = needleForJob(job);
 
     if (!active) {
-      if (jobId) activeByJob.delete(jobId);
+      if (jobId) {
+        activeByJob.delete(jobId);
+        jobProgress.delete(jobId);
+      }
+      renderJobList();
       highlightActiveJobs();
       wrap.setAttribute('data-open', '1');
       titleEl.textContent = job.label || 'Download';
@@ -347,6 +466,11 @@
     if (jobId) {
       const ids = idsForJob(job);
       if (ids.size) activeByJob.set(jobId, ids);
+      jobProgress.set(jobId, {
+        label: job.label || 'Download',
+        percent: job.percent,
+        detail: job.detail || '',
+      });
     }
 
     if (hideTimer) {
@@ -356,25 +480,46 @@
     wrap.setAttribute('data-open', '1');
     titleEl.textContent = job.label || 'Downloading';
 
-    const bits = [];
-    if (activeByJob.size > 1) bits.push(`${activeByJob.size} active`);
-    if (job.playlistIndex != null && job.playlistCount != null) {
-      bits.push(`Playlist item ${job.playlistIndex} of ${job.playlistCount}`);
-    }
-    if (needle) bits.push(String(needle));
-    subEl.textContent = bits.join(' · ') || job.detail || 'Working…';
+    const many = jobProgress.size > 1;
 
-    const pct = job.percent != null ? Number(job.percent) : NaN;
-    if (Number.isFinite(pct)) {
-      fillEl.classList.remove('indeterminate');
-      fillEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-      metaEl.textContent = `${pct.toFixed(pct >= 10 ? 0 : 1)}%${job.detail ? ` · ${job.detail}` : ''}`;
+    if (many) {
+      // One bar cannot stand for several downloads, and showing whichever
+      // reported last just makes it jump about. Summarise here, details below.
+      const all = [...jobProgress.values()];
+      const known = all.map((p) => Number(p.percent)).filter((n) => Number.isFinite(n));
+      titleEl.textContent = `${all.length} downloads running`;
+      subEl.textContent = 'Open the list to see each one';
+      if (known.length === all.length) {
+        const avg = known.reduce((a, b) => a + b, 0) / known.length;
+        fillEl.classList.remove('indeterminate');
+        fillEl.style.width = `${Math.max(0, Math.min(100, avg))}%`;
+        metaEl.textContent = `${avg.toFixed(0)}% overall`;
+      } else {
+        fillEl.classList.add('indeterminate');
+        fillEl.style.width = '40%';
+        metaEl.textContent = `${known.length} of ${all.length} reporting progress`;
+      }
     } else {
-      fillEl.classList.add('indeterminate');
-      fillEl.style.width = '40%';
-      metaEl.textContent = job.detail || 'Starting…';
+      const bits = [];
+      if (job.playlistIndex != null && job.playlistCount != null) {
+        bits.push(`Playlist item ${job.playlistIndex} of ${job.playlistCount}`);
+      }
+      if (needle) bits.push(String(needle));
+      subEl.textContent = bits.join(' · ') || job.detail || 'Working…';
+
+      const pct = job.percent != null ? Number(job.percent) : NaN;
+      if (Number.isFinite(pct)) {
+        fillEl.classList.remove('indeterminate');
+        fillEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+        metaEl.textContent = `${pct.toFixed(pct >= 10 ? 0 : 1)}%${job.detail ? ` · ${job.detail}` : ''}`;
+      } else {
+        fillEl.classList.add('indeterminate');
+        fillEl.style.width = '40%';
+        metaEl.textContent = job.detail || 'Starting…';
+      }
     }
 
+    renderJobList();
     highlightActiveJobs();
   }
 
