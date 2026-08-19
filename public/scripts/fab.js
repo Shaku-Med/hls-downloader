@@ -1319,6 +1319,8 @@
     panel.style.left = `${Math.round(left)}px`;
     panel.style.top = `${Math.round(top)}px`;
   }
+  let fabScanRetry = 0;
+  let fabScanRetryTimer = 0;
   function setPanelOpen(open) {
     if (open) {
       dismissStaleOverlays();
@@ -1339,6 +1341,7 @@
         positionPanel();
         requestAnimationFrame(() => positionPanel());
       });
+      fabScanRetry = 0;
       fabRecScan();
     } else {
       panel.classList.remove('open');
@@ -2741,10 +2744,8 @@
       fabSelectedIndex = Number(fabRecSelect.value) || 0;
     }
     ensureFabRecSelectEnhanced();
-    try {
-      fabRecSelect.dispatchEvent(new Event('change', { bubbles: true }));
-    } catch (_) {
-      // ignore
+    if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.sync) {
+      try { HLS_IOS_SELECT.sync(fabRecSelect); } catch (_) { /* ignore */ }
     }
   }
 
@@ -2836,12 +2837,13 @@
   function applyFabVideoList(res) {
     fabVideos = Array.isArray(res && res.videos) ? res.videos : [];
     fabEmbeds = Array.isArray(res && res.embeddedPlayers) ? res.embeddedPlayers : [];
-    const pref = Number.isFinite(Number(res && res.preferredStartIndex))
-      ? Number(res.preferredStartIndex)
-      : fabSelectedIndex;
-    fabSelectedIndex = fabVideos.length
-      ? Math.max(0, Math.min(fabVideos.length - 1, pref | 0))
-      : 0;
+    if (fabVideos.length) {
+      const stillThere = fabVideos.some((v) => v.index === fabSelectedIndex);
+      if (!stillThere) fabSelectedIndex = 0;
+      fabSelectedIndex = Math.max(0, Math.min(fabVideos.length - 1, fabSelectedIndex | 0));
+    } else {
+      fabSelectedIndex = 0;
+    }
     fillFabRecSelect();
   }
 
@@ -2947,19 +2949,22 @@
       if (!res || !res.ok) {
         setFabRecordUiVisible(false);
         setFabRecStopVisible(false);
+        scheduleFabScanRetry(false);
         return;
       }
       applyFabVideoList(res);
       if (res.recording) {
+        fabScanRetry = 0;
         setFabRecordUiVisible(true);
         setFabRecordingState(true);
         fabUpdateRecStatus();
       } else if (res.count > 0) {
+        fabScanRetry = 0;
         setFabRecordUiVisible(true);
         setFabRecordingState(
           false,
           res.count === 1
-            ? 'Found 1 video. Hit Rec when you’re ready, or open the list to peek at it.'
+            ? 'Found 1 video. Hit Rec when you’re ready, or open the list to jump to it.'
             : `Found ${res.count} videos. Pick which one to start with, then hit Rec.`
         );
       } else if (fabEmbeds.length) {
@@ -2968,11 +2973,50 @@
         setFabRecordingState(false);
         if (fabRecBtn) fabRecBtn.disabled = true;
         renderFabEmbedHint();
+        scheduleFabScanRetry(true);
       } else {
         setFabRecordUiVisible(false);
         setFabRecordingState(false);
+        scheduleFabScanRetry(false);
       }
     });
+  }
+
+  function scheduleFabScanRetry(foundEmbed) {
+    if (fabScanRetryTimer) {
+      clearTimeout(fabScanRetryTimer);
+      fabScanRetryTimer = 0;
+    }
+    if (fabIsRecording) return;
+    const panelOpen = !!(panel && panel.classList && panel.classList.contains('open'));
+    // Don't hammer pages with no player. Retry when a player iframe is visible
+    // or the user actually has the panel open (lazy players like Reddit).
+    if (!foundEmbed && !panelOpen) return;
+    const max = foundEmbed ? 6 : 4;
+    if (fabScanRetry >= max) return;
+    fabScanRetry += 1;
+    fabScanRetryTimer = setTimeout(() => {
+      fabScanRetryTimer = 0;
+      if (!extAlive() || fabIsRecording) return;
+      fabRecScan();
+    }, 700 * fabScanRetry);
+  }
+
+  function focusFabPickedVideo(idx) {
+    if (fabIsRecording) return;
+    if (!Number.isFinite(idx) || !fabVideos.length) return;
+    fabSendRecorder('focus', (res) => {
+      if (!res || !res.ok) {
+        if (renderFabEmbedHint(res && res.embeddedPlayers)) return;
+        if (fabRecStatus) {
+          fabRecStatus.textContent = res?.error || 'Couldn’t find that video. Try again.';
+        }
+        return;
+      }
+      if (fabRecStatus) {
+        fabRecStatus.textContent = `Got it. Brought you to “${fabShortLabel(res.label, 40)}”.`;
+      }
+    }, { index: fabFrameLocalIndex(idx), frameId: fabFrameIdForIndex(idx) });
   }
 
   if (fabRecSelect) {
@@ -2980,21 +3024,18 @@
       const idx = Number(fabRecSelect.value);
       if (!Number.isFinite(idx)) return;
       fabSelectedIndex = idx;
-      if (fabIsRecording) return;
-      fabSendRecorder('focus', (res) => {
-        if (!res || !res.ok) {
-          // The listed video is gone. If a cross-origin player is what is
-          // really on the page, offer to open it rather than just complaining.
-          if (renderFabEmbedHint(res && res.embeddedPlayers)) return;
-          if (fabRecStatus) {
-            fabRecStatus.textContent = res?.error || 'Couldn’t find that video. Try again.';
-          }
-          return;
-        }
-        if (fabRecStatus) {
-          fabRecStatus.textContent = `Got it. Brought you to “${fabShortLabel(res.label, 40)}”.`;
-        }
-      }, { index: fabFrameLocalIndex(idx), frameId: fabFrameIdForIndex(idx) });
+      if (fabSelectEnhanced || fabIsRecording) return;
+      focusFabPickedVideo(idx);
+    });
+    fabRecSelect.addEventListener('ios-select-picked', (ev) => {
+      const idx = Number(fabRecSelect.value);
+      if (ev && ev.detail && Number.isFinite(Number(ev.detail.index))) {
+        const opt = fabRecSelect.options[Number(ev.detail.index)];
+        if (opt) fabSelectedIndex = Number(opt.value) || 0;
+      } else if (Number.isFinite(idx)) {
+        fabSelectedIndex = idx;
+      }
+      focusFabPickedVideo(fabSelectedIndex);
     });
   }
 
@@ -3099,6 +3140,14 @@
       if (fabRecWatch) {
         clearInterval(fabRecWatch);
         fabRecWatch = null;
+      }
+      if (fabScanRetryTimer) {
+        clearTimeout(fabScanRetryTimer);
+        fabScanRetryTimer = 0;
+      }
+      if (fabRecPoll) {
+        clearInterval(fabRecPoll);
+        fabRecPoll = null;
       }
     });
   } catch (_) {

@@ -438,25 +438,70 @@
   }
 
   /* ───────────────────────── discovery ───────────────────────── */
+  function nodeConnected(el) {
+    try {
+      return !!(el && el.isConnected);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function videoInShadow(video) {
+    try {
+      const root = video.getRootNode && video.getRootNode();
+      return !!(root && root.host);
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /**
+   * Videos in this frame only (iframes are scanned separately via all_frames).
+   * Walks open shadow roots so custom players (Reddit, etc.) are not missed.
+   */
   function findVideoElements() {
     const videos = [];
     const seen = new Set();
     const collect = (root) => {
+      if (!root) return;
       let list;
-      try { list = root.querySelectorAll('video'); } catch (_) { return; }
+      try {
+        list = root.querySelectorAll('video');
+      } catch (_) {
+        return;
+      }
       for (const v of list) {
         if (seen.has(v)) continue;
         seen.add(v);
         videos.push(v);
       }
+      let hosts;
+      try {
+        hosts = root.querySelectorAll('*');
+      } catch (_) {
+        return;
+      }
+      for (const el of hosts) {
+        let sr = null;
+        try {
+          sr = el.shadowRoot;
+        } catch (_) {
+          sr = null;
+        }
+        if (sr) collect(sr);
+        // Closed-shadow players sometimes hang the media element on the host.
+        try {
+          const inner = el.video || el.media;
+          if (inner && inner.tagName === 'VIDEO' && !seen.has(inner)) {
+            seen.add(inner);
+            videos.push(inner);
+          }
+        } catch (_) {
+          // ignore
+        }
+      }
     };
     collect(document);
-    for (const iframe of document.querySelectorAll('iframe')) {
-      try {
-        const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
-        if (doc) collect(doc);
-      } catch (_) { /* cross-origin */ }
-    }
     return videos;
   }
 
@@ -779,13 +824,72 @@
     );
   }
 
+  function waitForPlaybackData(video, ms) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        try { video.removeEventListener('playing', done); } catch (_) {}
+        try { video.removeEventListener('loadeddata', done); } catch (_) {}
+        try { video.removeEventListener('canplay', done); } catch (_) {}
+        resolve();
+      };
+      try {
+        if (video.readyState >= 2) {
+          resolve();
+          return;
+        }
+      } catch (_) {
+        resolve();
+        return;
+      }
+      try { video.addEventListener('playing', done); } catch (_) {}
+      try { video.addEventListener('loadeddata', done); } catch (_) {}
+      try { video.addEventListener('canplay', done); } catch (_) {}
+      setTimeout(done, ms || 1500);
+    });
+  }
+
   /* ───────────────────────── start / stop one ───────────────────────── */
-  function startOne(video, idx) {
+  async function startOne(video, idx) {
     const label = labelForVideo(video, idx);
 
-    // Optional: pin the element fullscreen for the cleanest captureStream quality.
+    function captureElementStream(el) {
+      try {
+        if (el.captureStream) return el.captureStream();
+        if (el.mozCaptureStream) return el.mozCaptureStream();
+      } catch (_) {
+        // CORS / site policy
+      }
+      return null;
+    }
+    function streamUsable(s) {
+      if (!s) return false;
+      try {
+        const vt = s.getVideoTracks ? s.getVideoTracks() : [];
+        if (vt && vt.length) return true;
+        const at = s.getAudioTracks ? s.getAudioTracks() : [];
+        return !!(at && at.length);
+      } catch (_) {
+        return false;
+      }
+    }
+
+    // Same path for every site: kick playback, then capture the element's stream.
+    try { const p0 = video.play && video.play(); if (p0 && p0.catch) p0.catch(() => {}); } catch (_) {}
+    try {
+      if (video.readyState < 2) await waitForPlaybackData(video, 1500);
+    } catch (_) {
+      // ignore
+    }
+    if (!recording) return { idx, label, error: 'stopped' };
+
+    // Don't yank the node out of custom players (shadow DOM) — that kills Reddit
+    // and similar MSE pipelines. Fall back to in-place capture if detach fails.
     let detachSaved = null;
-    if (detachVideoEnabled) {
+    const canDetach = detachVideoEnabled && !videoInShadow(video);
+    if (canDetach) {
       try {
         detachSaved = detachVideoForRecord(video);
       } catch (_) {
@@ -793,19 +897,18 @@
       }
     }
 
-    // Same path for every site: kick playback, then capture the element's stream.
-    try { const p0 = video.play && video.play(); if (p0 && p0.catch) p0.catch(() => {}); } catch (_) {}
-
-    let stream;
-    try {
-      stream = video.captureStream
-        ? video.captureStream()
-        : (video.mozCaptureStream ? video.mozCaptureStream() : null);
-    } catch (e) {
-      restoreVideoAfterRecord(video, detachSaved);
-      return { idx, label, error: 'this video could not be recorded' };
+    let stream = captureElementStream(video);
+    if (!streamUsable(stream) && detachSaved) {
+      try {
+        restoreVideoAfterRecord(video, detachSaved);
+      } catch (_) {
+        // ignore
+      }
+      detachSaved = null;
+      try { const p1 = video.play && video.play(); if (p1 && p1.catch) p1.catch(() => {}); } catch (_) {}
+      stream = captureElementStream(video);
     }
-    if (!stream) {
+    if (!streamUsable(stream)) {
       restoreVideoAfterRecord(video, detachSaved);
       return { idx, label, error: 'this video could not be recorded' };
     }
@@ -926,12 +1029,12 @@
    * Start the next queued video only (never multiple at once).
    * Skips videos that fail to start.
    */
-  function startNextFromQueue() {
+  async function startNextFromQueue() {
     clearQueueAdvanceTimer();
     while (recordQueue.length) {
       const item = recordQueue.shift();
-      if (!item || !item.video || !document.contains(item.video)) continue;
-      const r = startOne(item.video, item.idx);
+      if (!item || !item.video || !nodeConnected(item.video)) continue;
+      const r = await startOne(item.video, item.idx);
       if (r && r.ok) {
         mountOverlay();
         startLoop();
@@ -994,10 +1097,11 @@
           queueAdvanceTimer = 0;
           if (!recording) return;
           if (recordings.size > 0) return;
-          const next = startNextFromQueue();
-          if (!next && queueTotal > 1) {
-            showToast(`All done with the queue (${queueFinished} of ${queueTotal}).`, 5000);
-          }
+          Promise.resolve(startNextFromQueue()).then((next) => {
+            if (!next && queueTotal > 1) {
+              showToast(`All done with the queue (${queueFinished} of ${queueTotal}).`, 5000);
+            }
+          }).catch(() => {});
         }, 500);
       } else {
         const total = queueTotal;
@@ -1042,7 +1146,7 @@
   }
 
   /* ───────────────────────── public actions ───────────────────────── */
-  function startRecording(opts) {
+  async function startRecording(opts) {
     if (recording) return { ok: false, error: 'Already recording' };
     const videos = findVideoElements();
     if (!videos.length) {
@@ -1089,7 +1193,7 @@
     startLoop();
 
     const details = [];
-    const first = startNextFromQueue();
+    const first = await startNextFromQueue();
     if (first) details.push(first);
 
     if (!first || !first.ok) {
@@ -1163,16 +1267,19 @@
       });
     }
     const pos = queuePosition();
+    const videoCount = (recording || recordings.size > 0)
+      ? (queueTotal || pos.total || 0)
+      : findVideoElements().length;
     return {
       recording: recording || recordings.size > 0,
-      videoCount: findVideoElements().length,
+      videoCount,
       active,
       sequential: queueTotal > 1,
       queueTotal,
       queueFinished,
       queueRemaining: recordQueue.length,
       position: pos.current,
-      total: pos.total || findVideoElements().length,
+      total: pos.total || videoCount,
     };
   }
 
@@ -1181,7 +1288,7 @@
     const listed = listVideos();
     return {
       ok: true,
-      count: st.videoCount,
+      count: listed.count,
       recording: st.recording,
       sequential: st.sequential,
       total: st.total,
@@ -1207,7 +1314,9 @@
       return true;
     }
     if (msg.action === 'start') {
-      sendResponse(startRecording({ startIndex: msg.startIndex }));
+      Promise.resolve(startRecording({ startIndex: msg.startIndex }))
+        .then((res) => sendResponse(res))
+        .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
       return true;
     }
     if (msg.action === 'stop') { sendResponse(stopRecording()); return true; }

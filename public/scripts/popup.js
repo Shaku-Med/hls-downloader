@@ -1677,22 +1677,21 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
       selectedIndex = Number(selectEl.value) || 0;
     }
     ensureSelectEnhanced();
-    try {
-      selectEl.dispatchEvent(new Event('change', { bubbles: true }));
-    } catch (_) {
-      // ignore
+    if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.sync) {
+      try { HLS_IOS_SELECT.sync(selectEl); } catch (_) { /* ignore */ }
     }
   }
 
   function applyVideoList(res) {
     videos = Array.isArray(res && res.videos) ? res.videos : [];
     embeds = Array.isArray(res && res.embeddedPlayers) ? res.embeddedPlayers : [];
-    const pref = Number.isFinite(Number(res && res.preferredStartIndex))
-      ? Number(res.preferredStartIndex)
-      : selectedIndex;
-    selectedIndex = videos.length
-      ? Math.max(0, Math.min(videos.length - 1, pref | 0))
-      : 0;
+    if (videos.length) {
+      const stillThere = videos.some((v) => v.index === selectedIndex);
+      if (!stillThere) selectedIndex = 0;
+      selectedIndex = Math.max(0, Math.min(videos.length - 1, selectedIndex | 0));
+    } else {
+      selectedIndex = 0;
+    }
     fillSelect();
   }
 
@@ -1770,7 +1769,7 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
         if (!statusEl.textContent || statusEl.hidden) {
           setStatus(
             res.count === 1
-              ? 'Found 1 video. Hit Rec when you’re ready, or open the list to peek at it.'
+              ? 'Found 1 video. Hit Rec when you’re ready, or open the list to jump to it.'
               : `Found ${res.count} videos. Pick which one to start with, then hit Rec.`
           );
         }
@@ -1785,21 +1784,38 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
     });
   }
 
-  selectEl.addEventListener('change', () => {
-    const idx = Number(selectEl.value);
-    if (!Number.isFinite(idx)) return;
-    selectedIndex = idx;
+  function focusPickedVideo(idx) {
     if (isRecording) return;
+    if (!Number.isFinite(idx) || !videos.length) return;
     sendToTab('focus', (res) => {
       if (!res || !res.ok) {
-        // The listed video is gone. If a cross-origin player is what is really
-        // on the page, offer to open it rather than just complaining.
         if (renderEmbedHint(res && res.embeddedPlayers)) return;
         setStatus(res?.error || 'Couldn’t find that video. Try again.');
         return;
       }
       setStatus(`Got it. Brought you to “${shortLabel(res.label, 48)}”.`);
     }, { index: frameLocalIndex(idx), frameId: frameIdForIndex(idx) });
+  }
+
+  selectEl.addEventListener('change', () => {
+    const idx = Number(selectEl.value);
+    if (!Number.isFinite(idx)) return;
+    selectedIndex = idx;
+    // Native <select> only. The iOS menu uses ios-select-picked so filling the
+    // list never yanks the page around.
+    if (selectEnhanced || isRecording) return;
+    focusPickedVideo(idx);
+  });
+
+  selectEl.addEventListener('ios-select-picked', (ev) => {
+    const idx = Number(selectEl.value);
+    if (ev && ev.detail && Number.isFinite(Number(ev.detail.index))) {
+      const opt = selectEl.options[Number(ev.detail.index)];
+      if (opt) selectedIndex = Number(opt.value) || 0;
+    } else if (Number.isFinite(idx)) {
+      selectedIndex = idx;
+    }
+    focusPickedVideo(selectedIndex);
   });
 
   btn.addEventListener('click', () => {

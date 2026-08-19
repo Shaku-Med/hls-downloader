@@ -100,9 +100,17 @@
       row.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
-        if (select.selectedIndex !== index) {
+        const changed = select.selectedIndex !== index;
+        if (changed) {
           select.selectedIndex = index;
           select.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        try {
+          select.dispatchEvent(
+            new CustomEvent('ios-select-picked', { bubbles: true, detail: { index } })
+          );
+        } catch (_) {
+          // ignore
         }
         syncTrigger(wrap, select);
         closeWrap(wrap);
@@ -299,6 +307,12 @@
     scope.querySelectorAll('select:not([data-ios-enhanced])').forEach((sel) => enhance(sel, options));
   }
 
+  function sync(select) {
+    if (!select || !select.closest) return;
+    const wrap = select.closest('.ios-select');
+    if (wrap) syncTrigger(wrap, select);
+  }
+
   if (!global.__iosSelectOutsideBound) {
     global.__iosSelectOutsideBound = true;
     document.addEventListener(
@@ -328,5 +342,5 @@
     );
   }
 
-  global.HLS_IOS_SELECT = { enhance, enhanceAll, closeAll };
+  global.HLS_IOS_SELECT = { enhance, enhanceAll, closeAll, sync };
 })(typeof window !== 'undefined' ? window : globalThis);

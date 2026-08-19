@@ -824,25 +824,66 @@ function askFrame(tabId, frameId, payload) {
   });
 }
 
-/**
- * Scan every frame and merge the results into one list. Each video carries the
- * frameId that owns it so focus/record can be routed back to the right frame.
- */
+const RECORDER_SCRIPT = 'public/scripts/video-recorder.js';
+
+async function ensureRecorderInAllFrames(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: [RECORDER_SCRIPT],
+    });
+  } catch (_) {
+    // Page may still have the manifest-injected copy.
+  }
+}
+
+async function scanFramesViaExecute(tabId) {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') return null;
+  try {
+    return await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        try {
+          if (!window.HLS_VIDEO_REC || typeof window.HLS_VIDEO_REC.scan !== 'function') {
+            return null;
+          }
+          return window.HLS_VIDEO_REC.scan();
+        } catch (_) {
+          return null;
+        }
+      },
+    });
+  } catch (_) {
+    return null;
+  }
+}
+
 async function scanAllFrames(tabId) {
-  const frameIds = [0, ...knownRecorderFrameIds(tabId)];
-  const payload = { type: 'VIDEO_RECORDER', action: 'scan' };
-  const results = await Promise.all(frameIds.map((fid) => askFrame(tabId, fid, payload)));
+  await ensureRecorderInAllFrames(tabId);
+
+  let rows = await scanFramesViaExecute(tabId);
+  if (!rows) {
+    const frameIds = [0, ...knownRecorderFrameIds(tabId)];
+    const payload = { type: 'VIDEO_RECORDER', action: 'scan' };
+    const asked = await Promise.all(frameIds.map((fid) => askFrame(tabId, fid, payload)));
+    rows = frameIds.map((frameId, i) => ({ frameId, result: asked[i] }));
+  }
 
   const merged = [];
   let recording = false;
   let embeddedPlayers = [];
   let stale = false;
+  const seenFrameIds = new Set();
 
-  results.forEach((res, i) => {
-    const frameId = frameIds[i];
+  for (const row of rows) {
+    const frameId = Number(row && row.frameId);
+    const res = row && row.result;
+    if (!Number.isFinite(frameId)) continue;
+    seenFrameIds.add(frameId);
     if (!res || !res.ok) {
       if (frameId > 0) stale = true;
-      return;
+      continue;
     }
     if (res.recording) recording = true;
     const frameUrl = (recorderFrames[tabId] && recorderFrames[tabId][frameId]?.url) || '';
@@ -852,6 +893,7 @@ async function scanAllFrames(tabId) {
     } catch (_) {
       host = '';
     }
+    if (frameId > 0) noteRecorderFrame(tabId, frameId, frameUrl);
     for (const v of res.videos || []) {
       merged.push({ ...v, frameId, frameIndex: v.index, frameHost: host });
     }
@@ -859,14 +901,14 @@ async function scanAllFrames(tabId) {
     if (frameId === 0 && Array.isArray(res.embeddedPlayers)) {
       embeddedPlayers = res.embeddedPlayers;
     }
-  });
+  }
 
   // Drop frames that stopped answering so the registry does not grow stale.
   if (stale && recorderFrames[tabId]) {
-    results.forEach((res, i) => {
-      const fid = frameIds[i];
-      if (fid > 0 && !res) delete recorderFrames[tabId][fid];
-    });
+    for (const fid of Object.keys(recorderFrames[tabId] || {})) {
+      const n = Number(fid);
+      if (n > 0 && !seenFrameIds.has(n)) delete recorderFrames[tabId][n];
+    }
   }
 
   // Re-index so the UI has one flat list.
@@ -880,15 +922,14 @@ async function scanAllFrames(tabId) {
     recording,
     videos: merged,
     embeddedPlayers,
-    preferredStartIndex: 0,
-    frames: frameIds.length,
+    frames: seenFrameIds.size || 1,
   };
 }
 
 const IMAGE_GRABBER_KEY = 'imageHoverDownloadEnabled';
 const FLOAT_GRABBER_KEY = 'floatGrabberEnabled';
 
-/** Same order as content_scripts in chromium/firefox manifests. */
+/** Top-frame page UI. video-recorder.js is injected separately into every frame. */
 const PAGE_CONTENT_SCRIPTS = [
   'public/scripts/ios-select.js',
   'public/scripts/theme-helpers.js',
@@ -898,7 +939,6 @@ const PAGE_CONTENT_SCRIPTS = [
   'public/scripts/ffmpeg-preset-helpers.js',
   'public/scripts/image-hover-download.js',
   'public/scripts/fab.js',
-  'public/scripts/video-recorder.js',
 ];
 
 /**
@@ -920,6 +960,14 @@ async function reinjectPageContentScripts(tabIds) {
     }
   }
   for (const tabId of ids) {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        files: [RECORDER_SCRIPT],
+      });
+    } catch (_) {
+      // Restricted pages, discarded tabs, missing file-access, etc.
+    }
     try {
       await chrome.scripting.executeScript({
         target: { tabId },
