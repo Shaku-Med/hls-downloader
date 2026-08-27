@@ -267,7 +267,10 @@ def _resolve_output_path(message, out_dir: str, filename: str, ext: str = ".mp4"
 
 def _yt_dlp_output_target(message: dict, out_dir: str, filename: str) -> str:
     """Single file path, or yt-dlp template for playlist downloads."""
-    if message.get("ytDlpAudioOnly"):
+    # Must agree with _wants_yt_dlp_audio_extract, which is what actually adds
+    # --extract-audio. Checking only the raw flag missed Spotify and the audio
+    # only sites, so their tracks were written to a .mp4 path.
+    if _wants_yt_dlp_audio_extract(message):
         stem = _sanitize_filename_stem(filename)
         stem = _shorten_stem_for_windows(stem, out_dir, ".mp3")
         single = os.path.join(out_dir, f"{stem}.%(ext)s")
@@ -1241,6 +1244,179 @@ def _impersonation_help_message() -> str:
     )
 
 
+_SPOTIFY_TRACK_ID_RE = re.compile(r"/track/([A-Za-z0-9]+)")
+
+# Variant words that mean "this is not the track we asked for". Only counted
+# against a candidate when the Spotify title does not use the word itself, so
+# asking for a remix still finds the remix.
+_WRONG_VARIANT_PENALTIES = (
+    ("karaoke", 60),
+    ("reaction", 60),
+    ("cover", 45),
+    ("live", 35),
+    ("instrumental", 35),
+    ("nightcore", 35),
+    ("sped up", 30),
+    ("slowed", 30),
+    ("remix", 25),
+    ("8d audio", 25),
+    ("mashup", 25),
+    ("tutorial", 40),
+)
+
+
+def _spotify_track_meta(spotify_url: str) -> Optional[Dict[str, Any]]:
+    """
+    Track name, artists and duration from Spotify's public embed page.
+
+    The oembed endpoint only returns a bare title, with no artist and no
+    duration, which is far too little to pick the right YouTube result.
+    """
+    m = _SPOTIFY_TRACK_ID_RE.search(spotify_url or "")
+    if not m:
+        return None
+    url = "https://open.spotify.com/embed/track/" + m.group(1)
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"}
+        )
+        with urllib.request.urlopen(req, timeout=25.0) as resp:
+            html = resp.read().decode("utf-8", errors="replace")
+        blob = re.search(
+            r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S
+        )
+        if not blob:
+            return None
+        entity = json.loads(blob.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+        title = str(entity.get("name") or "").strip()
+        if not title:
+            return None
+        artists = [
+            str(a.get("name") or "").strip()
+            for a in (entity.get("artists") or [])
+            if isinstance(a, dict) and a.get("name")
+        ]
+        dur_ms = entity.get("duration")
+        duration = float(dur_ms) / 1000.0 if isinstance(dur_ms, (int, float)) and dur_ms else 0.0
+        return {"title": title, "artists": artists, "duration": duration}
+    except Exception:
+        return None
+
+
+def _yt_search_candidates(query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    """Metadata only search, so the best match can be chosen before downloading."""
+    prefix = _yt_dlp_invocation_prefix()
+    if not prefix:
+        return []
+    cmd = prefix + [
+        f"ytsearch{limit}:{query}",
+        "--simulate",
+        "--no-warnings",
+        "--ignore-errors",
+        "--print",
+        "%(id)s\t%(duration)s\t%(title)s\t%(channel)s",
+    ]
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=90.0,
+            stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+        )
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for line in (proc.stdout or "").splitlines():
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) < 4 or not parts[0].strip():
+            continue
+        try:
+            dur = float(parts[1])
+        except (TypeError, ValueError):
+            dur = 0.0
+        out.append(
+            {"id": parts[0].strip(), "duration": dur, "title": parts[2], "channel": parts[3]}
+        )
+    return out
+
+
+def _score_music_candidate(
+    cand: Dict[str, Any], title: str, artists: List[str], duration: float
+) -> float:
+    """Higher is a better match for the Spotify track."""
+    ct = (cand.get("title") or "").lower()
+    cc = (cand.get("channel") or "").lower()
+    src = title.lower()
+    score = 0.0
+
+    # Duration is the strongest signal a recording is the same one.
+    cd = float(cand.get("duration") or 0)
+    if duration > 0 and cd > 0:
+        diff = abs(cd - duration)
+        if diff <= 2:
+            score += 60
+        elif diff <= 5:
+            score += 45
+        elif diff <= 10:
+            score += 25
+        elif diff <= 20:
+            score += 5
+        else:
+            score -= 45
+    elif duration > 0:
+        score -= 5  # unknown length when we know the real one
+
+    words = [w for w in re.findall(r"[a-z0-9']+", src) if len(w) > 2]
+    if words:
+        hit = sum(1 for w in words if w in ct)
+        score += 30.0 * (hit / len(words))
+
+    for a in artists:
+        al = a.lower()
+        if not al:
+            continue
+        if al in cc:
+            score += 25
+        if al in ct:
+            score += 12
+
+    # Auto generated channels carry the label's own audio.
+    if cc.endswith("- topic"):
+        score += 30
+    if "vevo" in cc:
+        score += 15
+    if "official audio" in ct or "official video" in ct:
+        score += 8
+
+    for word, penalty in _WRONG_VARIANT_PENALTIES:
+        if word in ct and word not in src:
+            score -= penalty
+    return score
+
+
+def _spotify_youtube_target(spotify_url: str) -> Optional[str]:
+    """
+    Pick the YouTube video that actually matches the Spotify track.
+
+    Searching the bare title and taking the first hit gave live versions,
+    covers and wrong songs, so search several and rank them on duration,
+    title overlap and channel before committing to one.
+    """
+    meta = _spotify_track_meta(spotify_url)
+    if not meta:
+        return None
+    title = meta["title"]
+    artists = meta["artists"]
+    duration = meta["duration"]
+    query = " ".join(filter(None, [", ".join(artists[:2]), title])).strip() or title
+
+    cands = _yt_search_candidates(query, limit=8)
+    if not cands:
+        return None
+    best = max(cands, key=lambda c: _score_music_candidate(c, title, artists, duration))
+    if _score_music_candidate(best, title, artists, duration) < 10:
+        return None
+    return "https://www.youtube.com/watch?v=" + best["id"]
+
+
 def _spotify_oembed_query(spotify_url: str) -> Optional[str]:
     u = (spotify_url or "").strip()
     if not u:
@@ -2039,21 +2215,27 @@ def run_yt_dlp_with_updates(
         tail = "".join(err_lines[-35:]).strip()
 
     if code != 0 and spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
-        q = _spotify_oembed_query(primary) or _spotify_oembed_query(stream_url)
-        if q:
-            send_message(
-                with_job_id(
-                    {
-                        "type": "progress",
-                        "phase": "downloading",
-                        "detail": "Spotify blocked; searching YouTube fallback…",
-                        "output": output_path,
-                    },
-                    job_id,
-                )
+        spotify_page = primary if _is_spotify_url(primary) else stream_url
+        send_message(
+            with_job_id(
+                {
+                    "type": "progress",
+                    "phase": "downloading",
+                    "detail": "Spotify blocked; finding the matching track…",
+                    "output": output_path,
+                },
+                job_id,
             )
-            yt_target = "ytsearch1:" + q
-            code, err_lines = run_one(yt_target)
+        )
+        # Rank several results on duration, title and channel rather than
+        # trusting whatever the first search hit happens to be.
+        picked = _spotify_youtube_target(spotify_page)
+        if picked:
+            code, err_lines = run_one(picked)
+        else:
+            q = _spotify_oembed_query(primary) or _spotify_oembed_query(stream_url)
+            if q:
+                code, err_lines = run_one("ytsearch1:" + q)
 
     if code != 0 and apple_flow:
         q = _apple_music_youtube_query(run_message, page_url, stream_url)
