@@ -19,6 +19,7 @@
   ],
   "background": {
     "scripts": [
+      "public/scripts/drm-hosts.js",
       "public/scripts/zip-store.js",
       "public/scripts/social-post-urls.js",
       "public/scripts/background.js"
@@ -51,6 +52,8 @@
         "file:///*"
       ],
       "js": [
+        "public/scripts/drm-hosts.js",
+        "public/scripts/drm-detect.js",
         "public/scripts/video-recorder.js"
       ],
       "all_frames": true,

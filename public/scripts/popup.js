@@ -795,6 +795,26 @@ function refreshSectionJump() {
   }
 }
 
+/** Protected pages get the recorder offer above the (usually useless) streams. */
+function renderDrmNotice(drm) {
+  const root = document.getElementById('streams-root');
+  if (!root) return;
+  const old = root.querySelector('.drm-notice');
+  if (old) old.remove();
+  window.__sgDrmBlocksRecording = !!(drm && drm.mediaKind !== 'audio');
+  if (window.__sgDrmBlocksRecording) {
+    // Take the Rec control away rather than let it fail on every attempt.
+    const rec = document.getElementById('record-row');
+    const recStatus = document.getElementById('record-status');
+    if (rec) rec.hidden = true;
+    if (recStatus) recStatus.hidden = true;
+  }
+  if (!drm) return;
+  const api = window.HGR_THEME;
+  if (!api || typeof api.buildDrmNotice !== 'function') return;
+  root.insertBefore(api.buildDrmNotice(drm, {}), root.firstChild);
+}
+
 function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
   setContextLine(pageTitle);
   const content = document.getElementById('streams-root') || document.getElementById('content');
@@ -1362,6 +1382,7 @@ function loadUi() {
         const streams = response?.streams || [];
         _lastStreamsSig = streamsSignature(streams);
         renderStreams(streams, response?.pageTitle || '', hasPath, spotifyCtx);
+        renderDrmNotice(response && response.drm);
         refreshSectionJump();
         renderJobsBanner(response?.jobs || [], {
           running: response?.running,
@@ -1403,6 +1424,7 @@ function refreshStreamsIfChanged() {
       const hasPath = !!(response.userDownloadPath || '').trim();
       setPathBar(response.userDownloadPath);
       renderStreams(streams, response.pageTitle || '', hasPath, spotifyCtx);
+      renderDrmNotice(response && response.drm);
       refreshSectionJump();
       renderJobsBanner(response.jobs || [], {
         running: response.running,
@@ -1746,6 +1768,7 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
   }
 
   function setRecordUiVisible(visible) {
+    if (window.__sgDrmBlocksRecording) visible = false;
     row.hidden = !visible;
     if (!visible) {
       setStatus('');

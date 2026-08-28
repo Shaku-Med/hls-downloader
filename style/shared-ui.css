@@ -606,6 +606,70 @@
   border-top: 0.5px solid var(--line);
 }
 
+/* ── Protected video notice ──
+   Shown when the page encrypts its video, where a download can never work and
+   screen recording is the only way through. */
+/* ── Protected video notice ──
+   Shown above the stream list on every protected site, so it is one short row:
+   a two line label and an inline button. The long explanation is the tooltip on
+   the box, not a paragraph that pushes the rest of the panel down. */
+.drm-notice {
+  margin-bottom: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius);
+  background: var(--warn-bg);
+  border: 0.5px solid color-mix(in srgb, var(--warn) 34%, transparent);
+}
+.drm-notice-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.drm-notice-copy { min-width: 0; flex: 1 1 auto; }
+.drm-notice-title {
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--text);
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.drm-notice-text {
+  margin-top: 1px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.drm-notice-btn {
+  flex: 0 0 auto;
+  border: none;
+  border-radius: 980px;
+  padding: 6px 14px;
+  font-family: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  cursor: pointer;
+  background: var(--accent);
+  color: var(--btnText);
+  transition: filter var(--transition), transform 120ms ease;
+}
+.drm-notice-btn:hover:not(:disabled) { filter: brightness(1.06); }
+.drm-notice-btn:active:not(:disabled) { transform: scale(0.98); }
+.drm-notice-btn:disabled { opacity: 0.55; cursor: default; }
+.drm-notice-status {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--muted);
+}
+.drm-notice-status.err { color: var(--danger); }
+.drm-notice-status.ok { color: var(--ok); }
+
 /* ── Jump to a section ──
    Sits on the header line beside the settings gear / close button, so it
    costs no vertical space. Shrinks before the title does. */

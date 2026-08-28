@@ -119,5 +119,39 @@ class SocialRouting(unittest.TestCase):
         self.assertEqual(host._netloc_host("https://www.instagram.com/reel/x/"), "instagram.com")
 
 
+class TrackNaming(unittest.TestCase):
+    """Saved music should be named after the song, not after a database id."""
+
+    def test_placeholders_are_recognised(self):
+        for name in ("video", "audio", "track", "", "   ",
+                     "spotify track 4cOdK2wGLETKBW3PvgPWqT",
+                     "spotify album 1ATL5GLyefJaxhQzSPVrLX",
+                     "4cOdK2wGLETKBW3PvgPWqT"):
+            self.assertTrue(host._looks_generic_stem(name), name)
+
+    def test_real_names_are_left_alone(self):
+        for name in ("Never Gonna Give You Up",
+                     "Rick Astley - Never Gonna Give You Up",
+                     "my song", "Interview 2024"):
+            self.assertFalse(host._looks_generic_stem(name), name)
+
+    def test_music_stem_puts_artist_first(self):
+        self.assertEqual(
+            host._music_stem("Blinding Lights", ["The Weeknd"]),
+            "The Weeknd - Blinding Lights",
+        )
+
+    def test_music_stem_without_artist(self):
+        self.assertEqual(host._music_stem("Some Track", []), "Some Track")
+
+    def test_music_stem_keeps_at_most_two_artists(self):
+        self.assertEqual(
+            host._music_stem("Song", ["A", "B", "C"]), "A, B - Song"
+        )
+
+    def test_music_stem_handles_nothing(self):
+        self.assertEqual(host._music_stem("", ["A"]), "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

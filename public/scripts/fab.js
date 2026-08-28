@@ -1525,6 +1525,7 @@
       _fabStreamsSig = fabStreamsSignature(streams);
       renderJobs(response.jobs || [], response);
       renderStreams(streams, response.pageTitle || '', hasPath);
+      renderFabDrmNotice(response && response.drm);
       refreshFabSectionJump();
       renderImages(hasPath);
       updateQueueBadge(response);
@@ -1559,6 +1560,7 @@
       }
       renderJobs(response.jobs || [], response);
       renderStreams(streams, response.pageTitle || '', hasPath);
+      renderFabDrmNotice(response && response.drm);
       refreshFabSectionJump();
       renderImages(hasPath);
       updateQueueBadge(response);
@@ -1888,6 +1890,25 @@
         // plain select still works
       }
     }
+  }
+
+  /**
+   * The in page recorder cannot capture protected video, so its controls are
+   * withdrawn and the screen recorder offered instead.
+   */
+  let fabDrmBlocksRecording = false;
+
+  /** Protected pages get the recorder offer above the (usually useless) streams. */
+  function renderFabDrmNotice(drm) {
+    fabDrmBlocksRecording = !!(drm && drm.mediaKind !== 'audio');
+    if (fabDrmBlocksRecording) setFabRecordUiVisible(false);
+    if (!fabStreams) return;
+    const old = fabStreams.querySelector('.drm-notice');
+    if (old) old.remove();
+    if (!drm) return;
+    const api = window.HGR_THEME;
+    if (!api || typeof api.buildDrmNotice !== 'function') return;
+    fabStreams.insertBefore(api.buildDrmNotice(drm, {}), fabStreams.firstChild);
   }
 
   function renderStreams(streams, pageTitle, hasPath) {
@@ -2690,6 +2711,7 @@
   let fabSelectEnhanced = false;
 
   function setFabRecordUiVisible(visible) {
+    if (fabDrmBlocksRecording) visible = false;
     if (fabRecSection) fabRecSection.hidden = !visible;
     if (!visible) {
       if (fabRecStatus) fabRecStatus.textContent = '';

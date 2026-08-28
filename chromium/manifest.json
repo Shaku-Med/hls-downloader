@@ -47,6 +47,8 @@
         "file:///*"
       ],
       "js": [
+        "public/scripts/drm-hosts.js",
+        "public/scripts/drm-detect.js",
         "public/scripts/video-recorder.js"
       ],
       "all_frames": true,

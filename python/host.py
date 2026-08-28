@@ -1172,11 +1172,57 @@ def _is_spotify_url(url: str) -> bool:
     return _host_matches_any(h, ("spotify.com", "open.spotify.com", "scdn.co"))
 
 
+_GENERIC_STEMS = {
+    "video", "stream", "download", "audio", "track", "media", "file", "song",
+}
+
+
+def _looks_generic_stem(name: str) -> bool:
+    """
+    Is this a placeholder rather than something a person would recognise?
+
+    Covers the plain words the extension falls back to, the "spotify track
+    <id>" name this helper itself used to produce, and a bare Spotify id, so a
+    saved file is never named after something only a database could read.
+    """
+    low = (name or "").strip().lower()
+    if not low or low in _GENERIC_STEMS:
+        return True
+    if re.fullmatch(r"spotify\s+(track|album|playlist|episode|show)\s+[a-z0-9_-]{6,}", low):
+        return True
+    if re.fullmatch(r"[a-z0-9]{20,24}", low):
+        return True
+    return False
+
+
+def _music_stem(title: str, artists: Optional[List[str]] = None) -> str:
+    """"Artist - Title", which is how music files are normally named."""
+    title = re.sub(r"\s+", " ", str(title or "")).strip()
+    if not title:
+        return ""
+    who = ", ".join([a for a in (artists or []) if a][:2])
+    stem = f"{who} - {title}" if who else title
+    return stem[:120].strip(" -")
+
+
 def _spotify_filename_hint(stream_url: str, page_url: str, fallback_stem: str) -> str:
     """
-    Build a readable track-ish name from Spotify URL path when user kept a generic name.
-    Keeps existing sanitization behavior via _safe_output_path callers.
+    A readable name for a Spotify track.
+
+    Prefers the real track name and artist, which the same embed page the
+    YouTube matching already reads gives us for free. Only when that is not a
+    track, or the fetch fails, does it fall back to the URL path, which is
+    where the old "spotify track 4cOdK2wGLET" style names came from.
     """
+    for candidate in (page_url, stream_url):
+        if not _is_spotify_url(candidate or ""):
+            continue
+        meta = _spotify_track_meta(candidate)
+        if meta and meta.get("title"):
+            stem = _music_stem(meta["title"], meta.get("artists"))
+            if stem:
+                return stem
+
     candidate = (page_url or stream_url or "").strip()
     if not candidate:
         return fallback_stem
@@ -1265,17 +1311,26 @@ _WRONG_VARIANT_PENALTIES = (
 )
 
 
+_SPOTIFY_META_CACHE: Dict[str, Optional[Dict[str, Any]]] = {}
+
+
 def _spotify_track_meta(spotify_url: str) -> Optional[Dict[str, Any]]:
     """
     Track name, artists and duration from Spotify's public embed page.
 
     The oembed endpoint only returns a bare title, with no artist and no
     duration, which is far too little to pick the right YouTube result.
+
+    Cached per track: naming the file and picking the YouTube match both want
+    this, and one download should not fetch the same page twice.
     """
     m = _SPOTIFY_TRACK_ID_RE.search(spotify_url or "")
     if not m:
         return None
-    url = "https://open.spotify.com/embed/track/" + m.group(1)
+    track_id = m.group(1)
+    if track_id in _SPOTIFY_META_CACHE:
+        return _SPOTIFY_META_CACHE[track_id]
+    url = "https://open.spotify.com/embed/track/" + track_id
     try:
         req = urllib.request.Request(
             url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"}
@@ -1290,6 +1345,7 @@ def _spotify_track_meta(spotify_url: str) -> Optional[Dict[str, Any]]:
         entity = json.loads(blob.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
         title = str(entity.get("name") or "").strip()
         if not title:
+            _SPOTIFY_META_CACHE[track_id] = None
             return None
         artists = [
             str(a.get("name") or "").strip()
@@ -1298,8 +1354,11 @@ def _spotify_track_meta(spotify_url: str) -> Optional[Dict[str, Any]]:
         ]
         dur_ms = entity.get("duration")
         duration = float(dur_ms) / 1000.0 if isinstance(dur_ms, (int, float)) and dur_ms else 0.0
-        return {"title": title, "artists": artists, "duration": duration}
+        meta = {"title": title, "artists": artists, "duration": duration}
+        _SPOTIFY_META_CACHE[track_id] = meta
+        return meta
     except Exception:
+        _SPOTIFY_META_CACHE[track_id] = None
         return None
 
 
@@ -1776,6 +1835,10 @@ def _yt_dlp_build_cmd(prefix: List[str], message: dict, output_path: str, target
     ]
     if _wants_yt_dlp_audio_extract(message, target_url):
         cmd.extend(["--extract-audio", "--audio-format", "mp3", "--audio-quality", "0"])
+        # Write title and artist into the file as well as the name. Without it
+        # a saved track shows up untitled in any music player, which is half
+        # the point of downloading it.
+        cmd.append("--embed-metadata")
     if not message.get("ytDlpDownloadPlaylist"):
         cmd.append("--no-playlist")
     cmd.extend(
@@ -3917,6 +3980,65 @@ def _split_filename_ext(filename: str) -> Tuple[str, str]:
     return stem, ext.lower()
 
 
+def _handle_launch_recorder(message: dict) -> None:
+    """
+    Start the screen recorder app.
+
+    Sites that protect their video cannot be downloaded, so the extension
+    offers to record the screen instead and asks us to open the recorder. It is
+    launched detached, so it keeps running once this connection closes.
+    """
+    req_id = (message.get("requestId") or "").strip()
+
+    def reply(**fields: Any) -> None:
+        send_message({"type": "launch_recorder_result", "requestId": req_id, **fields})
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    package_dir = os.path.join(project_root, "screen_recorder")
+    if not os.path.isdir(package_dir):
+        reply(success=False, error="The screen recorder is not installed next to the helper.")
+        return
+
+    python = sys.executable
+    if not python:
+        reply(success=False, error="Could not work out which Python to use.")
+        return
+    # pythonw avoids a console window flashing up on Windows.
+    if os.name == "nt":
+        windowless = os.path.join(os.path.dirname(python), "pythonw.exe")
+        if os.path.isfile(windowless):
+            python = windowless
+
+    kwargs: Dict[str, Any] = {
+        "cwd": project_root,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        # Detached, so closing the browser does not take the recorder with it.
+        kwargs["creationflags"] = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+    else:
+        kwargs["start_new_session"] = True
+
+    argv = [python, "-m", "screen_recorder"]
+    # Recordings belong with the rest of the downloads, so the save folder from
+    # Options is handed over rather than the recorder keeping a second one.
+    out_dir = (message.get("outputDirectory") or message.get("outputDir") or "").strip()
+    if out_dir and os.path.isdir(out_dir):
+        argv += ["--output-dir", out_dir]
+
+    try:
+        subprocess.Popen(argv, **kwargs)
+    except Exception as e:
+        reply(success=False, error=str(e))
+        return
+    reply(success=True)
+
+
 def _handle_save_file(message: dict) -> None:
     """Write base64 bytes into the configured save folder (image grabber direct-save)."""
     req_id = (message.get("requestId") or "").strip()
@@ -4884,10 +5006,18 @@ def run_ffmpeg_with_updates(url, filename, message):
     _CURRENT_JOB_ID = job_id
     page_for_social = (message.get("pageUrl") or message.get("referer") or "").strip()
     effective_filename = filename
-    if _is_spotify_url(url) or _is_spotify_url(page_for_social):
-        low = (filename or "").strip().lower()
-        if low in ("video", "stream", "download", "audio", "track"):
+    # Sites whose media has to be found somewhere else arrive with nothing
+    # useful to name the file after, so the real track name is looked up here
+    # rather than saving something only a database could read.
+    if _looks_generic_stem(filename):
+        if _is_spotify_url(url) or _is_spotify_url(page_for_social):
             effective_filename = _spotify_filename_hint(url, page_for_social, filename)
+        elif _is_apple_music_drm_context(url, page_for_social) or "music.apple.com" in (
+            (page_for_social or "") + (url or "")
+        ).lower():
+            apple = _apple_music_youtube_query(message, page_for_social, url)
+            if apple:
+                effective_filename = apple
     if _looks_like_vtt_url(url):
         _download_vtt_immediate(url, message, out_dir, effective_filename, job_id)
         if _CURRENT_JOB_ID == job_id:
@@ -5346,6 +5476,11 @@ def main():
         if mtype == "save_file":
             # Keep on the reader thread so chunked writes stay ordered on one connection.
             _handle_save_file(message)
+            continue
+        if mtype == "launch_recorder":
+            # Handled inline: spawning is quick, and a daemon thread would be
+            # killed if the connection closed before it got going.
+            _handle_launch_recorder(message)
             continue
         if mtype in ("health", "ping"):
             threading.Thread(

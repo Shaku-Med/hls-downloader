@@ -39,6 +39,7 @@ const CTX_MENU_KEYS = [
 // in firefox/manifest.json instead — importScripts is not available there.
 if (typeof importScripts === 'function') {
   try {
+    importScripts('drm-hosts.js');
     importScripts('zip-store.js');
   } catch (e) {
     console.warn('Stuff Grabber: zip-store failed to load', e);
@@ -742,6 +743,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     delete _ytdlpPageCap[tabId];
     detectedStreams[tabId] = [];
     delete recorderFrames[tabId];
+    delete drmTabs[tabId];
     chrome.action.setBadgeText({ text: '', tabId });
     notifyStreamsChanged(tabId);
   }
@@ -777,6 +779,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete _ytdlpPageCap[tabId];
   delete detectedStreams[tabId];
   delete recorderFrames[tabId];
+  delete drmTabs[tabId];
 });
 
 /**
@@ -785,6 +788,27 @@ chrome.tabs.onRemoved.addListener((tabId) => {
  * that frame too, so we talk to it directly by frameId.
  */
 const recorderFrames = {};
+
+/** Tabs whose video is protected: { [tabId]: { reason, keySystem, at } }. */
+const drmTabs = {};
+
+/**
+ * What the panel should say about protection on this tab.
+ *
+ * Prefers what the page reported, since that catches sites not on any list,
+ * and otherwise matches the tab URL. The URL check matters because a content
+ * script only loads with the page: without it, a tab that was already open
+ * when the extension started would show nothing.
+ */
+function drmForTab(tabId, url) {
+  const reported = drmTabs[tabId];
+  if (reported) return reported;
+  const api = typeof self !== 'undefined' ? self.HLS_DRM_HOSTS : null;
+  if (!api || !url) return null;
+  const kind = api.kindFor(url);
+  if (!kind) return null;
+  return { reason: 'known-host', mediaKind: kind, host: api.matchedHost(url), keySystem: '' };
+}
 
 function noteRecorderFrame(tabId, frameId, url) {
   if (tabId == null || tabId < 0 || !frameId) return;
@@ -2335,6 +2359,69 @@ function deleteOutputFileViaNative(outputPath, outputDirectory) {
  * @param {string} filename
  * @returns {Promise<{ ok: boolean, path?: string, error?: string }>}
  */
+/**
+ * Ask the helper to open the screen recorder.
+ *
+ * Protected video cannot be downloaded, so this is the way out: the recorder
+ * captures what is on screen instead. The browser cannot start a program
+ * itself, so the native helper does it.
+ */
+/**
+ * Start the native recorder, pointed at the same save folder as every other
+ * download, so recordings land where the rest of the grabs do rather than in a
+ * second place nobody set.
+ */
+function launchScreenRecorder() {
+  return new Promise(async (resolve) => {
+    const outputDirectory = await getUserDownloadPath();
+    let settled = false;
+    let port;
+    const finish = (out) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        if (port) port.disconnect();
+      } catch (_) {
+        // ignore
+      }
+      resolve(out);
+    };
+    const timer = setTimeout(
+      () => finish({ ok: false, error: 'The helper did not answer in time.' }),
+      15000
+    );
+    try {
+      port = chrome.runtime.connectNative(NATIVE);
+    } catch (e) {
+      finish({
+        ok: false,
+        error: 'The PC helper is not installed, so the recorder cannot be started.',
+      });
+      return;
+    }
+    const requestId = genJobId();
+    port.onMessage.addListener((msg) => {
+      if (msg && msg.type === 'launch_recorder_result' && msg.requestId === requestId) {
+        finish({ ok: msg.success !== false, error: msg.error || null });
+      }
+    });
+    port.onDisconnect.addListener(() => {
+      finish({
+        ok: false,
+        error:
+          chrome.runtime.lastError?.message ||
+          'The PC helper is not installed, so the recorder cannot be started.',
+      });
+    });
+    try {
+      port.postMessage({ type: 'launch_recorder', requestId, outputDirectory });
+    } catch (e) {
+      finish({ ok: false, error: String(e) });
+    }
+  });
+}
+
 function saveBytesViaNative(bytes, filename) {
   return new Promise(async (resolve) => {
     const outDir = await getUserDownloadPath();
@@ -3000,13 +3087,37 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'DRM_DETECTED') {
+    const tabId = sender.tab && sender.tab.id;
+    if (tabId != null && tabId >= 0) {
+      drmTabs[tabId] = {
+        reason: String(message.reason || ''),
+        // "video" means screen recording is the way out; "audio" means it is not.
+        mediaKind: message.mediaKind === 'audio' ? 'audio' : 'video',
+        host: String(message.host || ''),
+        keySystem: String(message.keySystem || ''),
+        at: Date.now(),
+      };
+      notifyStreamsChanged(tabId);
+    }
+    respond(sendResponse, { ok: true });
+    return true;
+  }
+
+  if (message.type === 'LAUNCH_SCREEN_RECORDER') {
+    (async () => {
+      respond(sendResponse, await launchScreenRecorder());
+    })();
+    return true;
+  }
+
   if (message.type === 'GET_STREAMS') {
     const tabIdFromMsg =
       message.tabId != null && message.tabId >= 0 ? message.tabId : null;
     const senderTabId = sender.tab && sender.tab.id >= 0 ? sender.tab.id : null;
     const effectiveTabId = tabIdFromMsg != null ? tabIdFromMsg : senderTabId;
 
-    const finish = (tabId, pageTitle) => {
+    const finish = (tabId, pageTitle, tabUrl) => {
       Promise.all([chrome.storage.session.get(JOBS_KEY), chrome.storage.local.get(USER_PATH_KEY)])
         .then(([sess, local]) => {
           const jobsState = (sess && sess[JOBS_KEY]) || defaultJobsState();
@@ -3019,6 +3130,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             maxParallel: MAX_SLOTS,
             queueLength: pendingQueue.length,
             running: slots.filter((s) => s.jobId).length,
+            drm: drmForTab(tabId, tabUrl),
           });
         })
         .catch((err) => {
@@ -3041,7 +3153,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           finish(effectiveTabId, '');
           return;
         }
-        finish(tab.id, (tab.title || '').trim());
+        finish(tab.id, (tab.title || '').trim(), tab.url || '');
       });
       return true;
     }
@@ -3049,7 +3161,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tid = tabs[0]?.id;
       const pageTitle = (tabs[0]?.title || '').trim();
-      finish(tid, pageTitle);
+      finish(tid, pageTitle, tabs[0]?.url || '');
     });
     return true;
   }

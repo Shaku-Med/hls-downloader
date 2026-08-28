@@ -31,6 +31,7 @@ CHROMIUM_BACKGROUND = {"service_worker": "public/scripts/background.js"}
 # Classic background scripts (not a service worker): list deps explicitly.
 FIREFOX_BACKGROUND = {
     "scripts": [
+        "public/scripts/drm-hosts.js",
         "public/scripts/zip-store.js",
         "public/scripts/social-post-urls.js",
         "public/scripts/background.js",

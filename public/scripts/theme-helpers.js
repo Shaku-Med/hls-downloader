@@ -1239,6 +1239,102 @@
     });
   }
 
+  /**
+   * Card offering the screen recorder on pages whose video is protected.
+   *
+   * Built here rather than in each surface so the popup and the floating panel
+   * cannot drift apart.
+   *
+   * @param {{ reason?: string }} info
+   * @param {{ onLaunched?: () => void }} [opts]
+   * @returns {HTMLElement}
+   */
+  function buildDrmNotice(info, opts) {
+    const onLaunched = (opts && opts.onLaunched) || (() => {});
+    const box = document.createElement('div');
+    box.className = 'drm-notice';
+    // The full explanation is a tooltip rather than a paragraph: this sits above
+    // the stream list on every protected site, so it has to stay out of the way.
+    box.title =
+      'The site scrambles its video so it can only be played, not saved. No '
+      + 'downloader can get around that. Recording the screen still works.';
+
+    const row = document.createElement('div');
+    row.className = 'drm-notice-row';
+    box.appendChild(row);
+
+    const copy = document.createElement('div');
+    copy.className = 'drm-notice-copy';
+    row.appendChild(copy);
+
+    const title = document.createElement('div');
+    title.className = 'drm-notice-title';
+    title.textContent = 'Protected video';
+    copy.appendChild(title);
+
+    const text = document.createElement('div');
+    text.className = 'drm-notice-text';
+    text.textContent = 'It cannot be downloaded, only recorded.';
+    copy.appendChild(text);
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'drm-notice-btn';
+    btn.textContent = 'Record';
+    row.appendChild(btn);
+
+    const status = document.createElement('div');
+    status.className = 'drm-notice-status';
+    status.hidden = true;
+    box.appendChild(status);
+
+    const say = (msg, kind) => {
+      status.hidden = !msg;
+      status.textContent = msg || '';
+      status.className = 'drm-notice-status' + (kind ? ' ' + kind : '');
+    };
+
+    btn.addEventListener('click', () => {
+      btn.disabled = true;
+      btn.textContent = 'Opening';
+      say('', '');
+      let settled = false;
+      const done = (res) => {
+        if (settled) return;
+        settled = true;
+        btn.disabled = false;
+        btn.textContent = 'Record';
+        if (res && res.ok) {
+          say('The recorder is open. Pick an area or the whole screen.', 'ok');
+          onLaunched();
+        } else {
+          say(
+            (res && res.error) ||
+              'Could not start the recorder. Check the PC helper is installed.',
+            'err'
+          );
+        }
+      };
+      // Never leave the button spinning if the helper never answers.
+      const timer = setTimeout(() => done({ ok: false, error: 'The helper did not answer.' }), 20000);
+      try {
+        chrome.runtime.sendMessage({ type: 'LAUNCH_SCREEN_RECORDER' }, (res) => {
+          clearTimeout(timer);
+          if (chrome.runtime.lastError) {
+            done({ ok: false, error: 'Stuff Grabber was reloaded. Refresh the page and try again.' });
+            return;
+          }
+          done(res);
+        });
+      } catch (e) {
+        clearTimeout(timer);
+        done({ ok: false, error: String((e && e.message) || e) });
+      }
+    });
+
+    return box;
+  }
+
   /** @param {(row: object | null | undefined) => void} callback */
   function showYtdlpFormatPicker(title, rows, callback) {
     const choices = [
@@ -1796,6 +1892,7 @@
     showChoicePicker,
     showYtdlpFormatPicker,
     showBatchThumbnailPrompt,
+    buildDrmNotice,
     adoptCssText,
     adoptExtensionCss,
     promoteInlineStyles,

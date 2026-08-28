@@ -322,10 +322,12 @@ Spotify
 
 On Spotify web you can paste or use a track style URL and try an audio extract through yt-dlp. A lot of Spotify sources are protected, so this often fails or falls back to a YouTube search for the same title. That is a site limit, not something the extension can crack.
 
+Tracks are saved as "Artist - Title", read from the track page rather than from the link, so a saved file is not named after the id in the URL. The title and artist are written into the file as tags too, so it does not turn up untitled in a music player. An album or playlist link has no single track to name after, so those still fall back to a name built from the link.
+
 
 Where things can fail
 
-Some sites wrap media in DRM. Netflix and similar services are a good example. The extension might see a manifest, but the segments stay encrypted and neither ffmpeg nor yt-dlp can unlock them. Use the official offline download from that service, or grab something that is not DRM locked.
+Some sites wrap media in DRM. Netflix and similar services are a good example. The extension might see a manifest, but the segments stay encrypted and neither ffmpeg nor yt-dlp can unlock them. Nothing gets around that, so on those pages the popup and the floating panel say the video is protected and offer the screen recorder instead. One button opens it. See Screen recorder below.
 
 Some pages only play inside workers or blob URLs that never show up as a normal request. In those cases the list stays empty. Play the media, wait a second, and open the popup again. If it is still empty, that page may simply not expose anything we can catch.
 
@@ -367,6 +369,39 @@ If that list still shows `(unavailable)` on every row, you installed it into a d
 Saves fail with path or permission errors. Change the Options folder to a place your user can write.
 
 The list is noisy. Pick the page download when you see one, or pick the main playlist style URL and ignore the tiny junk links.
+
+
+Screen recorder
+
+Some video cannot be downloaded no matter what. Sites that scramble their video hand the browser something only the player can unscramble, so there is nothing to save. Recording what is on screen is the way round it, and this repo ships a recorder for exactly that.
+
+The easy way in: open the popup or the floating panel on one of those sites. You get a card saying the video is protected, with a button that opens the recorder. That needs the PC helper installed, since a browser cannot start a program by itself.
+
+You can also open it yourself. On Windows, double click:
+
+```text
+screen_recorder\run.bat
+```
+
+On macOS or Linux:
+
+```text
+sh screen_recorder/run.sh
+```
+
+Or from this folder:
+
+```text
+python -m screen_recorder
+```
+
+A small bar appears at the top of your screen. Drag it anywhere, from any part of it. From there you can record the whole screen or an area you draw, with a border showing exactly what is being captured.
+
+It records the sound coming out of your computer by default, which is the point on a site whose video cannot be downloaded, and there is nothing to install for it on Windows or Linux. The microphone is a separate toggle, and with both on they are mixed into one track. Each has a small level meter on the bar so you can see sound arriving rather than finding out afterwards that the file was silent. On macOS there is no system route to what you are hearing, so that toggle explains that it needs a free loopback driver such as BlackHole first.
+
+The bar stays put and stays clickable while you record, so you can stop without needing a shortcut, and on Windows it is left out of the capture so it never shows up in the video.
+
+It needs Python 3.9 or newer and ffmpeg, the same ffmpeg the downloads already use. On Linux you also need tkinter, packaged separately as python3-tk on Debian and Ubuntu. Opened from the extension, recordings go to the same save folder as your downloads. Opened on its own it uses your Videos folder, and either way you can change it in its settings. Full details are in `screen_recorder/README.md`.
 
 
 Optional icon rebuild
