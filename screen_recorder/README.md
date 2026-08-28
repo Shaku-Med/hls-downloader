@@ -200,6 +200,35 @@ python -m screen_recorder --output-dir "D:\Grabs"
 ```
 
 
+When a recording comes out black
+
+Some players hand their video straight to the graphics card, and a screen
+grabber cannot see into that, so the capture is black where the video should
+be. It is most common on exactly the sites this recorder exists for, because
+protecting the video is the point.
+
+Nothing in this app can reach inside that path, and it deliberately does not
+go changing settings in your browser for you. What it does instead is look at
+the capture a few seconds after recording starts and say so while there is
+still time, rather than letting you film twenty minutes of nothing.
+
+The fix is to make the browser decode in software:
+
+```text
+Chrome or Edge   Settings, then System, then turn off
+                 "Use graphics acceleration when available", then restart it
+Firefox          Settings, General, Performance, untick
+                 "Use recommended performance settings", then untick
+                 "Use hardware acceleration when available", then restart it
+```
+
+Playback uses more processor after that, so it is worth turning back on when
+you are done.
+
+The check judges the brightest pixel in the frame, not the average. A dim scene
+averages close to black, so anything averaged would call every dark film a
+failure.
+
 Notes
 
 The bar stays on screen and stays clickable the whole time you are recording, so

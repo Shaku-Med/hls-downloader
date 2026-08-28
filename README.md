@@ -401,6 +401,8 @@ It records the sound coming out of your computer by default, which is the point 
 
 The bar stays put and stays clickable while you record, so you can stop without needing a shortcut, and on Windows it is left out of the capture so it never shows up in the video.
 
+If a recording comes out black, the site is handing its video straight to the graphics card where screen capture cannot see it. The recorder notices a few seconds in and tells you. Turning off hardware acceleration in the browser and restarting it makes the video decode in software, which records fine.
+
 It needs Python 3.9 or newer and ffmpeg, the same ffmpeg the downloads already use. On Linux you also need tkinter, packaged separately as python3-tk on Debian and Ubuntu. Opened from the extension, recordings go to the same save folder as your downloads. Opened on its own it uses your Videos folder, and either way you can change it in its settings. Full details are in `screen_recorder/README.md`.
 
 

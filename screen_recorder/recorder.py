@@ -76,6 +76,45 @@ def _mic_input_args(settings: Settings) -> List[str]:
     return ["-f", "pulse", "-thread_queue_size", "1024", "-i", settings.mic_device or "default"]
 
 
+# Brightest pixel below this means nothing reached the capture at all. Judged on
+# the brightest pixel rather than the average on purpose: a dim scene averages
+# close to black, so an average would call every dark film a failure.
+BLANK_YMAX = 32
+
+
+def capture_looks_blank(settings: Settings, region: Optional[Region]) -> Optional[bool]:
+    """
+    Grab one frame the way the recording does and see if anything is on it.
+
+    Protected video is handed straight to the graphics card, and the screen
+    grabber cannot see into that, so the recording comes out black. Nothing can
+    be done about it from here, but finding out while there is still time to fix
+    it beats finding out on playback. None means the check could not run.
+    """
+    ffmpeg = platforms.ffmpeg_path()
+    if not ffmpeg:
+        return None
+    cmd = [ffmpeg, "-hide_banner", "-y"]
+    cmd += _video_input_args(settings, region)
+    cmd += ["-frames:v", "1", "-vf", "signalstats,metadata=print", "-f", "null", "-"]
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15,
+            stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            if platforms.os_family() == WINDOWS else 0,
+        )
+    except Exception:
+        return None
+    for line in (p.stderr or "").splitlines():
+        if "signalstats.YMAX" in line:
+            try:
+                return float(line.split("=")[1]) <= BLANK_YMAX
+            except (ValueError, IndexError):
+                return None
+    return None
+
+
 def _region_pad_filter(region: Optional[Region]) -> str:
     """
     Put an area recording back where it was on a full screen canvas.

@@ -14,12 +14,13 @@ the video.
 from __future__ import annotations
 
 import sys
+import threading
 import tkinter as tk
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from .. import audio, display, platforms, settings as settings_mod
-from ..recorder import Recorder, Region
+from ..recorder import Recorder, Region, capture_looks_blank
 from ..settings import Settings
 from . import icons
 from .overlay import CaptureOutline, CountdownOverlay
@@ -75,6 +76,7 @@ class RecorderBar(tk.Tk):
         self._meter_job: Optional[str] = None
         self._settings_win: Optional[tk.Toplevel] = None
         self._selector: Optional[RegionSelector] = None
+        self._blank_answer: Optional[bool] = None
         self._system_ok, self._system_why = audio.supported()
 
         self.title("Screen recorder")
@@ -400,6 +402,50 @@ class RecorderBar(tk.Tk):
         if note:
             self._toast(note)
         self._tick()
+        # Check a few seconds in, once whatever is being recorded has had time
+        # to draw, rather than letting someone film twenty minutes of black.
+        self.after(4000, self._check_not_blank)
+
+    def _check_not_blank(self) -> None:
+        """
+        Warn if the capture is coming through empty.
+
+        The probe runs ffmpeg, so it goes on a thread to keep the bar
+        responsive. The answer is picked up by polling from here rather than
+        handed back with after(): tkinter calls are not thread safe, and
+        scheduling one from the worker raises "main thread is not in main loop"
+        where nobody sees it, leaving the warning silently dead.
+        """
+        if not self.recorder.is_recording:
+            return
+        region = self.region if self.settings.source == "region" else None
+        settings = self.settings
+        self._blank_answer: Optional[bool] = None
+
+        def probe() -> None:
+            self._blank_answer = capture_looks_blank(settings, region)
+
+        threading.Thread(target=probe, name="blank-check", daemon=True).start()
+        self.after(300, self._collect_blank, 40)
+
+    def _collect_blank(self, tries_left: int) -> None:
+        if not self.recorder.is_recording:
+            return
+        if self._blank_answer is None and tries_left > 0:
+            self.after(300, self._collect_blank, tries_left - 1)
+            return
+        if self._blank_answer:
+            self._warn_blank()
+
+    def _warn_blank(self) -> None:
+        if not self.recorder.is_recording:
+            return
+        self._toast(
+            "Nothing is reaching the recording, so this will come out black. "
+            "Sites that protect their video hand it straight to the graphics "
+            "card, where screen recording cannot see it. Turn off hardware "
+            "acceleration in the browser, restart it, then record again."
+        )
 
     def _stop(self) -> None:
         if self._tick_job:
