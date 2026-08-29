@@ -488,7 +488,9 @@ function addMusicTrackEntry(tabId, message) {
   const row = {
     url: pageUrl,
     cleanedUrl: pageUrl,
-    streamKind: 'music',
+    // Must be a kind the download path treats as yt-dlp. A kind of its own
+    // would have been fetched as a plain file, which for a page URL is junk.
+    streamKind: 'social',
     pageDownload: true,
     urlSource: 'tab',
     // Handed to the helper so it searches for this exact track instead of
@@ -500,7 +502,7 @@ function addMusicTrackEntry(tabId, message) {
     capturedHeaders: {},
   };
 
-  const at = list.findIndex((e) => e && e.streamKind === 'music');
+  const at = list.findIndex((e) => e && e.trackTitle);
   if (at >= 0) {
     if (list[at].trackName === label) return;
     list[at] = row;
@@ -540,7 +542,12 @@ function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
         // Drop raw HLS/DASH rows on Apple Music — only the song page URL is usable with yt-dlp.
         const rest = isAppleMusicPage(pageUrl)
           ? []
-          : list.filter((e) => e.streamKind !== 'social' && e.streamKind !== 'yt');
+          : list.filter(
+              (e) =>
+                // Keep the reported track: it is a social row too, but it is
+                // the only thing naming an actual song on these pages.
+                e.trackTitle || (e.streamKind !== 'social' && e.streamKind !== 'yt')
+            );
 
         if (!targets.length) {
           // Nothing usable (e.g. facebook.com/ with no post links found yet).
