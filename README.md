@@ -322,6 +322,8 @@ Spotify
 
 On Spotify web you can paste or use a track style URL and try an audio extract through yt-dlp. A lot of Spotify sources are protected, so this often fails or falls back to a YouTube search for the same title. That is a site limit, not something the extension can crack.
 
+The same applies to Amazon Music, Tidal, Deezer, Apple Music, Pandora, Qobuz, Anghami, Napster and Boomplay. None of them has a working yt-dlp extractor, checked rather than assumed, so the direct attempt fails and a matching recording is searched for instead. Candidates are ranked on length, title overlap and channel before one is picked, so you do not end up with a live take or a cover. SoundCloud and Bandcamp are deliberately left out of that, because yt-dlp downloads them properly and swapping in a lookalike would be worse.
+
 Tracks are saved as "Artist - Title", read from the track page rather than from the link, so a saved file is not named after the id in the URL. The title and artist are written into the file as tags too, so it does not turn up untitled in a music player. An album or playlist link has no single track to name after, so those still fall back to a name built from the link.
 
 

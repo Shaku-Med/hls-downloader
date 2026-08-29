@@ -59,15 +59,31 @@
   ];
 
   /** Protected audio. Recording the screen does not help here. */
+  /**
+   * Protected audio. Keep this in step with the music services the helper
+   * falls back for, in _MUSIC_FALLBACK_RULES, so a site does not show the
+   * notice here and then behave differently when the download runs.
+   */
   const AUDIO = [
     'open.spotify.com',
     'spotify.com',
     'music.apple.com',
+    'itunes.apple.com',
     'music.amazon.com',
     'tidal.com',
+    'listen.tidal.com',
     'deezer.com',
+    // Audible is protected too, but it is audiobooks: the helper has no
+    // search fallback for it, since there is no matching track to find.
     'audible.com',
     'music.youtube.com',
+    'pandora.com',
+    'napster.com',
+    'qobuz.com',
+    'open.qobuz.com',
+    'anghami.com',
+    'play.anghami.com',
+    'boomplay.com',
   ];
 
   function hostOf(urlOrHost) {

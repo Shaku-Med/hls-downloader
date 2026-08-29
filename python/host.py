@@ -1031,6 +1031,16 @@ _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
     ("Bandcamp", ("bandcamp.com",)),
     # Audiomack is deliberately absent: yt-dlp's extractor 404s on their
     # metadata API, and the page serves plain audio we can capture instead.
+    # Music services with no working yt-dlp extractor. They are routed here so
+    # the attempt runs and fails fast, and the YouTube fallback then picks up.
+    ("Amazon Music", ("music.amazon.com",)),
+    ("Tidal", ("tidal.com", "listen.tidal.com")),
+    ("Deezer", ("deezer.com",)),
+    ("Pandora", ("pandora.com",)),
+    ("Napster", ("napster.com",)),
+    ("Qobuz", ("qobuz.com", "open.qobuz.com")),
+    ("Anghami", ("anghami.com", "play.anghami.com")),
+    ("Boomplay", ("boomplay.com",)),
     ("Crunchyroll", ("crunchyroll.com", "vrv.co")),
     ("Rumble", ("rumble.com",)),
     ("Kick", ("kick.com",)),
@@ -1153,6 +1163,9 @@ def _wants_yt_dlp_audio_extract(message: dict, target_url: str = "") -> bool:
     if _is_spotify_url(target_url) or _is_spotify_url(page_url):
         return True
     if _is_apple_music_drm_context(target_url, page_url):
+        return True
+    # Every music service we fall back for wants audio, never a video stream.
+    if _music_fallback_service(target_url, page_url):
         return True
     # Audio only sites: asking for video gives nothing useful.
     if _is_audio_only_site(target_url) or _is_audio_only_site(page_url):
@@ -1466,6 +1479,171 @@ def _spotify_youtube_target(spotify_url: str) -> Optional[str]:
     artists = meta["artists"]
     duration = meta["duration"]
     query = " ".join(filter(None, [", ".join(artists[:2]), title])).strip() or title
+
+    cands = _yt_search_candidates(query, limit=8)
+    if not cands:
+        return None
+    best = max(cands, key=lambda c: _score_music_candidate(c, title, artists, duration))
+    if _score_music_candidate(best, title, artists, duration) < 10:
+        return None
+    return "https://www.youtube.com/watch?v=" + best["id"]
+
+
+# Music services whose tracks cannot be pulled down directly, so a matching
+# recording is looked for instead. Checked against yt-dlp --list-extractors
+# rather than assumed: none of these has a working track extractor, so the
+# first attempt fails with "unsupported url" and the search takes over. Left
+# out on purpose are the ones yt-dlp does handle, SoundCloud, Bandcamp and
+# jiosaavn, which download properly and must not be diverted.
+_MUSIC_FALLBACK_RULES = [
+    ("Spotify", ("spotify.com", "open.spotify.com")),
+    ("Apple Music", ("music.apple.com", "itunes.apple.com")),
+    ("Amazon Music", ("music.amazon.com",)),
+    ("Tidal", ("tidal.com", "listen.tidal.com")),
+    ("Deezer", ("deezer.com",)),
+    ("Pandora", ("pandora.com",)),
+    ("Napster", ("napster.com",)),
+    ("Qobuz", ("qobuz.com", "open.qobuz.com")),
+    ("Anghami", ("anghami.com", "play.anghami.com")),
+    ("Boomplay", ("boomplay.com",)),
+    ("YouTube Music", ("music.youtube.com",)),
+]
+
+# Amazon Music runs on a domain per country, so the prefix is matched instead
+# of listing every one of them.
+_AMAZON_MUSIC_PREFIX = "music.amazon."
+
+
+def _music_fallback_service(stream_url: str, page_url: str = "") -> str:
+    """The music service this belongs to, if it is one that needs a fallback."""
+    for candidate in (page_url, stream_url):
+        host = _netloc_host(candidate)
+        if not host:
+            continue
+        if host.startswith(_AMAZON_MUSIC_PREFIX):
+            return "Amazon Music"
+        for label, domains in _MUSIC_FALLBACK_RULES:
+            if _host_matches_any(host, domains):
+                return label
+    return ""
+
+
+_MUSIC_SITE_TAIL = re.compile(
+    r"\s*(?:[|·–—-]\s*)?(?:on\s+|from\s+)?"
+    r"(?:amazon\s+music|amazon\.com|apple\s+music|itunes|youtube\s+music|tidal|"
+    r"deezer|spotify|napster|pandora|qobuz|anghami|boomplay|listen\s+now|"
+    r"stream\s+now|music\s+streaming)\s*$",
+    re.I,
+)
+
+
+def _clean_music_page_title(raw: str) -> str:
+    """Strip the service's own name off the end of a page title."""
+    text = re.sub(r"[​-‏‪-‮﻿]", "", raw or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    for _ in range(3):
+        trimmed = _MUSIC_SITE_TAIL.sub("", text).strip(" |·–—-")
+        if trimmed == text:
+            break
+        text = trimmed
+    return text
+
+
+def _split_title_and_artists(text: str) -> Tuple[str, List[str]]:
+    """
+    Pull the artist out of "Song by Artist", which most of these sites use.
+
+    A plain "A - B" is left alone: some services put the song first and others
+    the artist, and guessing wrong sends the search after the wrong thing.
+    """
+    m = re.match(r"^(.*?)[,\s]+(?:a\s+)?(?:song\s+)?by\s+(.+)$", text or "", re.I)
+    if not m:
+        return (text or "").strip(), []
+    title = m.group(1).strip(" ,-")
+    artists = [a.strip() for a in re.split(r",|&|\band\b|\bfeat\.?\b", m.group(2)) if a.strip()]
+    return title or (text or "").strip(), artists[:3]
+
+
+def _music_slug_from_url(url: str) -> str:
+    """Last resort: the readable slug some of these put in the path."""
+    try:
+        parts = [p for p in (urlparse(url or "").path or "").split("/") if p]
+    except Exception:
+        return ""
+    for i, part in enumerate(parts):
+        if part.lower() in ("track", "song", "tracks", "songs", "album", "albums"):
+            if i + 1 < len(parts):
+                slug = re.sub(r"[-_]+", " ", parts[i + 1]).strip()
+                if len(slug) >= 3 and not _looks_like_identifier(slug):
+                    return slug
+    return ""
+
+
+def _looks_like_identifier(slug: str) -> bool:
+    """
+    Is this an id rather than something readable?
+
+    A real slug turns into words once the dashes are spaces. An id stays one
+    run of characters, and usually carries digits: Amazon uses things like
+    B08L5T7L1F and Tidal uses plain numbers. Searching for either finds
+    nothing, and saving a file under one is no better than the placeholder we
+    just stopped using.
+    """
+    s = (slug or "").strip()
+    if not s or " " in s:
+        return False
+    return bool(re.search(r"\d", s)) or len(s) > 15
+
+
+def _music_track_meta(
+    stream_url: str, page_url: str, message: Optional[dict] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Track name, artists and length, from whatever the service gives us.
+
+    Spotify publishes a real metadata page, which is worth using because it
+    carries the duration and duration is the strongest signal when picking the
+    matching recording. Everywhere else falls back to the page title, then to
+    the slug in the link, with no duration.
+    """
+    for candidate in (page_url, stream_url):
+        if _is_spotify_url(candidate or ""):
+            meta = _spotify_track_meta(candidate)
+            if meta:
+                return meta
+
+    for key in ("pageTitle", "title", "filename"):
+        raw = (message.get(key) or "").strip() if message else ""
+        if not raw or _looks_generic_stem(raw):
+            continue
+        cleaned = _clean_music_page_title(raw)
+        if len(cleaned) < 3:
+            continue
+        title, artists = _split_title_and_artists(cleaned)
+        return {"title": title, "artists": artists, "duration": 0.0}
+
+    slug = _music_slug_from_url(page_url) or _music_slug_from_url(stream_url)
+    if slug:
+        return {"title": slug, "artists": [], "duration": 0.0}
+    return None
+
+
+def _music_youtube_target(meta: Optional[Dict[str, Any]]) -> Optional[str]:
+    """
+    Rank several search results and take the best, rather than the first hit.
+
+    Searching a bare title and grabbing result one gave live takes, covers and
+    outright wrong songs, so candidates are scored on length, title overlap and
+    channel before one is committed to.
+    """
+    if not meta:
+        return None
+    title = str(meta.get("title") or "").strip()
+    if not title:
+        return None
+    artists = [a for a in (meta.get("artists") or []) if a]
+    duration = float(meta.get("duration") or 0)
+    query = " ".join(filter(None, [", ".join(artists[:2]), title])).strip()
 
     cands = _yt_search_candidates(query, limit=8)
     if not cands:
@@ -2217,14 +2395,18 @@ def run_yt_dlp_with_updates(
     apple_flow = plat in ("apple music", "apple") or _is_apple_music_drm_context(
         stream_url, page_url
     )
-    audio_flow = spotify_flow or apple_flow or bool(run_message.get("ytDlpAudioOnly"))
+    # Every one of these behaves the same way: the direct pull fails, then a
+    # matching recording is searched for. Spotify was the only one wired up.
+    music_service = _music_fallback_service(stream_url, page_url)
+    audio_flow = (
+        spotify_flow or apple_flow or bool(music_service)
+        or bool(run_message.get("ytDlpAudioOnly"))
+    )
     if audio_flow:
         run_message["ytDlpAudioOnly"] = True
     start_detail = f"yt-dlp - {platform_label}"
-    if spotify_flow:
-        start_detail = "Attempting Spotify extraction…"
-    elif apple_flow:
-        start_detail = "Attempting Apple Music via yt-dlp…"
+    if music_service:
+        start_detail = f"Attempting {music_service} extraction"
     send_message(
         with_job_id(
             {
@@ -2277,44 +2459,38 @@ def run_yt_dlp_with_updates(
             code, err_lines = run_one(stream_url)
         tail = "".join(err_lines[-35:]).strip()
 
-    if code != 0 and spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
-        spotify_page = primary if _is_spotify_url(primary) else stream_url
+    if code != 0 and music_service:
+        # The direct pull failed, which for these services is the normal case
+        # rather than the exception, so go and find the same track elsewhere.
         send_message(
             with_job_id(
                 {
                     "type": "progress",
                     "phase": "downloading",
-                    "detail": "Spotify blocked; finding the matching track…",
+                    "detail": f"{music_service} blocked, finding the matching track",
                     "output": output_path,
                 },
                 job_id,
             )
         )
-        # Rank several results on duration, title and channel rather than
-        # trusting whatever the first search hit happens to be.
-        picked = _spotify_youtube_target(spotify_page)
+        meta = _music_track_meta(stream_url, page_url or primary, run_message)
+        picked = _music_youtube_target(meta)
         if picked:
             code, err_lines = run_one(picked)
         else:
-            q = _spotify_oembed_query(primary) or _spotify_oembed_query(stream_url)
+            # Nothing good enough to rank, so fall back to a plain search on
+            # whatever text the page gave us.
+            q = None
+            if spotify_flow:
+                q = _spotify_oembed_query(primary) or _spotify_oembed_query(stream_url)
+            if not q:
+                q = _apple_music_youtube_query(run_message, page_url, stream_url)
+            if not q and meta and meta.get("title"):
+                q = " ".join(
+                    filter(None, [", ".join((meta.get("artists") or [])[:2]), meta["title"]])
+                ).strip()
             if q:
                 code, err_lines = run_one("ytsearch1:" + q)
-
-    if code != 0 and apple_flow:
-        q = _apple_music_youtube_query(run_message, page_url, stream_url)
-        if q:
-            send_message(
-                with_job_id(
-                    {
-                        "type": "progress",
-                        "phase": "downloading",
-                        "detail": "Apple Music blocked; searching YouTube fallback…",
-                        "output": output_path,
-                    },
-                    job_id,
-                )
-            )
-            code, err_lines = run_one("ytsearch1:" + q)
 
     _remove_temp_file_quietly(cookie_file)
 
@@ -2381,19 +2557,15 @@ def run_yt_dlp_with_updates(
             "cookie file open so they could not be read. Close the browser fully and "
             "run the download again, or sign in to the site in a different browser."
         )
-    if spotify_flow and _looks_like_spotify_drm_or_unsupported(tail):
-        err = (
-            "Spotify source protected (DRM/unsupported). "
-            "Direct full-audio extraction is blocked for many Spotify URLs. "
-            f"Details: {tail[-420:]}" if tail else
-            "Spotify source protected (DRM/unsupported). Direct full-audio extraction is blocked."
+    if music_service:
+        # The direct pull and the search both failed, so say which service and
+        # what to do rather than leaving a raw yt-dlp error.
+        base = (
+            f"{music_service} protects this track, and no matching recording "
+            "was found to use instead. Playing it and recording the sound is "
+            "the remaining option."
         )
-    if apple_flow and _looks_like_spotify_drm_or_unsupported(tail):
-        err = (
-            "Apple Music page extraction failed (often FairPlay DRM). "
-            f"Details: {tail[-420:]}" if tail else
-            "Apple Music page extraction failed (often FairPlay DRM)."
-        )
+        err = f"{base} Details: {tail[-420:]}" if tail else base
     if emit_done_on_failure:
         send_message(with_job_id({"type": "done", "success": False, "error": err}, job_id))
     return False, err
@@ -5009,15 +5181,14 @@ def run_ffmpeg_with_updates(url, filename, message):
     # Sites whose media has to be found somewhere else arrive with nothing
     # useful to name the file after, so the real track name is looked up here
     # rather than saving something only a database could read.
-    if _looks_generic_stem(filename):
+    if _looks_generic_stem(filename) and _music_fallback_service(url, page_for_social):
         if _is_spotify_url(url) or _is_spotify_url(page_for_social):
             effective_filename = _spotify_filename_hint(url, page_for_social, filename)
-        elif _is_apple_music_drm_context(url, page_for_social) or "music.apple.com" in (
-            (page_for_social or "") + (url or "")
-        ).lower():
-            apple = _apple_music_youtube_query(message, page_for_social, url)
-            if apple:
-                effective_filename = apple
+        else:
+            meta = _music_track_meta(url, page_for_social, message)
+            stem = _music_stem(meta.get("title"), meta.get("artists")) if meta else ""
+            if stem:
+                effective_filename = stem
     if _looks_like_vtt_url(url):
         _download_vtt_immediate(url, message, out_dir, effective_filename, job_id)
         if _CURRENT_JOB_ID == job_id:

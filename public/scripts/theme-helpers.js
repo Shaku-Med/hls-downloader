@@ -1255,9 +1255,14 @@
     box.className = 'drm-notice';
     // The full explanation is a tooltip rather than a paragraph: this sits above
     // the stream list on every protected site, so it has to stay out of the way.
-    box.title =
-      'The site scrambles its video so it can only be played, not saved. No '
-      + 'downloader can get around that. Recording the screen still works.';
+    // Music services are protected the same way, so this says content rather
+    // than video: the card shows up on Spotify and the like too.
+    const isAudio = !!(info && info.mediaKind === 'audio');
+    box.title = isAudio
+      ? 'The site scrambles this track so it can only be played, not saved. No '
+        + 'downloader can get around that. Recording it as it plays still works.'
+      : 'The site scrambles its video so it can only be played, not saved. No '
+        + 'downloader can get around that. Recording the screen still works.';
 
     const row = document.createElement('div');
     row.className = 'drm-notice-row';
@@ -1269,12 +1274,14 @@
 
     const title = document.createElement('div');
     title.className = 'drm-notice-title';
-    title.textContent = 'Protected video';
+    title.textContent = 'Protected content';
     copy.appendChild(title);
 
     const text = document.createElement('div');
     text.className = 'drm-notice-text';
-    text.textContent = 'It cannot be downloaded, only recorded.';
+    text.textContent = isAudio
+      ? 'This track cannot be downloaded, only recorded.'
+      : 'It cannot be downloaded, only recorded.';
     copy.appendChild(text);
 
     const btn = document.createElement('button');
