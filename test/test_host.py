@@ -214,5 +214,47 @@ class MusicTitleParsing(unittest.TestCase):
             self.assertFalse(host._looks_like_identifier(slug), slug)
 
 
+class ReportedTrackWins(unittest.TestCase):
+    """
+    What the page says is playing beats anything derived from the page title.
+
+    On an album page the title is the album, so without this a whole album
+    resolves to one wrong file.
+    """
+
+    ALBUM = "https://music.amazon.com/albums/B0FD256Q8D"
+    ALBUM_TITLE = "Play Some Album by Various Artists on Amazon Music"
+
+    def test_reported_track_is_preferred(self):
+        meta = host._music_track_meta(
+            self.ALBUM, self.ALBUM,
+            {"pageTitle": self.ALBUM_TITLE,
+             "trackTitle": "What It Sounds Like",
+             "trackArtist": "HUNTR/X, EJAE"},
+        )
+        self.assertEqual(meta["title"], "What It Sounds Like")
+        self.assertEqual(meta["artists"], ["HUNTR/X", "EJAE"])
+
+    def test_duration_is_carried_for_ranking(self):
+        meta = host._music_track_meta(
+            self.ALBUM, self.ALBUM,
+            {"trackTitle": "X", "trackArtist": "Y", "trackDuration": 250},
+        )
+        self.assertEqual(meta["duration"], 250.0)
+
+    def test_a_bad_duration_does_not_break_it(self):
+        meta = host._music_track_meta(
+            self.ALBUM, self.ALBUM,
+            {"trackTitle": "X", "trackDuration": "not a number"},
+        )
+        self.assertEqual(meta["duration"], 0.0)
+
+    def test_falls_back_to_the_page_title_without_a_track(self):
+        meta = host._music_track_meta(
+            self.ALBUM, self.ALBUM, {"pageTitle": self.ALBUM_TITLE}
+        )
+        self.assertEqual(meta["title"], "Play Some Album")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

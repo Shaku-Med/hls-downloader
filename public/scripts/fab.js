@@ -1954,7 +1954,9 @@
         urlSource === 'link' && cleanedUrl
           ? cleanedUrl
           : stream.url || '';
-      const defaultName = defaultFileName(i, n, pageTitle, url);
+      // A music row already knows its track, so do not fall back to the
+    // page title, which on an album page is the album.
+    const defaultName = stream.trackName || defaultFileName(i, n, pageTitle, url);
       const isAppleMusicPage = /music\.apple\.com/i.test(String(url || ''));
       const isLinkCard = pageOnly && urlSource === 'link';
 
@@ -2129,6 +2131,14 @@
           if (pageOnly && /music\.apple\.com/i.test(effUrl || '')) {
             payload.ytDlpAudioOnly = true;
             payload.streamKind = 'social';
+          }
+          if (stream.trackTitle) {
+            // Hand the helper the exact track, so it searches for this
+            // rather than working it out from the album page title.
+            payload.trackTitle = stream.trackTitle;
+            if (stream.trackArtist) payload.trackArtist = stream.trackArtist;
+            if (stream.trackDuration) payload.trackDuration = stream.trackDuration;
+            payload.ytDlpAudioOnly = true;
           }
 
           const probePayload = {

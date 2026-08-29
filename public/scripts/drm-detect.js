@@ -64,7 +64,62 @@
     }
   }
 
+  /**
+   * Watch what the page says is playing, on music services only.
+   *
+   * Their audio requests do not look like media to the traffic watcher, so an
+   * album page offered nothing at all to download. The browser already knows
+   * the track, because that is what fills the media keys on the keyboard, and
+   * every one of these services fills it in. Reading it gives a real title and
+   * artist to search for instead of guessing from the page title, which on an
+   * album page is the album.
+   */
+  function trackWatcherSource() {
+    return `(function () {
+      if (window.__sgTrackWatch) return;
+      window.__sgTrackWatch = true;
+      var last = '';
+      function look() {
+        try {
+          var ms = navigator.mediaSession;
+          var m = ms && ms.metadata;
+          if (!m || !m.title) return;
+          var key = (m.artist || '') + '|' + m.title;
+          if (key === last) return;
+          // The media element knows how long the track is, and length is what
+          // separates the real recording from a cover or a live take.
+          var el = document.querySelector('video, audio');
+          var dur = el && isFinite(el.duration) && el.duration > 0
+            ? Math.round(el.duration) : 0;
+          last = key;
+          window.postMessage({
+            __sgTrack: true,
+            title: String(m.title || ''),
+            artist: String(m.artist || ''),
+            album: String(m.album || ''),
+            duration: dur
+          }, '*');
+        } catch (e) {}
+      }
+      look();
+      setInterval(look, 1500);
+    })();`;
+  }
+
   /** Patch the page's own EME entry point and post back when it is used. */
+  function inject(source) {
+    try {
+      const el = document.createElement('script');
+      el.textContent = source;
+      (document.head || document.documentElement).appendChild(el);
+      el.remove();
+      return true;
+    } catch (_) {
+      // Trusted Types or a strict CSP refused the injection.
+      return false;
+    }
+  }
+
   function installPageHook() {
     const source = `(function () {
       if (navigator.__sgDrmHooked) return;
@@ -78,16 +133,7 @@
         return orig.apply(this, arguments);
       };
     })();`;
-    try {
-      const el = document.createElement('script');
-      el.textContent = source;
-      (document.head || document.documentElement).appendChild(el);
-      el.remove();
-      return true;
-    } catch (_) {
-      // Trusted Types or a strict CSP refused the injection.
-      return false;
-    }
+    return inject(source);
   }
 
   window.addEventListener(
@@ -96,11 +142,39 @@
       if (ev.source !== window) return;
       const d = ev.data;
       if (d && d.__sgDrm) report('eme', d.keySystem);
+      if (d && d.__sgTrack) reportTrack(d);
     },
     false
   );
 
   installPageHook();
+  // Only on the music services, where nothing else surfaces a track.
+  if (mediaKindForHost() === 'audio') inject(trackWatcherSource());
+
+  let lastTrack = '';
+  function reportTrack(d) {
+    const title = String((d && d.title) || '').trim();
+    if (!title || !extAlive()) return;
+    const artist = String((d && d.artist) || '').trim();
+    const key = artist + '|' + title;
+    if (key === lastTrack) return;
+    lastTrack = key;
+    try {
+      chrome.runtime.sendMessage(
+        {
+          type: 'MUSIC_TRACK',
+          title,
+          artist,
+          album: String((d && d.album) || '').trim(),
+          duration: Number((d && d.duration) || 0) || 0,
+          pageUrl: String(location.href || '').slice(0, 500),
+        },
+        () => void chrome.runtime.lastError
+      );
+    } catch (_) {
+      // Extension reloaded; nothing to do.
+    }
+  }
 
   // Known sites are reported straight away, so the panel is right before the
   // user ever presses play.

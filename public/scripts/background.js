@@ -464,6 +464,53 @@ async function collectYtdlpTargetUrls(tabId, pageUrl) {
  * Social + YouTube CDNs: yt-dlp uses post/page URLs (not raw CDN blobs).
  * Prefer concrete post links from the DOM when the tab is a feed/home root.
  */
+/**
+ * List the track a music service says it is playing.
+ *
+ * These sites stream their audio in a shape the traffic watcher does not
+ * recognise as media, so an album page offered nothing at all. The page itself
+ * tells the browser what is playing, which gives a real title and artist to
+ * search for, rather than the album name sitting in the page title.
+ *
+ * One row per track, replaced as the track changes, so a listening session does
+ * not pile up a list of everything that has played.
+ */
+function addMusicTrackEntry(tabId, message) {
+  const title = String((message && message.title) || '').trim();
+  if (!title) return;
+  const artist = String((message && message.artist) || '').trim();
+  const pageUrl = String((message && message.pageUrl) || '').trim();
+  if (!/^https?:/i.test(pageUrl)) return;
+
+  const label = artist ? `${artist} - ${title}` : title;
+  if (!detectedStreams[tabId]) detectedStreams[tabId] = [];
+  const list = detectedStreams[tabId];
+  const row = {
+    url: pageUrl,
+    cleanedUrl: pageUrl,
+    streamKind: 'music',
+    pageDownload: true,
+    urlSource: 'tab',
+    // Handed to the helper so it searches for this exact track instead of
+    // working it out again from the page title.
+    trackTitle: title,
+    trackArtist: artist,
+    trackDuration: Number((message && message.duration) || 0) || 0,
+    trackName: label,
+    capturedHeaders: {},
+  };
+
+  const at = list.findIndex((e) => e && e.streamKind === 'music');
+  if (at >= 0) {
+    if (list[at].trackName === label) return;
+    list[at] = row;
+  } else {
+    list.unshift(row);
+  }
+  detectedStreams[tabId] = list;
+  notifyStreamsChanged(tabId);
+}
+
 function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
   if (!tabId || tabId < 0) return;
   _ytdlpPageCap[tabId] = { ...(_ytdlpPageCap[tabId] || {}), ...(capturedHeaders || {}) };
@@ -3084,6 +3131,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         respond(sendResponse, { ok: false, error: String(e) });
       }
     })();
+    return true;
+  }
+
+  if (message.type === 'MUSIC_TRACK') {
+    const tabId = sender.tab && sender.tab.id;
+    if (tabId != null && tabId >= 0) {
+      addMusicTrackEntry(tabId, message);
+    }
+    respond(sendResponse, { ok: true });
     return true;
   }
 

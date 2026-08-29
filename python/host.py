@@ -1606,6 +1606,20 @@ def _music_track_meta(
     matching recording. Everywhere else falls back to the page title, then to
     the slug in the link, with no duration.
     """
+    # The extension reports what the page says is playing, which beats every
+    # guess below: on an album page the page title is the album, not the track.
+    explicit = str((message or {}).get("trackTitle") or "").strip()
+    if explicit:
+        artist = str((message or {}).get("trackArtist") or "").strip()
+        artists = [a.strip() for a in re.split(r",|&|\bfeat\.?\b", artist) if a.strip()]
+        # The player also knows how long the track is, and length is the
+        # strongest signal for telling the real recording from a cover.
+        try:
+            length = float((message or {}).get("trackDuration") or 0)
+        except (TypeError, ValueError):
+            length = 0.0
+        return {"title": explicit, "artists": artists[:3], "duration": max(0.0, length)}
+
     for candidate in (page_url, stream_url):
         if _is_spotify_url(candidate or ""):
             meta = _spotify_track_meta(candidate)
