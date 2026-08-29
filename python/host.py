@@ -1282,6 +1282,28 @@ def _looks_like_spotify_drm_or_unsupported(err_tail: str) -> bool:
     return any(n in t for n in needles)
 
 
+def _looks_like_youtube_blocked(err_tail: str) -> bool:
+    """
+    YouTube handed back nothing usable this time.
+
+    It turns the player away intermittently and the extraction then degrades to
+    the storyboard images only, so the download dies on a missing format even
+    though the right video was found. A second try with different player
+    clients usually gets through.
+    """
+    t = (err_tail or "").lower()
+    if "youtube" not in t and "requested format is not available" not in t:
+        return False
+    return (
+        "requested format is not available" in t
+        or "only images are available" in t
+        or "http error 401" in t
+        or "http error 403" in t
+        or "sign in to confirm" in t
+        or "unable to download api page" in t
+    )
+
+
 def _looks_like_cookie_db_locked(err_tail: str) -> bool:
     """Windows holds the cookie DB open while the browser runs, so yt-dlp cannot copy it."""
     t = (err_tail or "").lower()
@@ -2013,19 +2035,39 @@ def _parse_yt_dlp_progress(line: str) -> Dict[str, Any]:
     return out
 
 
-def _yt_dlp_header_args(message: dict) -> List[str]:
-    """Extra yt-dlp CLI args: --add-header for Referer, UA, Authorization."""
+def _yt_dlp_header_args(message: dict, target_url: str = "") -> List[str]:
+    """
+    Extra yt-dlp CLI args: --add-header for Referer, UA, Authorization.
+
+    Referer and Authorization belong to the page they were taken from, so they
+    are dropped once the download goes somewhere else. That happens on every
+    search fallback: the track came from Apple Music or Spotify, the download
+    goes to YouTube, and handing Google another site's referer and auth header
+    is both wrong and a good way to be turned away. Cookies were already held
+    back this way; these were not.
+    """
     referer = (message.get("pageUrl") or message.get("referer") or "").strip()
     ua = (message.get("userAgent") or "").strip() or USER_AGENT
     cap = _cap_headers(message.get("capturedHeaders"))
     if not referer and cap.get("referer"):
         referer = cap["referer"].strip()
+
+    same_site = True
+    if target_url and referer:
+        target_host = _netloc_host(target_url)
+        referer_host = _netloc_host(referer)
+        same_site = bool(target_host) and bool(referer_host) and (
+            target_host == referer_host
+            or target_host.endswith("." + referer_host)
+            or referer_host.endswith("." + target_host)
+        )
+
     args: List[str] = []
-    if referer:
+    if referer and same_site:
         args.extend(["--add-header", f"Referer:{referer}"])
     args.extend(["--add-header", f"User-Agent:{ua}"])
     auth = cap.get("authorization") or (message.get("authorization") or "").strip()
-    if auth:
+    if auth and same_site:
         args.extend(["--add-header", f"Authorization:{auth}"])
     return args
 
@@ -2169,7 +2211,7 @@ def _yt_dlp_build_cmd(prefix: List[str], message: dict, output_path: str, target
         cmd.extend(["--write-thumbnail", "--convert-thumbnails", "jpg"])
     cmd.extend(_yt_dlp_youtube_cli_extras(message, target_url))
     cmd.extend(_yt_dlp_cookies_args(message, target_url))
-    cmd.extend(_yt_dlp_header_args(message))
+    cmd.extend(_yt_dlp_header_args(message, target_url))
     cmd.append(target_url)
     return cmd
 
@@ -2255,7 +2297,7 @@ def _handle_ytdlp_formats(message: dict) -> None:
     ]
     cmd.extend(_yt_dlp_youtube_cli_extras(message, target))
     cmd.extend(_yt_dlp_cookies_args(message, target))
-    cmd.extend(_yt_dlp_header_args(message))
+    cmd.extend(_yt_dlp_header_args(message, target_url))
     cmd.append(target)
     run_kw: Dict[str, Any] = {
         "capture_output": True,
@@ -2534,6 +2576,7 @@ def run_yt_dlp_with_updates(
     # Every one of these behaves the same way: the direct pull fails, then a
     # matching recording is searched for. Spotify was the only one wired up.
     music_service = _music_fallback_service(stream_url, page_url)
+    music_match_found = False
     audio_flow = (
         spotify_flow or apple_flow or bool(music_service)
         or bool(run_message.get("ytDlpAudioOnly"))
@@ -2612,7 +2655,30 @@ def run_yt_dlp_with_updates(
         meta = _music_track_meta(stream_url, page_url or primary, run_message)
         picked = _music_youtube_target(meta)
         if picked:
+            music_match_found = True
             code, err_lines = run_one(picked)
+            if code != 0 and _looks_like_youtube_blocked("".join(err_lines[-35:])):
+                # The right video was found; YouTube just refused this client.
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "progress",
+                            "phase": "downloading",
+                            "detail": "Retrying that track another way",
+                            "output": output_path,
+                        },
+                        job_id,
+                    )
+                )
+                retry_message = dict(run_message)
+                retry_message["ytDlpYoutubeExtractorArgs"] = (
+                    "youtube:player_client=default,-web_embedded"
+                )
+                saved, run_message = run_message, retry_message
+                try:
+                    code, err_lines = run_one(picked)
+                finally:
+                    run_message = saved
         else:
             # Nothing good enough to rank, so fall back to a plain search on
             # whatever text the page gave us.
@@ -2694,13 +2760,22 @@ def run_yt_dlp_with_updates(
             "run the download again, or sign in to the site in a different browser."
         )
     if music_service:
-        # The direct pull and the search both failed, so say which service and
-        # what to do rather than leaving a raw yt-dlp error.
-        base = (
-            f"{music_service} protects this track, and no matching recording "
-            "was found to use instead. Playing it and recording the sound is "
-            "the remaining option."
-        )
+        # Two different failures reach here and they need different words. It
+        # used to blame the search either way, which read as "nothing found"
+        # even when the right track had been found and only the download of it
+        # fell over.
+        if music_match_found:
+            base = (
+                f"{music_service} protects this track, so a matching recording "
+                "was found instead, but downloading that failed. Worth trying "
+                "again in a moment. Otherwise play it and record the sound."
+            )
+        else:
+            base = (
+                f"{music_service} protects this track, and no matching "
+                "recording was found to use instead. Playing it and recording "
+                "the sound is the remaining option."
+            )
         err = f"{base} Details: {tail[-420:]}" if tail else base
     if emit_done_on_failure:
         send_message(with_job_id({"type": "done", "success": False, "error": err}, job_id))

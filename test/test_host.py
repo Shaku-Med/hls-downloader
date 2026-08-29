@@ -364,5 +364,53 @@ class RegistryIsWhereTheCodeLooks(unittest.TestCase):
             )
 
 
+class HeadersDoNotFollowToAnotherSite(unittest.TestCase):
+    """
+    A search fallback downloads from a different site than the page it started
+    on, and the page's referer and auth header have no business going there.
+    """
+
+    APPLE = "https://music.apple.com/us/song/x/6797549954"
+    MSG = {"pageUrl": APPLE, "userAgent": "UA", "authorization": "Bearer secret"}
+
+    def test_nothing_private_reaches_the_other_site(self):
+        args = host._yt_dlp_header_args(self.MSG, "https://www.youtube.com/watch?v=abc")
+        joined = " ".join(args)
+        self.assertNotIn("apple", joined.lower())
+        self.assertNotIn("secret", joined)
+        self.assertIn("User-Agent:UA", joined)
+
+    def test_they_are_kept_when_staying_put(self):
+        args = host._yt_dlp_header_args(self.MSG, self.APPLE)
+        joined = " ".join(args)
+        self.assertIn("Referer:" + self.APPLE, joined)
+        self.assertIn("Bearer secret", joined)
+
+    def test_a_subdomain_still_counts_as_the_same_site(self):
+        msg = {"pageUrl": "https://example.com/a", "userAgent": "UA"}
+        args = host._yt_dlp_header_args(msg, "https://cdn.example.com/b.mp4")
+        self.assertIn("Referer:https://example.com/a", " ".join(args))
+
+
+class YoutubeRefusalIsRetried(unittest.TestCase):
+    """Found the right video, but YouTube turned the player away this time."""
+
+    def test_the_real_failure_is_recognised(self):
+        tail = (
+            "WARNING: [youtube] XJ_qgsVtTOY: Unable to download API page: "
+            "HTTP Error 401: Unauthorized WARNING: Only images are available "
+            "for download. ERROR: [youtube] XJ_qgsVtTOY: Requested format is "
+            "not available."
+        )
+        self.assertTrue(host._looks_like_youtube_blocked(tail))
+
+    def test_other_failures_are_left_alone(self):
+        for tail in ("ERROR: Video unavailable",
+                     "ERROR: unable to connect to host",
+                     "ERROR: [youtube] private video",
+                     ""):
+            self.assertFalse(host._looks_like_youtube_blocked(tail), tail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
