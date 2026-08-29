@@ -256,5 +256,76 @@ class ReportedTrackWins(unittest.TestCase):
         self.assertEqual(meta["title"], "Play Some Album")
 
 
+class SiteRegistry(unittest.TestCase):
+    """public/data/ytdlp-sites.json, the file both sides read."""
+
+    def test_the_file_loads(self):
+        self.assertTrue(len(host._ytdlp_sites()) > 10)
+
+    def test_media_pages_are_recognised(self):
+        for url, label, role in (
+            ("https://open.spotify.com/track/abc", "Spotify", "audio"),
+            ("https://music.amazon.com/albums/B0F", "Amazon Music", "audio"),
+            ("https://www.youtube.com/watch?v=abc", "YouTube", "video"),
+            ("https://www.youtube.com/shorts/x", "YouTube", "video"),
+            ("https://www.instagram.com/reel/abc/", "Instagram", "video"),
+        ):
+            found = host._ytdlp_page_role(url)
+            self.assertIsNotNone(found, url)
+            self.assertEqual(found["label"], label, url)
+            self.assertEqual(found["role"], role, url)
+
+    def test_a_language_in_the_path_still_matches(self):
+        # Apple Music, Deezer and Qobuz put /us/ or /en/ in front of the path.
+        for url in ("https://music.apple.com/us/album/x/1",
+                    "https://www.deezer.com/en/track/1109731",
+                    "https://www.qobuz.com/us-en/album/x/y"):
+            self.assertIsNotNone(host._ytdlp_page_role(url), url)
+
+    def test_a_variable_segment_in_front_still_matches(self):
+        # /{user}/status/{id} and /r/{sub}/comments/{id}.
+        self.assertIsNotNone(host._ytdlp_page_role("https://x.com/someone/status/1"))
+        self.assertIsNotNone(host._ytdlp_page_role("https://reddit.com/r/x/comments/1/t/"))
+
+    def test_pages_holding_nothing_are_left_alone(self):
+        for url in ("https://open.spotify.com/",
+                    "https://www.youtube.com/feed/subscriptions",
+                    "https://www.instagram.com/accounts/edit/",
+                    "https://example.com/whatever"):
+            self.assertIsNone(host._ytdlp_page_role(url), url)
+
+    def test_a_video_on_an_audio_service_stays_video(self):
+        found = host._ytdlp_page_role("https://music.apple.com/us/music-video/x/1")
+        self.assertEqual(found["role"], "video")
+        self.assertFalse(host._wants_yt_dlp_audio_extract({}, "https://music.apple.com/us/music-video/x/1"))
+
+
+class QualitySelectionUnchanged(unittest.TestCase):
+    """The registry must not disturb how quality is chosen."""
+
+    YT = "https://www.youtube.com/watch?v=abc"
+
+    def test_your_own_format_wins(self):
+        self.assertEqual(host._yt_dlp_format_string({"ytDlpFormat": "137+140"}, self.YT), "137+140")
+
+    def test_video_pages_take_video_plus_audio(self):
+        fmt = host._yt_dlp_format_string({}, self.YT)
+        self.assertIn("bestvideo*", fmt)
+        self.assertIn("+bestaudio", fmt)
+
+    def test_the_height_cap_is_honoured(self):
+        fmt = host._yt_dlp_format_string({"ytDlpMaxHeight": 1080}, self.YT)
+        self.assertIn("height<=1080", fmt)
+
+    def test_the_merge_is_still_asked_for(self):
+        cmd = host._yt_dlp_build_cmd(["yt-dlp"], {}, "out.mp4", self.YT)
+        self.assertIn("--merge-output-format", cmd)
+        self.assertNotIn("--extract-audio", cmd)
+
+    def test_music_pages_take_audio(self):
+        fmt = host._yt_dlp_format_string({}, "https://open.spotify.com/track/abc")
+        self.assertEqual(fmt, "bestaudio/best")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

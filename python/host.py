@@ -1160,6 +1160,15 @@ def _wants_yt_dlp_audio_extract(message: dict, target_url: str = "") -> bool:
     if message and message.get("ytDlpAudioOnly"):
         return True
     page_url = (message.get("pageUrl") or message.get("referer") or "").strip() if message else ""
+
+    # The registry knows what each page holds, so it answers before the whole
+    # host rules below. Without this a music video on a music service came back
+    # as audio, because the host is a music host and that was all anyone asked.
+    for candidate in (target_url, page_url):
+        found = _ytdlp_page_role(candidate)
+        if found:
+            return found.get("role") == "audio"
+
     if _is_spotify_url(target_url) or _is_spotify_url(page_url):
         return True
     if _is_apple_music_drm_context(target_url, page_url):
@@ -1514,8 +1523,121 @@ _MUSIC_FALLBACK_RULES = [
 _AMAZON_MUSIC_PREFIX = "music.amazon."
 
 
+_YTDLP_SITES_CACHE: Optional[List[Dict[str, Any]]] = None
+# A leading language segment such as /us/ or /us-en/ on Apple Music,
+# Deezer and Qobuz, which sits in front of the real path.
+_LOCALE_PREFIX_RE = re.compile(r"^/[a-z]{2}(?:-[a-z]{2,4})?(?=/)", re.I)
+
+
+def _ytdlp_sites() -> List[Dict[str, Any]]:
+    """
+    The site registry, read from the same JSON the extension uses.
+
+    One file rather than a copy on each side: a site added there is known to
+    both at once. A missing or broken file is not fatal, it just means the
+    older host based rules below decide on their own.
+    """
+    global _YTDLP_SITES_CACHE
+    if _YTDLP_SITES_CACHE is not None:
+        return _YTDLP_SITES_CACHE
+    path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "public", "data", "ytdlp-sites.json",
+    )
+    try:
+        with open(path, encoding="utf-8") as fh:
+            _YTDLP_SITES_CACHE = json.load(fh).get("sites") or []
+    except Exception:
+        _YTDLP_SITES_CACHE = []
+    return _YTDLP_SITES_CACHE
+
+
+def _site_host_matches(site: Dict[str, Any], host: str) -> bool:
+    if not host:
+        return False
+    names = [site.get("hostname") or ""] + list(site.get("aliases") or [])
+    for name in names:
+        d = str(name or "").lower()
+        if d and (host == d or host.endswith("." + d)):
+            return True
+    prefix = str(site.get("hostnamePrefix") or "").lower()
+    return bool(prefix and host.startswith(prefix))
+
+
+def _endpoint_in_path(endpoint: str, path: str) -> bool:
+    """
+    Does this path hold that endpoint?
+
+    Not a plain prefix: most of these sites put something variable in front,
+    as in /{user}/status/{id} or /r/{sub}/comments/{id}. The endpoint has to
+    land on a segment boundary at both ends though, so /watch does not match
+    /watchlist.
+    """
+    at = path.find(endpoint)
+    while at != -1:
+        after = at + len(endpoint)
+        if endpoint.endswith("/") or after >= len(path) or path[after] == "/":
+            return True
+        at = path.find(endpoint, at + 1)
+    return False
+
+
+def _ytdlp_page_role(url: str) -> Optional[Dict[str, Any]]:
+    """
+    What this page holds, if yt-dlp can be pointed at it.
+
+    Matching on the path as well as the host keeps a homepage or a settings
+    page from being offered as a download. The longest matching endpoint wins,
+    so /browse/track/ beats a bare /.
+    """
+    host = _netloc_host(url)
+    if not host:
+        return None
+    try:
+        path = urlparse(url if "://" in url else "https://" + url).path or "/"
+    except Exception:
+        return None
+    # Several of these put the language in the path, so /us/album/... has to
+    # match an endpoint of /album. Both spellings are tried.
+    paths = [path]
+    stripped = _LOCALE_PREFIX_RE.sub("", path, count=1)
+    if stripped != path:
+        paths.append(stripped)
+
+    for site in _ytdlp_sites():
+        if not _site_host_matches(site, host):
+            continue
+        best = None
+        for page in site.get("pages") or []:
+            endpoint = str(page.get("endpoint") or "")
+            if not endpoint or not any(_endpoint_in_path(endpoint, p) for p in paths):
+                continue
+            if best is None or len(endpoint) > len(best[0]):
+                best = (endpoint, page.get("role") or site.get("role") or "video")
+        if best is None:
+            continue
+        return {
+            "label": site.get("label") or site.get("hostname") or "",
+            "role": best[1],
+            "searchFallback": bool(site.get("searchFallback")),
+            "endpoint": best[0],
+        }
+    return None
+
+
 def _music_fallback_service(stream_url: str, page_url: str = "") -> str:
-    """The music service this belongs to, if it is one that needs a fallback."""
+    """
+    The service this belongs to, if the direct pull needs a search behind it.
+
+    The registry answers first, since it is the file the extension reads too.
+    The table below still stands in when the file is missing, and for a bare
+    host with no path to match on.
+    """
+    for candidate in (page_url, stream_url):
+        found = _ytdlp_page_role(candidate)
+        if found and found.get("searchFallback"):
+            return str(found.get("label") or "")
+
     for candidate in (page_url, stream_url):
         host = _netloc_host(candidate)
         if not host:

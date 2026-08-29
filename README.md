@@ -318,6 +318,42 @@ Open a song, album, or playlist page on `music.apple.com`. Stuff Grabber should 
 Do not expect the raw Apple stream links to work. Those are usually locked with FairPlay, so the extension ignores them on purpose and sticks to the page URL. If Apple or yt-dlp cannot give you a real file, the download fails with an error instead of leaving a silent unplayable file.
 
 
+Which pages yt-dlp is used on
+
+One file lists them, `public/data/ytdlp-sites.json`, and both sides read it, so
+a site added there is known to the extension and the helper at once:
+
+```text
+hostname        the site, plus aliases and a prefix for the ones that run a
+                domain per country like Amazon Music
+endpoint        the path that actually holds media, so a homepage or a
+                settings page is not offered as a download
+role            audio or video, per endpoint. A music video on a music
+                service is still fetched as video
+searchFallback  true where yt-dlp has no working extractor. The direct pull
+                still runs first, and only when it fails is a matching
+                recording searched for, before any error is shown
+```
+
+An endpoint matches on segment boundaries rather than as a plain prefix, since
+most of these sites put something variable in front, as in `/{user}/status/{id}`
+or `/r/{sub}/comments/{id}`, and several put the language there too, as in
+`/us/album/` on Apple Music.
+
+Any page in that file gets a This page row, music services included. That was
+the gap: nothing in their traffic looks like media, so a track or album page
+offered nothing to download at all.
+
+The role only decides audio against video. Quality is untouched: your own
+format choice still wins, otherwise a video page takes the best video plus the
+best audio and lets ffmpeg merge them, honouring the height cap you picked.
+
+Media served without an extension is picked up too. Some servers give no
+filename and a content type that says nothing, `octet-stream`, `text/plain`,
+`force-download` and the like. The response still gives it away by being
+seekable and large, and anything the server names as a non media file is left
+alone.
+
 Spotify
 
 On Spotify web you can paste or use a track style URL and try an audio extract through yt-dlp. A lot of Spotify sources are protected, so this often fails or falls back to a YouTube search for the same title. That is a site limit, not something the extension can crack.

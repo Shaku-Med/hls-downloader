@@ -40,6 +40,7 @@ const CTX_MENU_KEYS = [
 if (typeof importScripts === 'function') {
   try {
     importScripts('drm-hosts.js');
+    importScripts('ytdlp-sites.js');
     importScripts('zip-store.js');
   } catch (e) {
     console.warn('Stuff Grabber: zip-store failed to load', e);
@@ -337,9 +338,29 @@ function totalSizeFromHeaders(headers) {
  * server will seek into is a media file in practice.
  * @returns {string | null}
  */
+/**
+ * Content types that say nothing about what the body actually is.
+ *
+ * Plenty of servers hand out media with no extension in the URL and a type
+ * like this, so neither the path nor the header identifies it. The response
+ * itself still gives it away: seekable, and big.
+ */
+const VAGUE_CONTENT_TYPES = new Set([
+  'application/octet-stream',
+  'binary/octet-stream',
+  'application/binary',
+  'application/x-binary',
+  'application/download',
+  'application/force-download',
+  'application/x-download',
+  'application/unknown',
+  'application/save',
+  'text/plain',
+]);
+
 function genericBinaryMediaKind(url, headers) {
   const ct = (getHeaderValue(headers, 'content-type') || '').toLowerCase().split(';')[0].trim();
-  if (ct && ct !== 'application/octet-stream' && ct !== 'binary/octet-stream') return null;
+  if (ct && !VAGUE_CONTENT_TYPES.has(ct)) return null;
 
   const disposition = filenameFromContentDisposition(
     getHeaderValue(headers, 'content-disposition')
@@ -513,6 +534,18 @@ function addMusicTrackEntry(tabId, message) {
   notifyStreamsChanged(tabId);
 }
 
+function ytdlpSites() {
+  return (typeof self !== 'undefined' && self.HLS_YTDLP_SITES) || null;
+}
+
+// Loaded once so the page checks below are answerable straight away.
+try {
+  const api = ytdlpSites();
+  if (api) void api.loadFromExtension();
+} catch (_) {
+  // The registry is a nicety; without it the older host rules still apply.
+}
+
 function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
   if (!tabId || tabId < 0) return;
   _ytdlpPageCap[tabId] = { ...(_ytdlpPageCap[tabId] || {}), ...(capturedHeaders || {}) };
@@ -564,13 +597,19 @@ function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
           return;
         }
 
+        const api = ytdlpSites();
         for (const t of targets) {
+          // audio or video, straight from the registry, so a music page asks
+          // for audio and a video page still gets video plus audio merged.
+          const known = api ? api.lookup(t.url) : null;
           rest.push({
             url: t.url,
             cleanedUrl: t.cleanedUrl || t.url,
             streamKind: t.streamKind || 'social',
             pageDownload: true,
             urlSource: t.urlSource === 'tab' ? 'tab' : 'link',
+            siteRole: known ? known.role : undefined,
+            siteLabel: known ? known.label : undefined,
             capturedHeaders: { ...merged },
           });
         }
@@ -808,6 +847,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
     isAppleMusicTrackPage(tab.url || '')
   ) {
     upsertYtdlpPagePlaceholder(tabId, {});
+  }
+  // Any page the registry knows, music as well as video. Music services were
+  // the gap: nothing in their traffic looks like media, so without this an
+  // album or track page offered no This page row at all.
+  if ((changeInfo.status === 'complete' || changeInfo.url) && tab && tab.url) {
+    const api = ytdlpSites();
+    if (api && api.isReady() && api.lookup(tab.url)) {
+      upsertYtdlpPagePlaceholder(tabId, {});
+    }
   }
   // YouTube / Facebook / TikTok / etc.: scan for watch/shorts/reel/post links on load.
   if (

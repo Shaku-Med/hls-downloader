@@ -1202,6 +1202,10 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
               payload.ytDlpAudioOnly = true;
               payload.streamKind = 'social';
             }
+            // A music page asks for audio. A video page is left alone so it
+            // still gets the best video plus audio, merged by ffmpeg, and
+            // whatever quality was chosen.
+            if (stream.siteRole === 'audio') payload.ytDlpAudioOnly = true;
             if (stream.trackTitle) {
               // Hand the helper the exact track, so it searches for this
               // rather than working it out from the album page title.

@@ -32,6 +32,7 @@ CHROMIUM_BACKGROUND = {"service_worker": "public/scripts/background.js"}
 FIREFOX_BACKGROUND = {
     "scripts": [
         "public/scripts/drm-hosts.js",
+        "public/scripts/ytdlp-sites.js",
         "public/scripts/zip-store.js",
         "public/scripts/social-post-urls.js",
         "public/scripts/background.js",

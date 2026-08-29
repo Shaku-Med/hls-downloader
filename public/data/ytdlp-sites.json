@@ -1,0 +1,348 @@
+{
+  "_comment": [
+    "Pages yt-dlp can be pointed at, and what each one holds.",
+    "",
+    "One file, read by both sides: the extension loads it to decide when to offer",
+    "a This page row, and the helper loads the same file to decide whether to ask",
+    "for audio or video and whether to search when the direct pull fails. Two",
+    "copies of this would drift apart within a week.",
+    "",
+    "role         audio, video, or both. Drives whether yt-dlp is asked to",
+    "             extract audio or to pick video plus audio and merge them.",
+    "searchFallback  true where yt-dlp has no working extractor, checked against",
+    "             --list-extractors rather than assumed. The direct attempt still",
+    "             runs first, and only when it fails is a matching recording",
+    "             searched for, before any error is shown.",
+    "endpoint     path prefix on that host that actually holds media. Kept so a",
+    "             homepage or a settings page does not offer a download."
+  ],
+  "version": 1,
+  "sites": [
+    {
+      "hostname": "youtube.com",
+      "aliases": ["youtu.be", "m.youtube.com", "youtube-nocookie.com"],
+      "label": "YouTube",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/watch", "role": "video" },
+        { "endpoint": "/shorts/", "role": "video" },
+        { "endpoint": "/live/", "role": "video" },
+        { "endpoint": "/embed/", "role": "video" },
+        { "endpoint": "/playlist", "role": "video" },
+        { "endpoint": "/clip/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "music.youtube.com",
+      "label": "YouTube Music",
+      "role": "audio",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/watch", "role": "audio" },
+        { "endpoint": "/playlist", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "open.spotify.com",
+      "aliases": ["spotify.com"],
+      "label": "Spotify",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/track/", "role": "audio" },
+        { "endpoint": "/album/", "role": "audio" },
+        { "endpoint": "/playlist/", "role": "audio" },
+        { "endpoint": "/episode/", "role": "audio" },
+        { "endpoint": "/show/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "music.apple.com",
+      "aliases": ["itunes.apple.com"],
+      "label": "Apple Music",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/album", "role": "audio" },
+        { "endpoint": "/song", "role": "audio" },
+        { "endpoint": "/playlist", "role": "audio" },
+        { "endpoint": "/music-video", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "music.amazon.com",
+      "hostnamePrefix": "music.amazon.",
+      "label": "Amazon Music",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/albums/", "role": "audio" },
+        { "endpoint": "/tracks/", "role": "audio" },
+        { "endpoint": "/playlists/", "role": "audio" },
+        { "endpoint": "/podcasts/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "tidal.com",
+      "aliases": ["listen.tidal.com"],
+      "label": "Tidal",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/track/", "role": "audio" },
+        { "endpoint": "/browse/track/", "role": "audio" },
+        { "endpoint": "/album/", "role": "audio" },
+        { "endpoint": "/playlist/", "role": "audio" },
+        { "endpoint": "/video/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "deezer.com",
+      "label": "Deezer",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/track/", "role": "audio" },
+        { "endpoint": "/album/", "role": "audio" },
+        { "endpoint": "/playlist/", "role": "audio" },
+        { "endpoint": "/episode/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "pandora.com",
+      "label": "Pandora",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/artist/", "role": "audio" },
+        { "endpoint": "/playlist/", "role": "audio" },
+        { "endpoint": "/podcast/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "qobuz.com",
+      "aliases": ["open.qobuz.com"],
+      "label": "Qobuz",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/album/", "role": "audio" },
+        { "endpoint": "/track/", "role": "audio" },
+        { "endpoint": "/playlist/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "anghami.com",
+      "aliases": ["play.anghami.com"],
+      "label": "Anghami",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/song/", "role": "audio" },
+        { "endpoint": "/album/", "role": "audio" },
+        { "endpoint": "/playlist/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "boomplay.com",
+      "label": "Boomplay",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/songs/", "role": "audio" },
+        { "endpoint": "/albums/", "role": "audio" },
+        { "endpoint": "/playlists/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "napster.com",
+      "label": "Napster",
+      "role": "audio",
+      "searchFallback": true,
+      "pages": [
+        { "endpoint": "/track/", "role": "audio" },
+        { "endpoint": "/album/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "soundcloud.com",
+      "aliases": ["m.soundcloud.com", "on.soundcloud.com"],
+      "label": "SoundCloud",
+      "role": "audio",
+      "searchFallback": false,
+      "pages": [{ "endpoint": "/", "role": "audio" }]
+    },
+    {
+      "hostname": "bandcamp.com",
+      "label": "Bandcamp",
+      "role": "audio",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/track/", "role": "audio" },
+        { "endpoint": "/album/", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "instagram.com",
+      "label": "Instagram",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/p/", "role": "video" },
+        { "endpoint": "/reel/", "role": "video" },
+        { "endpoint": "/reels/", "role": "video" },
+        { "endpoint": "/tv/", "role": "video" },
+        { "endpoint": "/stories/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "tiktok.com",
+      "aliases": ["vm.tiktok.com", "m.tiktok.com"],
+      "label": "TikTok",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/video/", "role": "video" },
+        { "endpoint": "/@", "role": "video" },
+        { "endpoint": "/t/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "x.com",
+      "aliases": ["twitter.com", "mobile.twitter.com"],
+      "label": "Twitter / X",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/status/", "role": "video" },
+        { "endpoint": "/i/status/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "facebook.com",
+      "aliases": ["fb.watch", "m.facebook.com", "web.facebook.com"],
+      "label": "Facebook",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/watch", "role": "video" },
+        { "endpoint": "/reel/", "role": "video" },
+        { "endpoint": "/videos/", "role": "video" },
+        { "endpoint": "/share/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "reddit.com",
+      "aliases": ["old.reddit.com", "redd.it"],
+      "label": "Reddit",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [{ "endpoint": "/comments/", "role": "video" }]
+    },
+    {
+      "hostname": "twitch.tv",
+      "aliases": ["m.twitch.tv", "clips.twitch.tv"],
+      "label": "Twitch",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/videos/", "role": "video" },
+        { "endpoint": "/clip/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "vimeo.com",
+      "aliases": ["player.vimeo.com"],
+      "label": "Vimeo",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [{ "endpoint": "/", "role": "video" }]
+    },
+    {
+      "hostname": "dailymotion.com",
+      "aliases": ["dai.ly"],
+      "label": "Dailymotion",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/video/", "role": "video" },
+        { "endpoint": "/embed/video/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "bilibili.com",
+      "aliases": ["m.bilibili.com", "b23.tv"],
+      "label": "Bilibili",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/video/", "role": "video" },
+        { "endpoint": "/bangumi/play/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "rumble.com",
+      "label": "Rumble",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [{ "endpoint": "/", "role": "video" }]
+    },
+    {
+      "hostname": "kick.com",
+      "label": "Kick",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/video/", "role": "video" },
+        { "endpoint": "/clip/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "pinterest.com",
+      "aliases": ["pin.it"],
+      "label": "Pinterest",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [{ "endpoint": "/pin/", "role": "video" }]
+    },
+    {
+      "hostname": "linkedin.com",
+      "label": "LinkedIn",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/posts/", "role": "video" },
+        { "endpoint": "/feed/update/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "snapchat.com",
+      "label": "Snapchat",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/spotlight/", "role": "video" },
+        { "endpoint": "/add/", "role": "video" }
+      ]
+    },
+    {
+      "hostname": "threads.net",
+      "aliases": ["threads.com"],
+      "label": "Threads",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [{ "endpoint": "/@", "role": "video" }]
+    },
+    {
+      "hostname": "crunchyroll.com",
+      "label": "Crunchyroll",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/watch/", "role": "video" },
+        { "endpoint": "/series/", "role": "video" }
+      ]
+    }
+  ]
+}
