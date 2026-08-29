@@ -340,9 +340,15 @@ most of these sites put something variable in front, as in `/{user}/status/{id}`
 or `/r/{sub}/comments/{id}`, and several put the language there too, as in
 `/us/album/` on Apple Music.
 
-Any page in that file gets a This page row, music services included. That was
-the gap: nothing in their traffic looks like media, so a track or album page
-offered nothing to download at all.
+Any page in that file gets a This page row, music services included, and it is
+there as soon as the page loads. Nothing has to be played or clicked first:
+the address alone says yt-dlp can be pointed at it. Whatever the network turns
+up afterwards is listed underneath it, and the file name is yours to change
+either way.
+
+That was the gap on music services. Their page row went through the same check
+as a social post link, which does not recognise them, so a track or album page
+listed only the raw audio the browser happened to fetch, and no page row at all.
 
 The role only decides audio against video. Quality is untouched: your own
 format choice still wins, otherwise a video page takes the best video plus the

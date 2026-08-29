@@ -538,6 +538,58 @@ function ytdlpSites() {
   return (typeof self !== 'undefined' && self.HLS_YTDLP_SITES) || null;
 }
 
+/**
+ * Put the page itself in the list, straight away, on any page the registry
+ * knows.
+ *
+ * Nothing has to happen on the page first: the URL alone says yt-dlp can be
+ * pointed at it, so the row is there the moment the page loads rather than
+ * waiting for traffic or for a track to start. Whatever the network turns up
+ * afterwards is added alongside it.
+ *
+ * This is separate from the placeholder below, which scans the page for links
+ * to other posts. That scan asks the social classifier first, and it does not
+ * recognise a music service, which is why an album page listed nothing.
+ */
+function ensureRegistryPageRow(tabId, pageUrl) {
+  if (!tabId || tabId < 0) return false;
+  const api = ytdlpSites();
+  if (!api || !api.isReady()) return false;
+  const url = String(pageUrl || '').trim();
+  if (!/^https?:/i.test(url)) return false;
+  const known = api.lookup(url);
+  if (!known) return false;
+
+  if (!detectedStreams[tabId]) detectedStreams[tabId] = [];
+  const list = detectedStreams[tabId];
+  const key = url.replace(/\/$/, '').toLowerCase();
+  const existing = list.find(
+    (e) =>
+      e &&
+      e.pageDownload &&
+      e.urlSource === 'tab' &&
+      String(e.url || '').replace(/\/$/, '').toLowerCase() === key
+  );
+  if (existing) {
+    existing.siteRole = known.role;
+    existing.siteLabel = known.label;
+    return false;
+  }
+  list.unshift({
+    url,
+    cleanedUrl: url,
+    streamKind: 'social',
+    pageDownload: true,
+    urlSource: 'tab',
+    siteRole: known.role,
+    siteLabel: known.label,
+    fromRegistry: true,
+    capturedHeaders: {},
+  });
+  detectedStreams[tabId] = list;
+  return true;
+}
+
 // Loaded once so the page checks below are answerable straight away.
 try {
   const api = ytdlpSites();
@@ -577,9 +629,12 @@ function upsertYtdlpPagePlaceholder(tabId, capturedHeaders) {
           ? []
           : list.filter(
               (e) =>
-                // Keep the reported track: it is a social row too, but it is
-                // the only thing naming an actual song on these pages.
-                e.trackTitle || (e.streamKind !== 'social' && e.streamKind !== 'yt')
+                // Keep the reported track and the registry's own page row:
+                // both are social rows, and both are the only thing offering
+                // anything at all on a music service.
+                e.trackTitle ||
+                e.fromRegistry ||
+                (e.streamKind !== 'social' && e.streamKind !== 'yt')
             );
 
         if (!targets.length) {
@@ -852,9 +907,10 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   // the gap: nothing in their traffic looks like media, so without this an
   // album or track page offered no This page row at all.
   if ((changeInfo.status === 'complete' || changeInfo.url) && tab && tab.url) {
-    const api = ytdlpSites();
-    if (api && api.isReady() && api.lookup(tab.url)) {
-      upsertYtdlpPagePlaceholder(tabId, {});
+    if (ensureRegistryPageRow(tabId, tab.url)) {
+      chrome.action.setBadgeText({ text: String((detectedStreams[tabId] || []).length), tabId });
+      chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
+      notifyStreamsChanged(tabId);
     }
   }
   // YouTube / Facebook / TikTok / etc.: scan for watch/shorts/reel/post links on load.
@@ -3229,6 +3285,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const effectiveTabId = tabIdFromMsg != null ? tabIdFromMsg : senderTabId;
 
     const finish = (tabId, pageTitle, tabUrl) => {
+      // Opening the panel on a tab that loaded before the extension did, or
+      // before the registry finished loading, still gets its page row.
+      const api = ytdlpSites();
+      const ready = api && api.isReady() ? Promise.resolve(true) : (api ? api.loadFromExtension() : Promise.resolve(false));
+      ready
+        .catch(() => false)
+        .then(() => {
+          ensureRegistryPageRow(tabId, tabUrl);
+          respondWithStreams(tabId, pageTitle, tabUrl);
+        });
+    };
+
+    const respondWithStreams = (tabId, pageTitle, tabUrl) => {
       Promise.all([chrome.storage.session.get(JOBS_KEY), chrome.storage.local.get(USER_PATH_KEY)])
         .then(([sess, local]) => {
           const jobsState = (sess && sess[JOBS_KEY]) || defaultJobsState();
