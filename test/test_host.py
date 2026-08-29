@@ -6,6 +6,7 @@ Or directly:             python test/test_host.py
 """
 
 import os
+import re
 import sys
 import unittest
 
@@ -325,6 +326,42 @@ class QualitySelectionUnchanged(unittest.TestCase):
     def test_music_pages_take_audio(self):
         fmt = host._yt_dlp_format_string({}, "https://open.spotify.com/track/abc")
         self.assertEqual(fmt, "bestaudio/best")
+
+
+class RegistryIsWhereTheCodeLooks(unittest.TestCase):
+    """
+    The path the extension fetches has to exist in the loaded browser roots.
+
+    This shipped broken once: the code asked for data/ytdlp-sites.json while
+    the file sits under public/, so the fetch 404d, the registry never loaded,
+    and every page check failed at its first line with nothing to show for it.
+    """
+
+    def _paths_the_code_tries(self):
+        js = os.path.join(HERE, "..", "public", "scripts", "ytdlp-sites.js")
+        with open(js, encoding="utf-8") as fh:
+            block = fh.read().split("DATA_PATHS = [", 1)[1].split("]", 1)[0]
+        return re.findall(r"'([^']+)'", block)
+
+    def test_the_first_path_tried_actually_exists(self):
+        tried = self._paths_the_code_tries()
+        self.assertTrue(tried, "no DATA_PATHS found in ytdlp-sites.js")
+        root = os.path.join(HERE, "..")
+        self.assertTrue(
+            os.path.isfile(os.path.join(root, tried[0])),
+            "%s does not exist; the extension would fetch nothing" % tried[0],
+        )
+
+    def test_each_browser_root_has_it(self):
+        tried = self._paths_the_code_tries()
+        for browser in ("chromium", "firefox"):
+            folder = os.path.join(HERE, "..", browser)
+            if not os.path.isdir(folder):
+                continue  # setup_browser_roots.py has not been run here
+            self.assertTrue(
+                any(os.path.isfile(os.path.join(folder, p)) for p in tried),
+                "%s has none of %s" % (browser, tried),
+            )
 
 
 if __name__ == "__main__":

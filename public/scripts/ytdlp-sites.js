@@ -126,18 +126,27 @@
     return ready;
   }
 
+  // Where the file lands inside the loaded extension. public/ is kept as a
+  // folder in both browser roots, so the path includes it. Asking for the
+  // short one fetched nothing, quietly, and every page check then failed at
+  // its first line because the registry was never loaded.
+  const DATA_PATHS = ['public/data/ytdlp-sites.json', 'data/ytdlp-sites.json'];
+
   /** Fetch the file from inside the extension. Safe to call more than once. */
   async function loadFromExtension() {
     if (ready) return true;
-    try {
-      const url = global.chrome && chrome.runtime && chrome.runtime.getURL
-        ? chrome.runtime.getURL('data/ytdlp-sites.json')
-        : 'data/ytdlp-sites.json';
-      const res = await fetch(url);
-      return load(await res.json());
-    } catch (_) {
-      return false;
+    const resolve = (p) =>
+      global.chrome && chrome.runtime && chrome.runtime.getURL ? chrome.runtime.getURL(p) : p;
+    for (const path of DATA_PATHS) {
+      try {
+        const res = await fetch(resolve(path));
+        if (!res || !res.ok) continue;
+        if (load(await res.json())) return true;
+      } catch (_) {
+        // Try the next spelling.
+      }
     }
+    return false;
   }
 
   global.HLS_YTDLP_SITES = { lookup, siteFor, load, loadFromExtension, isReady, normHost };
