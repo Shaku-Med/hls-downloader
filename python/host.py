@@ -1016,6 +1016,7 @@ _SOCIAL_PLATFORM_RULES: List[Tuple[str, Tuple[str, ...]]] = [
     ("LinkedIn", ("linkedin.com", "licdn.com")),
     ("Bilibili", ("bilibili.com", "bilivideo.com", "bilibiliapi.net")),
     ("SoundCloud", ("soundcloud.com",)),
+    ("Mixcloud", ("mixcloud.com",)),
     ("Spotify", ("spotify.com", "open.spotify.com", "scdn.co")),
     (
         "Apple Music",
@@ -1142,6 +1143,12 @@ def _social_platform_for_yt_dlp(stream_url: str, page_url: str, message: Any) ->
     """
     sh = _netloc_host(stream_url)
     ph = _netloc_host(page_url)
+    # The registry has the final say on where yt-dlp does not belong, so the
+    # row the extension offers and the tool the helper reaches for cannot
+    # disagree. Without this a site could be left out of the registry and still
+    # be routed here by a host rule, giving a download that only ever fails.
+    if _ytdlp_site_disabled(page_url) or _ytdlp_site_disabled(stream_url):
+        return None
     if _is_apple_music_drm_context(stream_url, page_url):
         return "Apple Music"
     if _is_hls_input(stream_url, message):
@@ -1182,7 +1189,7 @@ def _wants_yt_dlp_audio_extract(message: dict, target_url: str = "") -> bool:
     return False
 
 
-_AUDIO_ONLY_HOSTS = ("soundcloud.com", "bandcamp.com")
+_AUDIO_ONLY_HOSTS = ("soundcloud.com", "bandcamp.com", "mixcloud.com")
 
 
 def _is_audio_only_site(url: str) -> bool:
@@ -1574,16 +1581,77 @@ def _ytdlp_sites() -> List[Dict[str, Any]]:
     return _YTDLP_SITES_CACHE
 
 
-def _site_host_matches(site: Dict[str, Any], host: str) -> bool:
+def _site_host_score(site: Dict[str, Any], host: str) -> int:
+    """
+    How specifically this site claims the host, 0 for not at all.
+
+    The score is the length of the name that matched, so music.youtube.com beats
+    youtube.com on its own pages. Without that the first entry whose suffix fit
+    won, and YouTube Music was answered by the YouTube entry, which asks for
+    video where the whole point there is audio.
+    """
     if not host:
-        return False
+        return 0
+    best = 0
     names = [site.get("hostname") or ""] + list(site.get("aliases") or [])
     for name in names:
         d = str(name or "").lower()
         if d and (host == d or host.endswith("." + d)):
-            return True
+            best = max(best, len(d))
     prefix = str(site.get("hostnamePrefix") or "").lower()
-    return bool(prefix and host.startswith(prefix))
+    if prefix and host.startswith(prefix):
+        best = max(best, len(prefix))
+    return best
+
+
+def _ytdlp_site_for(url: str) -> Optional[Dict[str, Any]]:
+    """The registry entry claiming this host, most specific first."""
+    host = _netloc_host(url)
+    if not host:
+        return None
+    best: Optional[Dict[str, Any]] = None
+    best_score = 0
+    for site in _ytdlp_sites():
+        score = _site_host_score(site, host)
+        if score > best_score:
+            best, best_score = site, score
+    return best
+
+
+def _ytdlp_site_disabled(url: str) -> bool:
+    """Whether the registry says yt-dlp is simply not the tool for this site."""
+    site = _ytdlp_site_for(url)
+    return bool(site and site.get("ytdlp") is False)
+
+
+# The file ships with the helper, so this is a sanity bound rather than a
+# defence against a hostile pattern. Anything longer is a mistake.
+_MAX_SITE_PATTERN = 200
+_SITE_PATTERN_CACHE: Dict[str, Optional["re.Pattern[str]"]] = {}
+
+
+def _site_pattern(source: Any) -> Optional["re.Pattern[str]"]:
+    """Compile once, and treat a bad pattern as no pattern rather than raising."""
+    if not isinstance(source, str) or not source or len(source) > _MAX_SITE_PATTERN:
+        return None
+    if source in _SITE_PATTERN_CACHE:
+        return _SITE_PATTERN_CACHE[source]
+    try:
+        # ASCII so \w and \d mean here what they mean in the extension's copy.
+        found = re.compile(source, re.ASCII)
+    except re.error:
+        found = None
+    _SITE_PATTERN_CACHE[source] = found
+    return found
+
+
+def _site_denies(site: Dict[str, Any], paths: List[str]) -> bool:
+    """First segment the site says never holds media."""
+    for raw in site.get("deny") or []:
+        d = str(raw or "")
+        if d and any(p == d or p.startswith(d + "/") for p in paths):
+            return True
+    return False
 
 
 def _endpoint_in_path(endpoint: str, path: str) -> bool:
@@ -1612,8 +1680,8 @@ def _ytdlp_page_role(url: str) -> Optional[Dict[str, Any]]:
     page from being offered as a download. The longest matching endpoint wins,
     so /browse/track/ beats a bare /.
     """
-    host = _netloc_host(url)
-    if not host:
+    site = _ytdlp_site_for(url)
+    if site is None or site.get("ytdlp") is False:
         return None
     try:
         path = urlparse(url if "://" in url else "https://" + url).path or "/"
@@ -1625,26 +1693,32 @@ def _ytdlp_page_role(url: str) -> Optional[Dict[str, Any]]:
     stripped = _LOCALE_PREFIX_RE.sub("", path, count=1)
     if stripped != path:
         paths.append(stripped)
+    if _site_denies(site, paths):
+        return None
 
-    for site in _ytdlp_sites():
-        if not _site_host_matches(site, host):
+    best: Optional[Tuple[str, str]] = None
+    for page in site.get("pages") or []:
+        endpoint = str(page.get("endpoint") or "")
+        hit = ""
+        if endpoint:
+            if any(_endpoint_in_path(endpoint, p) for p in paths):
+                hit = endpoint
+        else:
+            found = _site_pattern(page.get("match"))
+            if found is not None and any(found.search(p) for p in paths):
+                hit = str(page.get("match"))
+        if not hit:
             continue
-        best = None
-        for page in site.get("pages") or []:
-            endpoint = str(page.get("endpoint") or "")
-            if not endpoint or not any(_endpoint_in_path(endpoint, p) for p in paths):
-                continue
-            if best is None or len(endpoint) > len(best[0]):
-                best = (endpoint, page.get("role") or site.get("role") or "video")
-        if best is None:
-            continue
-        return {
-            "label": site.get("label") or site.get("hostname") or "",
-            "role": best[1],
-            "searchFallback": bool(site.get("searchFallback")),
-            "endpoint": best[0],
-        }
-    return None
+        if best is None or len(hit) > len(best[0]):
+            best = (hit, page.get("role") or site.get("role") or "video")
+    if best is None:
+        return None
+    return {
+        "label": site.get("label") or site.get("hostname") or "",
+        "role": best[1],
+        "searchFallback": bool(site.get("searchFallback")),
+        "endpoint": best[0],
+    }
 
 
 def _music_fallback_service(stream_url: str, page_url: str = "") -> str:

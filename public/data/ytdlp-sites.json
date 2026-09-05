@@ -4,23 +4,57 @@
     "",
     "One file, read by both sides: the extension loads it to decide when to offer",
     "a This page row, and the helper loads the same file to decide whether to ask",
-    "for audio or video and whether to search when the direct pull fails. Two",
-    "copies of this would drift apart within a week.",
+    "for audio or video, whether to search when the direct pull fails, and whether",
+    "to hand the job to yt-dlp at all. Two copies of this would drift apart within",
+    "a week.",
     "",
-    "role         audio, video, or both. Drives whether yt-dlp is asked to",
-    "             extract audio or to pick video plus audio and merge them.",
+    "Every entry below was checked against yt-dlp's own URL matching rather than",
+    "assumed, using the sample URLs in test/test_host.py. A site is only listed as",
+    "working where yt-dlp actually has an extractor that takes that shape of URL.",
+    "",
+    "ytdlp       false means we know the site and yt-dlp is not the answer there.",
+    "            No This page row is offered and the helper will not route to it,",
+    "            so whatever the network capture picks up is used instead. The",
+    "            note says why. Absent means true.",
+    "role        audio, video, or both. Drives whether yt-dlp is asked to",
+    "            extract audio or to pick video plus audio and merge them.",
     "searchFallback  true where yt-dlp has no working extractor, checked against",
-    "             --list-extractors rather than assumed. The direct attempt still",
-    "             runs first, and only when it fails is a matching recording",
-    "             searched for, before any error is shown.",
-    "endpoint     path prefix on that host that actually holds media. Kept so a",
-    "             homepage or a settings page does not offer a download."
+    "            its extractor list rather than assumed. The direct attempt still",
+    "            runs first, and only when it fails is a matching recording",
+    "            searched for, before any error is shown.",
+    "endpoint    path segment on that host that holds media. Matched on segment",
+    "            boundaries, and it may sit anywhere in the path, because these",
+    "            sites put something variable in front: /{user}/status/{id}.",
+    "match       a path pattern, for shapes a segment cannot express. Kept to the",
+    "            syntax JavaScript and Python read the same way: classes, groups,",
+    "            +*?, anchors and negative lookahead. No backreferences, no",
+    "            lookbehind, no named groups.",
+    "deny        first path segments on that host that never hold media. Checked",
+    "            before anything else, because a bare two segment rule like",
+    "            SoundCloud's cannot tell a track from /you/library."
   ],
-  "version": 1,
+  "version": 2,
   "sites": [
     {
+      "hostname": "music.youtube.com",
+      "label": "YouTube Music",
+      "role": "audio",
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/watch", "role": "audio" },
+        { "endpoint": "/playlist", "role": "audio" }
+      ]
+    },
+    {
+      "hostname": "youtu.be",
+      "label": "YouTube",
+      "role": "video",
+      "searchFallback": false,
+      "pages": [{ "match": "^/[A-Za-z0-9_-]{6,}/?$", "role": "video" }]
+    },
+    {
       "hostname": "youtube.com",
-      "aliases": ["youtu.be", "m.youtube.com", "youtube-nocookie.com"],
+      "aliases": ["youtube-nocookie.com"],
       "label": "YouTube",
       "role": "video",
       "searchFallback": false,
@@ -31,16 +65,6 @@
         { "endpoint": "/embed/", "role": "video" },
         { "endpoint": "/playlist", "role": "video" },
         { "endpoint": "/clip/", "role": "video" }
-      ]
-    },
-    {
-      "hostname": "music.youtube.com",
-      "label": "YouTube Music",
-      "role": "audio",
-      "searchFallback": false,
-      "pages": [
-        { "endpoint": "/watch", "role": "audio" },
-        { "endpoint": "/playlist", "role": "audio" }
       ]
     },
     {
@@ -167,11 +191,24 @@
     },
     {
       "hostname": "soundcloud.com",
-      "aliases": ["m.soundcloud.com", "on.soundcloud.com"],
+      "aliases": ["m.soundcloud.com"],
       "label": "SoundCloud",
       "role": "audio",
       "searchFallback": false,
-      "pages": [{ "endpoint": "/", "role": "audio" }]
+      "deny": [
+        "/discover", "/you", "/feed", "/stream", "/search", "/upload",
+        "/settings", "/notifications", "/messages", "/stations", "/charts",
+        "/tags", "/pages", "/people", "/groups", "/popular", "/premium",
+        "/pro", "/creators", "/imprint", "/jobs", "/mobile", "/terms",
+        "/legal", "/login", "/signin", "/logout"
+      ],
+      "pages": [
+        { "endpoint": "/sets/", "role": "audio" },
+        {
+          "match": "^/[^/]+/(?!(?:tracks|albums|sets|reposts|likes|spotlight|comments)/?$)[^/]+/?$",
+          "role": "audio"
+        }
+      ]
     },
     {
       "hostname": "bandcamp.com",
@@ -184,10 +221,58 @@
       ]
     },
     {
+      "hostname": "mixcloud.com",
+      "aliases": ["m.mixcloud.com", "beta.mixcloud.com"],
+      "label": "Mixcloud",
+      "role": "audio",
+      "searchFallback": false,
+      "deny": ["/discover", "/search", "/upload", "/settings", "/select", "/pro"],
+      "pages": [
+        {
+          "match": "^/[^/]+/(?!(?:stream|uploads|favorites|listens|playlists)/?$)[^/]+/?$",
+          "role": "audio"
+        }
+      ]
+    },
+    {
+      "hostname": "audiomack.com",
+      "label": "Audiomack",
+      "ytdlp": false,
+      "note": [
+        "yt-dlp matches audiomack.com/song/ and /album/, but the extractor still",
+        "404s on their metadata API, so the attempt only produces a confusing",
+        "error. The pages serve plain audio the network capture picks up, which",
+        "is both the real file and better than a YouTube lookalike, so no page",
+        "row is offered here."
+      ]
+    },
+    {
+      "hostname": "threads.net",
+      "aliases": ["threads.com"],
+      "label": "Threads",
+      "ytdlp": false,
+      "note": [
+        "No yt-dlp extractor, checked against its matcher rather than assumed.",
+        "A post page used to be routed at Meta's other domains and could only",
+        "fail. Video on Threads is captured from the network like any other."
+      ]
+    },
+    {
+      "hostname": "crunchyroll.com",
+      "label": "Crunchyroll",
+      "ytdlp": false,
+      "note": [
+        "yt-dlp recognises the URL only to report that it is DRM protected.",
+        "Offering a download that cannot finish is worse than saying so, and the",
+        "protected content notice already offers the screen recorder here."
+      ]
+    },
+    {
       "hostname": "instagram.com",
       "label": "Instagram",
       "role": "video",
       "searchFallback": false,
+      "deny": ["/accounts", "/explore", "/direct", "/settings"],
       "pages": [
         { "endpoint": "/p/", "role": "video" },
         { "endpoint": "/reel/", "role": "video" },
@@ -204,7 +289,7 @@
       "searchFallback": false,
       "pages": [
         { "endpoint": "/video/", "role": "video" },
-        { "endpoint": "/@", "role": "video" },
+        { "endpoint": "/photo/", "role": "video" },
         { "endpoint": "/t/", "role": "video" }
       ]
     },
@@ -257,7 +342,10 @@
       "label": "Vimeo",
       "role": "video",
       "searchFallback": false,
-      "pages": [{ "endpoint": "/", "role": "video" }]
+      "pages": [
+        { "match": "^(?:/[^/]+)*/[0-9]+(?:/[0-9a-f]{10})?/?$", "role": "video" },
+        { "endpoint": "/ondemand/", "role": "video" }
+      ]
     },
     {
       "hostname": "dailymotion.com",
@@ -286,7 +374,10 @@
       "label": "Rumble",
       "role": "video",
       "searchFallback": false,
-      "pages": [{ "endpoint": "/", "role": "video" }]
+      "pages": [
+        { "match": "^/v(?!ideos)[A-Za-z0-9_.-]+", "role": "video" },
+        { "endpoint": "/embed/", "role": "video" }
+      ]
     },
     {
       "hostname": "kick.com",
@@ -294,8 +385,8 @@
       "role": "video",
       "searchFallback": false,
       "pages": [
-        { "endpoint": "/video/", "role": "video" },
-        { "endpoint": "/clip/", "role": "video" }
+        { "endpoint": "/videos/", "role": "video" },
+        { "endpoint": "/clips/", "role": "video" }
       ]
     },
     {
@@ -313,7 +404,8 @@
       "searchFallback": false,
       "pages": [
         { "endpoint": "/posts/", "role": "video" },
-        { "endpoint": "/feed/update/", "role": "video" }
+        { "endpoint": "/feed/update/", "role": "video" },
+        { "endpoint": "/events/", "role": "video" }
       ]
     },
     {
@@ -321,28 +413,7 @@
       "label": "Snapchat",
       "role": "video",
       "searchFallback": false,
-      "pages": [
-        { "endpoint": "/spotlight/", "role": "video" },
-        { "endpoint": "/add/", "role": "video" }
-      ]
-    },
-    {
-      "hostname": "threads.net",
-      "aliases": ["threads.com"],
-      "label": "Threads",
-      "role": "video",
-      "searchFallback": false,
-      "pages": [{ "endpoint": "/@", "role": "video" }]
-    },
-    {
-      "hostname": "crunchyroll.com",
-      "label": "Crunchyroll",
-      "role": "video",
-      "searchFallback": false,
-      "pages": [
-        { "endpoint": "/watch/", "role": "video" },
-        { "endpoint": "/series/", "role": "video" }
-      ]
+      "pages": [{ "endpoint": "/spotlight/", "role": "video" }]
     }
   ]
 }

@@ -328,17 +328,44 @@ hostname        the site, plus aliases and a prefix for the ones that run a
                 domain per country like Amazon Music
 endpoint        the path that actually holds media, so a homepage or a
                 settings page is not offered as a download
+match           a path pattern, for the sites a segment cannot describe. A
+                SoundCloud track is just /{user}/{track} with nothing to mark
+                it, and a Vimeo video is a number
+deny            first segments that never hold media, checked before anything
+                else, since /you/library on SoundCloud has the shape of a
+                track without being one
 role            audio or video, per endpoint. A music video on a music
                 service is still fetched as video
 searchFallback  true where yt-dlp has no working extractor. The direct pull
                 still runs first, and only when it fails is a matching
                 recording searched for, before any error is shown
+ytdlp           false where we know the site and yt-dlp is not the answer.
+                No row is offered and the helper will not route there, so
+                whatever the network capture found is used instead. The note
+                on the entry says why
 ```
 
 An endpoint matches on segment boundaries rather than as a plain prefix, since
 most of these sites put something variable in front, as in `/{user}/status/{id}`
 or `/r/{sub}/comments/{id}`, and several put the language there too, as in
-`/us/album/` on Apple Music.
+`/us/album/` on Apple Music. Where two entries claim a host the more specific
+one answers, so YouTube Music is asked for audio rather than being caught by
+the YouTube entry and fetched as video.
+
+Every line of that file is checked against yt-dlp's own URL matching rather
+than assumed, and the tests fail if the two ever disagree, so a site cannot sit
+in the list claiming support that is not there. Three are listed as known and
+deliberately left to something else. Audiomack has an extractor whose metadata
+API still answers 404, and the page serves plain audio the capture picks up,
+which is the real file rather than a lookalike. Threads has no extractor at
+all and used to be routed at Meta's other domains, where it could only fail.
+Crunchyroll is recognised only so yt-dlp can say it is DRM protected, and the
+protected content notice already offers the recorder there.
+
+The other half of that check is that the row and the download agree. The
+registry decides whether a This page row appears, the helper decides which tool
+runs, and when those drifted apart you got a row that could not work. The
+registry now has the final say on both.
 
 Any page in that file gets a This page row, music services included, and it is
 there as soon as the page loads. Nothing has to be played or clicked first:

@@ -301,6 +301,217 @@ class SiteRegistry(unittest.TestCase):
         self.assertFalse(host._wants_yt_dlp_audio_extract({}, "https://music.apple.com/us/music-video/x/1"))
 
 
+# One real shaped URL per registry site. These are what the checks below run
+# against, so a site added to the registry has to bring one with it.
+SITE_SAMPLES = {
+    "youtu.be": "https://youtu.be/dQw4w9WgXcQ",
+    "youtube.com": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    "music.youtube.com": "https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+    "open.spotify.com": "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT",
+    "music.apple.com": "https://music.apple.com/us/song/x/6797549954",
+    "music.amazon.com": "https://music.amazon.com/albums/B08XYZ1234",
+    "tidal.com": "https://tidal.com/browse/track/12345678",
+    "deezer.com": "https://www.deezer.com/track/123456789",
+    "pandora.com": "https://www.pandora.com/artist/x/y/z",
+    "qobuz.com": "https://open.qobuz.com/album/abcdefghijklm",
+    "anghami.com": "https://play.anghami.com/song/12345678",
+    "boomplay.com": "https://www.boomplay.com/songs/12345678",
+    "napster.com": "https://us.napster.com/track/abc",
+    "soundcloud.com": "https://soundcloud.com/forss/flickermood",
+    "bandcamp.com": "https://artist.bandcamp.com/track/song-name",
+    "mixcloud.com": "https://www.mixcloud.com/dholbach/cryptkeeper/",
+    "audiomack.com": "https://audiomack.com/kizzdaniel/song/buga",
+    "threads.net": "https://www.threads.net/@user/post/ABC123",
+    "crunchyroll.com": "https://www.crunchyroll.com/watch/ABC123/title",
+    "instagram.com": "https://www.instagram.com/p/CxAbCdEfGhI/",
+    "tiktok.com": "https://www.tiktok.com/@user/video/7300000000000000000",
+    "x.com": "https://x.com/user/status/1700000000000000000",
+    "facebook.com": "https://www.facebook.com/watch/?v=123456789",
+    "reddit.com": "https://www.reddit.com/r/videos/comments/abc123/t/",
+    "twitch.tv": "https://www.twitch.tv/videos/123456789",
+    "vimeo.com": "https://vimeo.com/123456789",
+    "dailymotion.com": "https://www.dailymotion.com/video/x8abcde",
+    "bilibili.com": "https://www.bilibili.com/video/BV1xx411c7mD",
+    "rumble.com": "https://rumble.com/v6abcd-some-video.html",
+    "kick.com": "https://kick.com/chan/videos/12345678-1234-1234-1234-123456789abc",
+    "pinterest.com": "https://www.pinterest.com/pin/123456789012345678/",
+    "linkedin.com": "https://www.linkedin.com/posts/x_s-activity-7123456789012345678-Ab3x/",
+    "snapchat.com": "https://www.snapchat.com/spotlight/W7_ABCDEFG",
+}
+
+
+class EverySiteHasASample(unittest.TestCase):
+    def test_nothing_slipped_in_unchecked(self):
+        listed = {s["hostname"] for s in host._ytdlp_sites()}
+        self.assertEqual(listed - set(SITE_SAMPLES), set())
+
+
+class RegistryAndRoutingAgree(unittest.TestCase):
+    """
+    The registry decides whether a This page row is offered. The host rules
+    decide whether the download actually goes to yt-dlp. When those two drift
+    apart you get a row that cannot work, or a page yt-dlp handles with nothing
+    offered on it, which is how Kick and Threads went wrong.
+    """
+
+    def test_a_row_is_offered_exactly_where_the_download_will_use_ytdlp(self):
+        for site in host._ytdlp_sites():
+            url = SITE_SAMPLES[site["hostname"]]
+            offers = host._ytdlp_page_role(url) is not None
+            routes = bool(host._social_platform_for_yt_dlp(url, url, {}))
+            self.assertEqual(offers, routes, f"{site['hostname']} ({url})")
+
+
+class SitesWhereYtDlpIsNotTheTool(unittest.TestCase):
+    """
+    Some sites are known and still not yt-dlp's job. Offering a download that
+    can only fail is worse than offering nothing, so these get no row and are
+    never routed there either.
+    """
+
+    NOT_YTDLP = (
+        # Extractor exists but its metadata API 404s; the page serves plain
+        # audio the network capture picks up instead.
+        "https://audiomack.com/kizzdaniel/song/buga",
+        # No extractor at all. Meta's other domains used to route it here.
+        "https://www.threads.net/@user/post/ABC123",
+        # yt-dlp recognises it only to say it is DRM protected.
+        "https://www.crunchyroll.com/watch/ABC123/title",
+    )
+
+    def test_no_row_is_offered(self):
+        for url in self.NOT_YTDLP:
+            self.assertIsNone(host._ytdlp_page_role(url), url)
+            self.assertTrue(host._ytdlp_site_disabled(url), url)
+
+    def test_the_download_is_not_routed_there(self):
+        for url in self.NOT_YTDLP:
+            self.assertIsNone(host._social_platform_for_yt_dlp(url, url, {}), url)
+
+
+class PagesThatHoldNoTrack(unittest.TestCase):
+    """
+    A bare / endpoint matched a whole site, so the row turned up on library and
+    settings pages where there is nothing to download.
+    """
+
+    def test_browsing_and_settings_pages_offer_nothing(self):
+        for url in (
+            "https://soundcloud.com/discover",
+            "https://soundcloud.com/you/library",
+            "https://soundcloud.com/feed",
+            "https://soundcloud.com/",
+            "https://soundcloud.com/forss",
+            "https://soundcloud.com/forss/likes",
+            "https://soundcloud.com/forss/tracks",
+            "https://www.mixcloud.com/dholbach/uploads/",
+            "https://www.mixcloud.com/dholbach/",
+            "https://vimeo.com/settings",
+            "https://vimeo.com/upgrade",
+            "https://rumble.com/browse/live",
+            "https://rumble.com/videos",
+            "https://www.snapchat.com/add/someuser",
+            "https://www.linkedin.com/in/someone/",
+            "https://www.tiktok.com/@someuser",
+        ):
+            self.assertIsNone(host._ytdlp_page_role(url), url)
+
+    def test_the_real_pages_still_work(self):
+        for url in (
+            "https://soundcloud.com/forss/flickermood",
+            "https://soundcloud.com/forss/sets/soulhack",
+            "https://soundcloud.com/forss/likeable-track",
+            "https://www.mixcloud.com/dholbach/cryptkeeper/",
+            "https://vimeo.com/123456789",
+            "https://vimeo.com/channels/staffpicks/123456789",
+            "https://rumble.com/v6abcd-some-video.html",
+        ):
+            self.assertIsNotNone(host._ytdlp_page_role(url), url)
+
+
+class TheMostSpecificHostWins(unittest.TestCase):
+    """
+    music.youtube.com ends with youtube.com, so the YouTube entry answered for
+    it and asked for video on a service whose whole point is audio.
+    """
+
+    def test_youtube_music_is_audio(self):
+        found = host._ytdlp_page_role("https://music.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(found["label"], "YouTube Music")
+        self.assertEqual(found["role"], "audio")
+        self.assertTrue(
+            host._wants_yt_dlp_audio_extract({}, "https://music.youtube.com/watch?v=dQw4w9WgXcQ")
+        )
+
+    def test_youtube_itself_is_still_video(self):
+        found = host._ytdlp_page_role("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        self.assertEqual(found["role"], "video")
+
+    def test_a_short_link_is_recognised(self):
+        self.assertIsNotNone(host._ytdlp_page_role("https://youtu.be/dQw4w9WgXcQ"))
+
+
+class RegistryAgreesWithYtDlp(unittest.TestCase):
+    """
+    The list is only worth having if it matches what yt-dlp actually does, so
+    it is checked against yt-dlp's own URL matching rather than against memory.
+    Skipped where yt-dlp is not installed.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from yt_dlp.extractor import gen_extractor_classes
+        except ImportError:
+            raise unittest.SkipTest("yt-dlp is not installed")
+        cls.classes = [ie for ie in gen_extractor_classes() if ie.IE_NAME != "generic"]
+
+    @staticmethod
+    def _refuses(name):
+        # These match a URL only to report a better error, not to download it.
+        low = name.lower()
+        return name in ("DRM", "Piracy") or "truncated" in low or low.startswith("unsupported")
+
+    def _extractors(self, url):
+        real, refusing = [], []
+        for ie in self.classes:
+            try:
+                if not ie.suitable(url):
+                    continue
+            except Exception:
+                continue
+            (refusing if self._refuses(ie.IE_NAME) else real).append(ie.IE_NAME)
+        return real, refusing
+
+    def test_every_site_we_offer_is_one_yt_dlp_can_take(self):
+        for site in host._ytdlp_sites():
+            url = SITE_SAMPLES[site["hostname"]]
+            real, refusing = self._extractors(url)
+            if site.get("ytdlp") is False:
+                continue
+            if site.get("searchFallback"):
+                # No working extractor is the whole reason for the fallback.
+                continue
+            self.assertTrue(
+                real,
+                f"{site['hostname']}: offered as a yt-dlp page but yt-dlp has no "
+                f"extractor for {url} (only {refusing or 'nothing'})",
+            )
+
+    def test_the_fallback_flag_is_set_where_yt_dlp_cannot_help(self):
+        for site in host._ytdlp_sites():
+            if site.get("ytdlp") is False:
+                continue
+            url = SITE_SAMPLES[site["hostname"]]
+            real, _ = self._extractors(url)
+            if not real:
+                self.assertTrue(
+                    site.get("searchFallback"),
+                    f"{site['hostname']}: yt-dlp cannot take {url}, so it needs "
+                    f"searchFallback or ytdlp:false",
+                )
+
+
 class QualitySelectionUnchanged(unittest.TestCase):
     """The registry must not disturb how quality is chosen."""
 
