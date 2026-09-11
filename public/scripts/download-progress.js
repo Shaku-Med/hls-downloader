@@ -29,6 +29,8 @@
         --fill: rgba(120, 120, 128, 0.32);
         --shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
         --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
+        --dl-spring: cubic-bezier(0.32, 0.72, 0, 1);
+        --dl-spring-in: cubic-bezier(0.34, 1.25, 0.64, 1);
       }
       :host([data-theme="light"]) {
         --bg: #f2f2f7;
@@ -42,11 +44,70 @@
         --shadow: 0 12px 40px rgba(0, 0, 0, 0.16);
       }
       .bar-wrap {
-        position: fixed; left: 16px; right: 16px; bottom: 16px; z-index: 2147483646;
+        position: fixed; left: 16px; right: 16px; bottom: 16px; top: auto;
+        z-index: 2147483646;
         pointer-events: none; display: none;
         font-family: var(--font);
+        width: auto;
+        transform-origin: top left;
       }
-      .bar-wrap[data-open="1"] { display: block; }
+      .bar-wrap[data-open="1"],
+      .bar-wrap.is-leaving { display: block; }
+      .bar-wrap[data-morph="1"].is-appearing,
+      .bar-wrap[data-morph="1"].is-leaving {
+        transform-origin: center center;
+      }
+      .bar-wrap[data-morph="1"].is-appearing {
+        animation: dl-island-in 520ms var(--dl-spring-in) both;
+      }
+      .bar-wrap[data-morph="1"].is-leaving {
+        animation: dl-island-out 340ms var(--dl-spring) both;
+        pointer-events: none;
+      }
+      .bar-wrap.is-morphing {
+        will-change: transform, filter;
+        z-index: 2147483647;
+      }
+      .bar-wrap.is-morphing .card { overflow: hidden; }
+      .bar-wrap[data-morph="1"] .body,
+      .bar-wrap[data-morph="1"] .circle-face {
+        transition: opacity 260ms var(--dl-spring);
+      }
+      .bar-wrap.is-morphing .body,
+      .bar-wrap.is-morphing .circle-face { opacity: 0.18; }
+      @keyframes dl-island-in {
+        0% { opacity: 0; transform: scale(0.62); filter: blur(10px); }
+        62% { opacity: 1; filter: blur(0); }
+        100% { opacity: 1; transform: scale(1); filter: none; }
+      }
+      @keyframes dl-island-out {
+        0% { opacity: 1; transform: scale(1); filter: none; }
+        100% { opacity: 0; transform: scale(0.7); filter: blur(8px); }
+      }
+      .bar-wrap[data-placed="1"] {
+        left: var(--dl-left, 16px);
+        top: var(--dl-top, 16px);
+        right: auto;
+        bottom: auto;
+        width: max-content;
+        max-width: calc(100vw - 16px);
+      }
+      .bar-wrap[data-placed="1"][data-layout="bar"] .card {
+        width: min(420px, calc(100vw - 16px));
+        max-width: min(420px, calc(100vw - 16px));
+        margin: 0;
+      }
+      .bar-wrap[data-placed="1"][data-layout="pill"] .card {
+        width: min(360px, calc(100vw - 16px));
+        max-width: min(360px, calc(100vw - 16px));
+        margin: 0;
+      }
+      .bar-wrap[data-layout="circle"]:not([data-placed="1"]) {
+        left: 16px; right: auto; bottom: 16px; top: auto; width: auto;
+      }
+      .bar-wrap[data-layout="pill"]:not([data-placed="1"]) {
+        left: 16px; right: 16px; top: 16px; bottom: auto;
+      }
       .card {
         pointer-events: auto;
         max-width: 420px; margin: 0 auto;
@@ -55,10 +116,27 @@
         box-shadow: var(--shadow);
         backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
         padding: 12px 14px 14px;
+        cursor: grab;
+        touch-action: none;
+        user-select: none;
+        -webkit-user-select: none;
+        overflow: hidden;
       }
+      .bar-wrap[data-morph="1"] .card {
+        transition: border-radius 520ms var(--dl-spring), box-shadow 520ms var(--dl-spring);
+      }
+      .bar-wrap[data-morph="1"] .card.dragging { transition: none; }
+      .card.dragging { cursor: grabbing; }
+      .card button { cursor: pointer; touch-action: manipulation; }
       .top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
       .title { font-size: 13px; font-weight: 700; letter-spacing: -0.01em; color: var(--text); }
       .sub { font-size: 11px; color: var(--muted); margin-top: 3px; line-height: 1.35; word-break: break-word; }
+      .top-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+      .cancel {
+        flex: 0 0 auto; border: 0; background: transparent; color: #ff453a;
+        font: 650 12px/1 var(--font); cursor: pointer; padding: 4px 2px;
+      }
+      .cancel[hidden] { display: none; }
       .x {
         flex: 0 0 auto; border: 0; background: transparent; color: var(--muted);
         font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px;
@@ -108,25 +186,85 @@
         transition: width 220ms ease;
       }
       .row-fill.indeterminate { width: 38% !important; animation: slide 1.1s ease-in-out infinite; }
+      .circle-face { display: none; position: relative; width: 72px; height: 72px; place-items: center; }
+      .circle-ring {
+        position: absolute; inset: 0;
+        border-radius: 50%;
+        background: conic-gradient(var(--accent) calc(var(--pct, 0) * 1%), var(--fill) 0);
+      }
+      .circle-ring::after {
+        content: "";
+        position: absolute; inset: 7px;
+        border-radius: 50%;
+        background: color-mix(in srgb, var(--surface) 96%, transparent);
+      }
+      .circle-ring.indeterminate {
+        background: conic-gradient(var(--accent) 28%, var(--fill) 0);
+        animation: spin 1.1s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .circle-pct {
+        position: relative; z-index: 1;
+        font-size: 13px; font-weight: 750; letter-spacing: -0.03em;
+        font-variant-numeric: tabular-nums; color: var(--text);
+      }
+      .circle-count {
+        display: none; position: absolute; top: -2px; right: -2px; z-index: 2;
+        min-width: 18px; height: 18px; padding: 0 5px;
+        border-radius: 980px; background: var(--accent); color: #fff;
+        font: 700 10px/18px var(--font); text-align: center;
+      }
+      .circle-count[data-on="1"] { display: block; }
+      .bar-wrap[data-layout="circle"]:not([data-expanded="1"]) .body { display: none; }
+      .bar-wrap[data-layout="circle"]:not([data-expanded="1"]) .circle-face { display: grid; }
+      .bar-wrap[data-layout="circle"]:not([data-expanded="1"]) .card {
+        width: 72px; height: 72px; max-width: 72px; padding: 0; margin: 0;
+        border-radius: 50%; display: grid; place-items: center;
+      }
+      .bar-wrap[data-layout="circle"][data-expanded="1"] .card {
+        width: min(360px, 92vw); max-width: 360px;
+      }
+      .bar-wrap[data-layout="pill"] .card {
+        max-width: min(380px, 92vw);
+        border-radius: 980px;
+        padding: 8px 12px 10px;
+      }
+      .bar-wrap[data-layout="pill"]:not([data-expanded="1"]) .sub,
+      .bar-wrap[data-layout="pill"]:not([data-expanded="1"]) .more,
+      .bar-wrap[data-layout="pill"]:not([data-expanded="1"]) .list { display: none; }
+      .bar-wrap[data-layout="pill"] .track { height: 4px; }
+      .bar-wrap[data-layout="pill"] .title { font-size: 12px; }
+      .bar-wrap[data-layout="pill"] .meta { margin-top: 4px; }
     </style>
-    <div class="bar-wrap" part="wrap">
+    <div class="bar-wrap" part="wrap" data-layout="bar" data-morph="1">
       <div class="card">
-        <div class="top">
-          <div>
-            <div class="title"></div>
-            <div class="sub"></div>
-          </div>
-          <button type="button" class="x" aria-label="Hide">×</button>
+        <div class="circle-face" aria-hidden="true">
+          <div class="circle-ring"></div>
+          <div class="circle-pct">0%</div>
+          <div class="circle-count">1</div>
         </div>
-        <div class="track"><div class="fill"></div></div>
-        <div class="meta"></div>
-        <button type="button" class="more" hidden></button>
-        <div class="list"></div>
+        <div class="body">
+          <div class="top">
+            <div>
+              <div class="title"></div>
+              <div class="sub"></div>
+            </div>
+            <div class="top-actions">
+              <button type="button" class="cancel" hidden>Cancel</button>
+              <button type="button" class="x" aria-label="Hide">×</button>
+            </div>
+          </div>
+          <div class="track"><div class="fill"></div></div>
+          <div class="meta"></div>
+          <button type="button" class="more" hidden></button>
+          <div class="list"></div>
+        </div>
       </div>
     </div>
   `;
 
   const wrap = shadow.querySelector('.bar-wrap');
+  const card = shadow.querySelector('.card');
   const titleEl = shadow.querySelector('.title');
   const subEl = shadow.querySelector('.sub');
   const fillEl = shadow.querySelector('.fill');
@@ -134,6 +272,30 @@
   const moreBtn = shadow.querySelector('.more');
   const listEl = shadow.querySelector('.list');
   const closeBtn = shadow.querySelector('.x');
+  const cancelBtn = shadow.querySelector('.cancel');
+  const circleRing = shadow.querySelector('.circle-ring');
+  const circlePct = shadow.querySelector('.circle-pct');
+  const circleCount = shadow.querySelector('.circle-count');
+
+  const LAYOUT_KEY = 'dlProgressLayout';
+  const POS_KEY = 'dlProgressPos';
+  const MORPH_KEY = (window.HGR_THEME && window.HGR_THEME.MORPH_KEY) || 'uiMorphMotion';
+  const MORPH_KEY_LEGACY = (window.HGR_THEME && window.HGR_THEME.MORPH_KEY_LEGACY) || 'dlProgressMorph';
+  const LAYOUTS = ['bar', 'circle', 'pill'];
+  const EDGE = 8;
+  const MOVE_TOLERANCE = 6;
+  const SPRING = 'cubic-bezier(0.32, 0.72, 0, 1)';
+  const MORPH_MS = 540;
+  let layout = 'bar';
+  let morphOn = true;
+  let morphTimer = 0;
+  let leaveTimer = 0;
+  /** @type {{ bar?: {left:number, top:number}, circle?: {left:number, top:number}, pill?: {left:number, top:number} }} */
+  let savedPos = {};
+  let expanded = false;
+  /** @type {null | { pid: number, ox: number, oy: number, startX: number, startY: number, moved: number }} */
+  let drag = null;
+  let suppressClickUntil = 0;
 
   let unbindProgressTheme = null;
   try {
@@ -149,15 +311,308 @@
   /** @type {HTMLElement[]} */
   let highlighted = [];
   let hideTimer = 0;
+  let timeTimer = 0;
   let dismissed = false;
+  /** Jobs the user hid or canceled — do not bring the card back on leftover ticks. */
+  const dismissedIds = new Set();
   /** @type {Map<string, string>} jobId -> mediaId for all active downloads */
   const activeByJob = new Map();
+
+  function formatJobTime(job) {
+    if (window.HGR_THEME && typeof window.HGR_THEME.formatJobTime === 'function') {
+      return window.HGR_THEME.formatJobTime(job);
+    }
+    return '';
+  }
+
+  function stopTimeTick() {
+    if (timeTimer) {
+      clearInterval(timeTimer);
+      timeTimer = 0;
+    }
+  }
+
+  function startTimeTick() {
+    if (timeTimer) return;
+    timeTimer = setInterval(() => {
+      if (!jobProgress.size || wrap.getAttribute('data-open') !== '1') {
+        stopTimeTick();
+        return;
+      }
+      const first = [...jobProgress.values()][0];
+      const clock = formatJobTime(first);
+      if (jobProgress.size === 1) {
+        const base = metaEl.dataset.base || '';
+        metaEl.textContent = [base, clock].filter(Boolean).join(' · ');
+      }
+    }, 1000);
+  }
 
   function mount() {
     if (!document.documentElement.contains(host)) {
       document.documentElement.appendChild(host);
     }
     ensureHighlightStyle();
+  }
+
+  function vw() {
+    return window.visualViewport ? window.visualViewport.width : window.innerWidth;
+  }
+  function vh() {
+    return window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  }
+  function vx() {
+    return window.visualViewport ? window.visualViewport.offsetLeft : 0;
+  }
+  function vy() {
+    return window.visualViewport ? window.visualViewport.offsetTop : 0;
+  }
+
+  function cardSize() {
+    const r = card.getBoundingClientRect();
+    return {
+      w: Math.max(r.width || 0, layout === 'circle' && !expanded ? 72 : 160),
+      h: Math.max(r.height || 0, layout === 'circle' && !expanded ? 72 : 48),
+    };
+  }
+
+  function clampPos(left, top) {
+    const { w, h } = cardSize();
+    const minL = vx() + EDGE;
+    const minT = vy() + EDGE;
+    const maxL = vx() + vw() - w - EDGE;
+    const maxT = vy() + vh() - h - EDGE;
+    return {
+      left: Math.round(Math.min(Math.max(minL, left), Math.max(minL, maxL))),
+      top: Math.round(Math.min(Math.max(minT, top), Math.max(minT, maxT))),
+    };
+  }
+
+  function placeAt(left, top, persist) {
+    const p = clampPos(left, top);
+    wrap.style.setProperty('--dl-left', `${p.left}px`);
+    wrap.style.setProperty('--dl-top', `${p.top}px`);
+    wrap.setAttribute('data-placed', '1');
+    if (persist) {
+      savedPos = { ...savedPos, [layout]: { left: p.left, top: p.top } };
+      try {
+        chrome.storage.local.set({ [POS_KEY]: savedPos });
+      } catch (_) {
+        // ignore
+      }
+    }
+    return p;
+  }
+
+  function applySavedPlace() {
+    const p = savedPos[layout];
+    if (p && Number.isFinite(p.left) && Number.isFinite(p.top)) {
+      placeAt(p.left, p.top, false);
+      return;
+    }
+    wrap.removeAttribute('data-placed');
+    wrap.style.removeProperty('--dl-left');
+    wrap.style.removeProperty('--dl-top');
+  }
+
+  function reclampPlaced() {
+    if (wrap.getAttribute('data-placed') !== '1') return;
+    const r = card.getBoundingClientRect();
+    if (!r.width && !r.height) return;
+    placeAt(r.left, r.top, false);
+  }
+
+  function setMorphEnabled(on) {
+    morphOn = on !== false;
+    wrap.setAttribute('data-morph', morphOn ? '1' : '0');
+    if (!morphOn) {
+      wrap.classList.remove('is-appearing', 'is-leaving', 'is-morphing');
+      wrap.style.transition = '';
+      wrap.style.transform = '';
+      wrap.style.filter = '';
+    }
+  }
+
+  function morphEnabled() {
+    return (
+      morphOn &&
+      wrap.getAttribute('data-open') === '1' &&
+      !wrap.classList.contains('is-leaving') &&
+      !wrap.classList.contains('is-appearing') &&
+      !drag
+    );
+  }
+
+  function clearMorphStyles() {
+    wrap.classList.remove('is-morphing');
+    wrap.style.transition = '';
+    wrap.style.transform = '';
+    wrap.style.filter = '';
+    wrap.style.transformOrigin = '';
+  }
+
+  function runMorph(mutate) {
+    if (!morphEnabled()) {
+      mutate();
+      return;
+    }
+    const first = wrap.getBoundingClientRect();
+    if (!first.width || !first.height) {
+      mutate();
+      return;
+    }
+    if (morphTimer) {
+      clearTimeout(morphTimer);
+      morphTimer = 0;
+    }
+    wrap.classList.add('is-morphing');
+    mutate();
+    const last = wrap.getBoundingClientRect();
+    if (!last.width || !last.height) {
+      clearMorphStyles();
+      return;
+    }
+    const dx = first.left - last.left;
+    const dy = first.top - last.top;
+    const sx = first.width / last.width;
+    const sy = first.height / last.height;
+    if (Math.abs(dx) < 1 && Math.abs(dy) < 1 && Math.abs(sx - 1) < 0.02 && Math.abs(sy - 1) < 0.02) {
+      clearMorphStyles();
+      return;
+    }
+    wrap.style.transition = 'none';
+    wrap.style.transformOrigin = 'top left';
+    wrap.style.transform = `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`;
+    wrap.style.filter = 'blur(6px)';
+    void wrap.offsetWidth;
+    wrap.style.transition = `transform ${MORPH_MS}ms ${SPRING}, filter 380ms ${SPRING}`;
+    wrap.style.transform = 'none';
+    wrap.style.filter = 'none';
+    morphTimer = setTimeout(() => {
+      morphTimer = 0;
+      clearMorphStyles();
+    }, MORPH_MS + 40);
+  }
+
+  function setChipOpen(open) {
+    const isOpen = wrap.getAttribute('data-open') === '1';
+    if (open) {
+      if (leaveTimer) {
+        clearTimeout(leaveTimer);
+        leaveTimer = 0;
+      }
+      wrap.classList.remove('is-leaving');
+      if (isOpen) return;
+      wrap.setAttribute('data-open', '1');
+      if (!morphOn) return;
+      wrap.classList.remove('is-appearing');
+      void wrap.offsetWidth;
+      wrap.classList.add('is-appearing');
+      const done = () => wrap.classList.remove('is-appearing');
+      wrap.addEventListener(
+        'animationend',
+        (ev) => {
+          if (ev.animationName === 'dl-island-in') done();
+        },
+        { once: true }
+      );
+      setTimeout(done, 560);
+      return;
+    }
+    if (!isOpen && !wrap.classList.contains('is-leaving')) return;
+    wrap.classList.remove('is-appearing');
+    if (!morphOn) {
+      wrap.classList.remove('is-leaving');
+      wrap.setAttribute('data-open', '0');
+      return;
+    }
+    wrap.classList.add('is-leaving');
+    if (leaveTimer) clearTimeout(leaveTimer);
+    leaveTimer = setTimeout(() => {
+      leaveTimer = 0;
+      wrap.classList.remove('is-leaving');
+      wrap.setAttribute('data-open', '0');
+    }, 360);
+  }
+
+  function setExpanded(on) {
+    const next = !!on;
+    const mutate = () => {
+      expanded = next;
+      if (expanded) wrap.setAttribute('data-expanded', '1');
+      else wrap.removeAttribute('data-expanded');
+      reclampPlaced();
+    };
+    if (expanded === next) return;
+    runMorph(mutate);
+  }
+
+  function applyLayout(next, opts) {
+    const id = LAYOUTS.includes(next) ? next : 'bar';
+    const mutate = () => {
+      layout = id;
+      wrap.setAttribute('data-layout', id);
+      if (id === 'bar') {
+        expanded = false;
+        wrap.removeAttribute('data-expanded');
+      }
+      applySavedPlace();
+      reclampPlaced();
+    };
+    if (opts && opts.instant) {
+      mutate();
+      return;
+    }
+    runMorph(mutate);
+  }
+
+  function updateCircleFace(job) {
+    if (!circleRing || !circlePct) return;
+    const many = jobProgress.size > 1;
+    const pct = job && job.percent != null ? Number(job.percent) : NaN;
+    let shown = pct;
+    if (many) {
+      const known = [...jobProgress.values()]
+        .map((p) => Number(p.percent))
+        .filter((n) => Number.isFinite(n));
+      shown = known.length ? known.reduce((a, b) => a + b, 0) / known.length : NaN;
+    }
+    if (Number.isFinite(shown)) {
+      circleRing.classList.remove('indeterminate');
+      wrap.style.setProperty('--pct', String(Math.max(0, Math.min(100, shown))));
+      circlePct.textContent = `${Math.round(shown)}%`;
+    } else {
+      circleRing.classList.add('indeterminate');
+      wrap.style.setProperty('--pct', '28');
+      circlePct.textContent = many ? String(jobProgress.size) : '…';
+    }
+    if (circleCount) {
+      const n = Math.max(jobProgress.size, activeByJob.size);
+      circleCount.textContent = String(n);
+      circleCount.setAttribute('data-on', n > 1 ? '1' : '0');
+    }
+  }
+
+  function loadLayoutPrefs() {
+    try {
+      chrome.storage.local.get([LAYOUT_KEY, POS_KEY, MORPH_KEY, MORPH_KEY_LEGACY], (data) => {
+        if (chrome.runtime.lastError) return;
+        savedPos = data && data[POS_KEY] && typeof data[POS_KEY] === 'object' ? data[POS_KEY] : {};
+        const morph =
+          data && data[MORPH_KEY] != null
+            ? data[MORPH_KEY] !== false
+            : !data || data[MORPH_KEY_LEGACY] !== false;
+        setMorphEnabled(morph);
+        applyLayout((data && data[LAYOUT_KEY]) || 'bar', { instant: true });
+      });
+    } catch (_) {
+      setMorphEnabled(true);
+      applyLayout('bar', { instant: true });
+    }
+  }
+
+  function isDragIgnoreTarget(el) {
+    return !!(el && el.closest && el.closest('button, a, input, textarea, select'));
   }
 
   function ensureHighlightStyle() {
@@ -424,8 +879,11 @@
   }
 
   moreBtn.addEventListener('click', () => {
-    listOpen = !listOpen;
-    renderJobList();
+    runMorph(() => {
+      listOpen = !listOpen;
+      renderJobList();
+      reclampPlaced();
+    });
   });
 
   function showProgress(job) {
@@ -435,15 +893,17 @@
     const jobId = String(job.id || '');
     const active = ['queued', 'connecting', 'downloading'].includes(status);
     const needle = needleForJob(job);
+    if (cancelBtn) cancelBtn.hidden = !active && !jobProgress.size;
 
     if (!active) {
       if (jobId) {
         activeByJob.delete(jobId);
         jobProgress.delete(jobId);
+        dismissedIds.add(jobId);
       }
       renderJobList();
       highlightActiveJobs();
-      wrap.setAttribute('data-open', '1');
+      setChipOpen(true);
       titleEl.textContent = job.label || 'Download';
       subEl.textContent =
         status === 'completed'
@@ -453,13 +913,22 @@
             : job.error || status || 'Done';
       fillEl.classList.remove('indeterminate');
       fillEl.style.width = status === 'completed' ? '100%' : fillEl.style.width || '0%';
+      const clock = formatJobTime(job);
+      metaEl.dataset.base = '';
       metaEl.textContent = activeByJob.size
         ? `${activeByJob.size} still downloading`
-        : '';
+        : clock;
+      if (cancelBtn) cancelBtn.hidden = activeByJob.size === 0;
+      updateCircleFace(job);
       if (hideTimer) clearTimeout(hideTimer);
+      const hideMs = status === 'canceled' ? 700 : 2800;
       hideTimer = setTimeout(() => {
-        if (!activeByJob.size) wrap.setAttribute('data-open', '0');
-      }, 2800);
+        if (!activeByJob.size) {
+          setChipOpen(false);
+          stopTimeTick();
+        }
+      }, hideMs);
+      if (!activeByJob.size) stopTimeTick();
       return;
     }
 
@@ -470,6 +939,9 @@
         label: job.label || 'Download',
         percent: job.percent,
         detail: job.detail || '',
+        startedAt: job.startedAt,
+        playlistIndex: job.playlistIndex,
+        playlistCount: job.playlistCount,
       });
     }
 
@@ -477,10 +949,12 @@
       clearTimeout(hideTimer);
       hideTimer = 0;
     }
-    wrap.setAttribute('data-open', '1');
+    setChipOpen(true);
     titleEl.textContent = job.label || 'Downloading';
+    if (cancelBtn) cancelBtn.hidden = false;
 
     const many = jobProgress.size > 1;
+    const clock = formatJobTime(job);
 
     if (many) {
       // One bar cannot stand for several downloads, and showing whichever
@@ -493,12 +967,13 @@
         const avg = known.reduce((a, b) => a + b, 0) / known.length;
         fillEl.classList.remove('indeterminate');
         fillEl.style.width = `${Math.max(0, Math.min(100, avg))}%`;
-        metaEl.textContent = `${avg.toFixed(0)}% overall`;
+        metaEl.dataset.base = `${avg.toFixed(0)}% overall`;
       } else {
         fillEl.classList.add('indeterminate');
         fillEl.style.width = '40%';
-        metaEl.textContent = `${known.length} of ${all.length} reporting progress`;
+        metaEl.dataset.base = `${known.length} of ${all.length} reporting progress`;
       }
+      metaEl.textContent = [metaEl.dataset.base, clock].filter(Boolean).join(' · ');
     } else {
       const bits = [];
       if (job.playlistIndex != null && job.playlistCount != null) {
@@ -511,27 +986,159 @@
       if (Number.isFinite(pct)) {
         fillEl.classList.remove('indeterminate');
         fillEl.style.width = `${Math.max(0, Math.min(100, pct))}%`;
-        metaEl.textContent = `${pct.toFixed(pct >= 10 ? 0 : 1)}%${job.detail ? ` · ${job.detail}` : ''}`;
+        metaEl.dataset.base = `${pct.toFixed(pct >= 10 ? 0 : 1)}%${job.detail ? ` · ${job.detail}` : ''}`;
       } else {
         fillEl.classList.add('indeterminate');
         fillEl.style.width = '40%';
-        metaEl.textContent = job.detail || 'Starting…';
+        metaEl.dataset.base = job.detail || 'Starting…';
       }
+      metaEl.textContent = [metaEl.dataset.base, clock].filter(Boolean).join(' · ');
     }
 
+    startTimeTick();
     renderJobList();
     highlightActiveJobs();
+    updateCircleFace(job);
+    requestAnimationFrame(reclampPlaced);
   }
 
   closeBtn.addEventListener('click', () => {
     dismissed = true;
-    wrap.setAttribute('data-open', '0');
+    for (const id of jobProgress.keys()) dismissedIds.add(id);
+    setChipOpen(false);
+    stopTimeTick();
     clearHighlights();
   });
 
+  if (cancelBtn) {
+    cancelBtn.addEventListener('click', () => {
+      const entries = [...jobProgress.entries()];
+      for (const [id, p] of entries) {
+        dismissedIds.add(id);
+        try {
+          chrome.runtime.sendMessage({ type: 'CANCEL_DOWNLOAD', jobId: id });
+        } catch (_) {
+          // ignore
+        }
+        showProgress({
+          id,
+          status: 'canceled',
+          label: (p && p.label) || titleEl.textContent,
+          startedAt: p && p.startedAt,
+        });
+      }
+    });
+  }
+
+  card.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0) return;
+    if (isDragIgnoreTarget(e.target)) return;
+    try {
+      card.setPointerCapture(e.pointerId);
+    } catch (_) {
+      // Firefox / hostile pages may reject capture
+    }
+    const r = card.getBoundingClientRect();
+    drag = {
+      pid: e.pointerId,
+      ox: e.clientX - r.left,
+      oy: e.clientY - r.top,
+      startX: e.clientX,
+      startY: e.clientY,
+      moved: 0,
+    };
+    card.classList.add('dragging');
+  });
+
+  card.addEventListener('pointermove', (e) => {
+    if (!drag || e.pointerId !== drag.pid) return;
+    const dist = Math.hypot(e.clientX - drag.startX, e.clientY - drag.startY);
+    drag.moved = Math.max(drag.moved, dist);
+    if (dist < MOVE_TOLERANCE) return;
+    placeAt(e.clientX - drag.ox, e.clientY - drag.oy, false);
+  });
+
+  function endDrag(e) {
+    if (!drag || (e && e.pointerId != null && e.pointerId !== drag.pid)) return;
+    const moved = drag.moved;
+    if (e && e.pointerId != null) {
+      try {
+        card.releasePointerCapture(e.pointerId);
+      } catch (_) {
+        // ignore
+      }
+    }
+    card.classList.remove('dragging');
+    const r = card.getBoundingClientRect();
+    drag = null;
+    if (moved >= MOVE_TOLERANCE) {
+      suppressClickUntil = Date.now() + 400;
+      placeAt(r.left, r.top, true);
+    }
+  }
+
+  card.addEventListener('pointerup', endDrag);
+  card.addEventListener('pointercancel', endDrag);
+
+  card.addEventListener('click', (e) => {
+    if (Date.now() < suppressClickUntil) {
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (isDragIgnoreTarget(e.target)) return;
+    if (layout === 'circle' || layout === 'pill') {
+      setExpanded(!expanded);
+    }
+  });
+
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local') return;
+      if (changes[POS_KEY] && changes[POS_KEY].newValue && typeof changes[POS_KEY].newValue === 'object') {
+        savedPos = changes[POS_KEY].newValue;
+      }
+      if (changes[MORPH_KEY] || changes[MORPH_KEY_LEGACY]) {
+        const next = changes[MORPH_KEY]
+          ? changes[MORPH_KEY].newValue !== false
+          : changes[MORPH_KEY_LEGACY].newValue !== false;
+        setMorphEnabled(next);
+      }
+      if (changes[LAYOUT_KEY]) {
+        applyLayout(changes[LAYOUT_KEY].newValue || 'bar');
+      } else if (changes[POS_KEY]) {
+        applySavedPlace();
+      }
+    });
+  } catch (_) {
+    // ignore
+  }
+
+  window.addEventListener('resize', () => requestAnimationFrame(reclampPlaced), { passive: true });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => requestAnimationFrame(reclampPlaced), {
+      passive: true,
+    });
+    window.visualViewport.addEventListener('scroll', () => requestAnimationFrame(reclampPlaced), {
+      passive: true,
+    });
+  }
+
+  loadLayoutPrefs();
+
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || msg.type !== 'JOB_DOWNLOAD_PROGRESS') return;
+    const job = msg.job || {};
+    const id = String(job.id || '');
+    const status = String(job.status || '');
+    if (id && dismissedIds.has(id)) {
+      if (['queued', 'connecting', 'downloading'].includes(status)) return;
+      if (wrap.getAttribute('data-open') !== '1') return;
+    }
+    if (id && ['canceled', 'completed', 'error'].includes(status)) {
+      dismissedIds.add(id);
+    }
     dismissed = false;
-    showProgress(msg.job || {});
+    showProgress(job);
   });
 })();

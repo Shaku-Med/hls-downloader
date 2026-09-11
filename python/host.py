@@ -19,8 +19,10 @@ import tempfile
 import shutil
 import glob
 import base64
+import binascii
 import urllib.error
 import urllib.request
+import ssl
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 from typing import Optional, Set, Any, Dict, List, Tuple
 
@@ -38,6 +40,8 @@ _PROC_LOCK = threading.Lock()
 _active_ffmpeg: Optional[subprocess.Popen] = None
 _CANCEL_EVENT = threading.Event()
 _CURRENT_JOB_ID = ""
+# When set, every GET for this job uses the extension's fetch (works on every OS).
+_CURRENT_BROWSER_HTTP = False
 # Per-job: output path, last known media time (sec) from ffmpeg progress, last message
 _JOB_LIVE: Dict[str, Dict[str, Any]] = {}
 # When we kill ffmpeg to resume with fresh auth, skip the normal done/error for that run
@@ -47,6 +51,8 @@ _REFRESH_LOCK = threading.Lock()
 _HLS_CONT_ACTIVE_JID: Optional[str] = None
 # Each auth-refresh / bump; newer refresh supersedes older _handle() runs
 _HLS_REFRESH_SEQ: Dict[str, int] = {}
+_HTTP_GET_LOCK = threading.Lock()
+_HTTP_GET_PENDING: Dict[str, Dict[str, Any]] = {}
 
 
 def _bump_hls_refresh_seq(jid: str) -> int:
@@ -144,6 +150,121 @@ def build_ffmpeg_header_block(message, stream_url):
     return "".join(parts)
 
 
+_URI_ATTR_RE = re.compile(r'(URI\s*=\s*")([^"]+)(")', re.I)
+
+
+def _rewrite_m3u8_absolute(text: str, playlist_url: str) -> str:
+    """Turn relative segment / key / map URIs into absolute http(s) URLs."""
+    out: List[str] = []
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            out.append(line)
+            continue
+        if stripped.startswith("#"):
+            def _abs_uri(m: re.Match) -> str:
+                return m.group(1) + urljoin(playlist_url, m.group(2)) + m.group(3)
+
+            out.append(_URI_ATTR_RE.sub(_abs_uri, line))
+            continue
+        out.append(urljoin(playlist_url, stripped))
+    return "\n".join(out) + "\n"
+
+
+def _write_local_hls_playlist(text: str, playlist_url: str) -> str:
+    rewritten = _rewrite_m3u8_absolute(text, playlist_url)
+    fd, path = tempfile.mkstemp(prefix="sg_hls_", suffix=".m3u8")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(rewritten)
+    return path
+
+
+def _ffmpeg_file_input(path: str) -> str:
+    """Local playlist path ffmpeg will open (never the signed CDN URL)."""
+    abs_path = os.path.abspath(path)
+    if os.name == "nt":
+        abs_path = abs_path.replace("\\", "/")
+    return "file:" + abs_path
+
+
+def _hls_playlist_from_message(
+    message: dict, url: str, header_block: str
+) -> Tuple[str, str]:
+    """
+    Prefer the playlist the extension grabbed when the page first requested it.
+    Fall back to fetching now. Follows master -> highest-bandwidth variant.
+    """
+    cached = (message.get("playlistText") or "").strip() if message else ""
+    cached_url = (
+        ((message.get("playlistUrl") or "") if message else "").strip() or url or ""
+    )
+    one_shot = bool((message or {}).get("oneShotHls")) or _hls_url_looks_one_shot(
+        url
+    ) or _hls_url_looks_one_shot(cached_url)
+    if cached and "#EXTM3U" in cached.upper():
+        cur_url, text = cached_url, cached
+        guard = 0
+        while _is_master_playlist(text) and guard < 8:
+            guard += 1
+            var = _select_highest_bandwidth_variant_uri(text, _m3u8_base_url(cur_url))
+            if not var or var == cur_url:
+                break
+            if one_shot:
+                # Do not spend another signed GET; ffmpeg can follow a local master.
+                text = _rewrite_m3u8_absolute(text, cur_url)
+                break
+            try:
+                text = _http_get_text(var, header_block, timeout=45.0)
+                cur_url = var
+            except (urllib.error.URLError, OSError, ValueError, UnicodeError):
+                text = _rewrite_m3u8_absolute(text, cur_url)
+                break
+        return cur_url, text
+    return _resolve_variant_playlist_url(url, header_block)
+
+
+def _format_playlist_fetch_error(exc: BaseException) -> str:
+    t = str(exc)
+    if "extension fetch timed out" in t.lower() or "extension fetch" in t.lower():
+        return (
+            "Could not open the playlist through the browser. "
+            "Reload Stuff Grabber on chrome://extensions, refresh the lesson, "
+            "play the video, then download."
+        )
+    if isinstance(exc, urllib.error.HTTPError):
+        return (
+            f"Could not open the playlist (HTTP {exc.code} {exc.reason}). "
+            "Reload the lesson, wait until the video is playing, then download."
+        )
+    if _http_error_looks_like_ssl(exc):
+        return (
+            "This CDN will not talk TLS to the helper. "
+            "Reload Stuff Grabber, play the video, then download so Chrome can fetch it."
+        )
+    return (
+        f"Could not open the playlist: {exc}. "
+        "Reload the lesson, wait until the video is playing, then download."
+    )
+
+
+def _ffmpeg_looks_like_network_fail(err: str) -> bool:
+    t = (err or "").lower()
+    needles = (
+        "i/o error",
+        "input/output error",
+        "error opening input",
+        "server returned 403",
+        "server returned 401",
+        "server returned 404",
+        "http error 403",
+        "forbidden",
+        "access denied",
+        "connection reset",
+        "connection refused",
+    )
+    return any(n in t for n in needles)
+
+
 def read_message():
     raw_length = sys.stdin.buffer.read(4)
     if not raw_length or len(raw_length) < 4:
@@ -161,6 +282,82 @@ def send_message(data):
         sys.stdout.buffer.write(struct.pack("=I", len(encoded)))
         sys.stdout.buffer.write(encoded)
         sys.stdout.buffer.flush()
+
+
+def _http_get_result_from_ext(message: dict) -> None:
+    rid = str((message or {}).get("requestId") or "")
+    if not rid:
+        return
+    with _HTTP_GET_LOCK:
+        rec = _HTTP_GET_PENDING.get(rid)
+    if not rec:
+        return
+    box = rec["box"]
+    if message.get("ok") is False:
+        box["error"] = str(message.get("error") or "extension fetch failed")
+        rec["ev"].set()
+        return
+    try:
+        chunk = int(message.get("chunk") or 0)
+        total = int(message.get("total") or 1)
+        raw = base64.b64decode(message.get("data") or "", validate=False)
+    except (TypeError, ValueError, binascii.Error) as e:
+        box["error"] = str(e)
+        rec["ev"].set()
+        return
+    box["chunks"][chunk] = raw
+    box["total"] = max(1, total)
+    if len(box["chunks"]) >= box["total"]:
+        box["ok"] = True
+        rec["ev"].set()
+
+
+def _http_get_bytes_extension(
+    url: str,
+    headers: Dict[str, str],
+    *,
+    timeout: float,
+    max_bytes: Optional[int],
+    byte_range: Optional[Tuple[int, int]],
+    job_id: str,
+) -> bytes:
+    """Ask the extension to GET the URL with Chrome's TLS (this CDN rejects Python/curl)."""
+    rid = hashlib.sha1(
+        f"{job_id}:{url}:{time.time_ns()}".encode("utf-8", errors="replace")
+    ).hexdigest()[:16]
+    ev = threading.Event()
+    box: Dict[str, Any] = {"chunks": {}, "total": 1, "ok": False, "error": None}
+    with _HTTP_GET_LOCK:
+        _HTTP_GET_PENDING[rid] = {"ev": ev, "box": box}
+    try:
+        send_message(
+            {
+                "type": "http_get",
+                "requestId": rid,
+                "jobId": job_id,
+                "url": url,
+                "headers": headers,
+                "byteRange": list(byte_range) if byte_range else None,
+            }
+        )
+        if not ev.wait(timeout=max(timeout, 30.0)):
+            raise urllib.error.URLError("extension fetch timed out")
+        if box.get("error"):
+            raise urllib.error.URLError(str(box["error"]))
+        if not box.get("ok"):
+            raise urllib.error.URLError("extension fetch failed")
+        parts = [box["chunks"][i] for i in range(int(box["total"]))]
+        data = b"".join(parts)
+        if max_bytes is not None and byte_range is None and len(data) > max_bytes:
+            data = data[:max_bytes]
+        if byte_range is not None:
+            _rs, ln = byte_range
+            if len(data) > ln:
+                data = data[:ln]
+        return data
+    finally:
+        with _HTTP_GET_LOCK:
+            _HTTP_GET_PENDING.pop(rid, None)
 
 
 def with_job_id(data, job_id):
@@ -355,11 +552,14 @@ def _is_hls_input(url: str, message) -> bool:
     u = (url or "").lower()
     if ".m3u8" in u or u.endswith(".m3u") or re.search(r"\.m3u8[?#]", u):
         return True
-    # CDN playlists disguised as .txt / .php / .asp / … (still contain #EXTM3U)
-    if re.search(r"\.(?:txt|php|asp|aspx|ashx|jsp)(?:[?#]|$)", u) and (
+    # CDN playlists disguised as .txt / .php / .html / .json / … (still contain #EXTM3U)
+    if re.search(r"\.(?:txt|php|asp|aspx|ashx|jsp|html|json|js)(?:[?#]|$)", u) and (
         "index-" in u
         or "playlist" in u
+        or "manifest" in u
+        or "master" in u
         or "/hls/" in u
+        or "/pl/" in u
         or "/pts" in u
         or "/v4/" in u
         or "m3u" in u
@@ -368,6 +568,29 @@ def _is_hls_input(url: str, message) -> bool:
         return True
     sk = (message.get("streamKind") or message.get("stream_kind") or "").strip().lower()
     return sk in ("hls", "apple_hls", "hls_by_header", "m3u8", "m3u")
+
+
+def _hls_url_looks_one_shot(url: str) -> bool:
+    """
+    Signed / tokenized playlist URLs that often work for one GET (the player's)
+    and fail if ffmpeg or a preset probe hits them again.
+    """
+    u = url or ""
+    if re.search(r"H4sIAAAA", u, re.I):
+        return True
+    if re.search(
+        r"/[A-Za-z0-9._~\-]{80,}/(?:master|index|playlist|manifest)[^/]*\.m3u8(?:[?#]|$)",
+        u,
+        re.I,
+    ):
+        return True
+    if ".m3u8" in u.lower() and re.search(
+        r"[?&](token|signature|sig|expires|exp|policy|key-pair-id|hdnts)=",
+        u,
+        re.I,
+    ):
+        return True
+    return False
 
 
 def _is_dash_input(url: str, message) -> bool:
@@ -855,6 +1078,104 @@ def _netflix_drm_error_message() -> str:
     )
 
 
+def _mega_mod():
+    try:
+        import mega_fetch
+
+        return mega_fetch
+    except ImportError:
+        return None
+
+
+def _is_mega_public_url(url: str) -> bool:
+    mod = _mega_mod()
+    return bool(mod and mod.is_mega_public_url(url or ""))
+
+
+def _pick_mega_url(*candidates: str) -> str:
+    mod = _mega_mod()
+    if not mod:
+        return ""
+    return mod.pick_mega_url(*candidates)
+
+
+def _download_mega_job(
+    url: str, message: dict, out_dir: str, filename: str, job_id: str
+) -> None:
+    mod = _mega_mod()
+    if not mod:
+        send_message(
+            with_job_id(
+                {
+                    "type": "done",
+                    "success": False,
+                    "error": "MEGA helper module is missing (python/mega_fetch.py).",
+                },
+                job_id,
+            )
+        )
+        return
+    output_guess = os.path.join(out_dir, _sanitize_filename_stem(filename) or "mega-file")
+    _JOB_LIVE[job_id] = _job_live_from_message(output_guess, url, message)
+    send_message(
+        with_job_id(
+            {
+                "type": "progress",
+                "phase": "starting",
+                "detail": "Opening MEGA link…",
+                "output": output_guess,
+            },
+            job_id,
+        )
+    )
+
+    def on_progress(patch: Dict[str, Any]) -> None:
+        payload = {
+            "type": "progress",
+            "phase": "fetch",
+            "detail": patch.get("detail") or "Downloading from MEGA…",
+            "output": patch.get("output") or output_guess,
+        }
+        if patch.get("percent") is not None:
+            payload["percent"] = patch["percent"]
+        if patch.get("playlistIndex") is not None:
+            payload["playlistIndex"] = patch["playlistIndex"]
+        if patch.get("playlistCount") is not None:
+            payload["playlistCount"] = patch["playlistCount"]
+        send_message(with_job_id(payload, job_id))
+
+    try:
+        out_path = mod.download_mega(
+            url,
+            out_dir,
+            filename,
+            cancel_check=_CANCEL_EVENT.is_set,
+            on_progress=on_progress,
+        )
+    except Exception as e:
+        if _CANCEL_EVENT.is_set() or "canceled" in str(e).lower():
+            _send_done_canceled(job_id)
+            return
+        send_message(
+            with_job_id(
+                {"type": "done", "success": False, "error": str(e)},
+                job_id,
+            )
+        )
+        return
+    send_message(
+        with_job_id(
+            {
+                "type": "done",
+                "success": True,
+                "output": out_path,
+                "detail": "Finished",
+            },
+            job_id,
+        )
+    )
+
+
 def _is_apple_music_drm_context(stream_url: str, page_url: str = "") -> bool:
     for u in (stream_url, page_url):
         h = _netloc_host(u)
@@ -1203,6 +1524,7 @@ def _is_spotify_url(url: str) -> bool:
 
 _GENERIC_STEMS = {
     "video", "stream", "download", "audio", "track", "media", "file", "song",
+    "mega",
 }
 
 
@@ -1338,6 +1660,22 @@ def _impersonation_help_message() -> str:
         "This site needs browser impersonation, which yt-dlp cannot do without "
         "curl-cffi. Install it into the helper Python and retry:\n"
         f'  "{py}" -m pip install -U curl-cffi'
+    )
+
+
+def _looks_like_missing_pycryptodomex(err_tail: str) -> bool:
+    t = (err_tail or "").lower()
+    return "pycryptodomex" in t and (
+        "not found" in t or "please install" in t or "is not" in t
+    )
+
+
+def _pycryptodomex_help_message() -> str:
+    py = sys.executable or "python"
+    return (
+        "This site encrypts the stream and yt-dlp cannot decrypt it without "
+        "pycryptodomex. Install it into the helper Python and retry:\n"
+        f'  "{py}" -m pip install -U pycryptodomex'
     )
 
 
@@ -1681,11 +2019,17 @@ def _ytdlp_page_role(url: str) -> Optional[Dict[str, Any]]:
     so /browse/track/ beats a bare /.
     """
     site = _ytdlp_site_for(url)
-    if site is None or site.get("ytdlp") is False:
+    if site is None:
+        return None
+    if site.get("ytdlp") is False and not site.get("handler"):
         return None
     try:
-        path = urlparse(url if "://" in url else "https://" + url).path or "/"
+        parsed = urlparse(url if "://" in url else "https://" + url)
+        path = parsed.path or "/"
+        hash_part = parsed.fragment or ""
     except Exception:
+        return None
+    if site.get("requireHash") and not hash_part:
         return None
     # Several of these put the language in the path, so /us/album/... has to
     # match an endpoint of /album. Both spellings are tried.
@@ -1708,6 +2052,10 @@ def _ytdlp_page_role(url: str) -> Optional[Dict[str, Any]]:
             if found is not None and any(found.search(p) for p in paths):
                 hit = str(page.get("match"))
         if not hit:
+            found = _site_pattern(page.get("hashMatch"))
+            if found is not None and found.search(hash_part):
+                hit = str(page.get("hashMatch"))
+        if not hit:
             continue
         if best is None or len(hit) > len(best[0]):
             best = (hit, page.get("role") or site.get("role") or "video")
@@ -1718,6 +2066,7 @@ def _ytdlp_page_role(url: str) -> Optional[Dict[str, Any]]:
         "role": best[1],
         "searchFallback": bool(site.get("searchFallback")),
         "endpoint": best[0],
+        "handler": site.get("handler") or "",
     }
 
 
@@ -2827,6 +3176,8 @@ def run_yt_dlp_with_updates(
         err = err + ": " + tail[-600:]
     if _looks_like_missing_impersonation(tail):
         err = _impersonation_help_message()
+    elif _looks_like_missing_pycryptodomex(tail):
+        err = _pycryptodomex_help_message()
     elif _looks_like_cookie_db_locked(tail):
         err = (
             "This site needs your browser cookies, but the browser is holding the "
@@ -3091,6 +3442,191 @@ def _m3u8_base_url(playlist_url: str) -> str:
     return urlunsplit((u.scheme, u.netloc, dirpath, "", ""))
 
 
+def _http_error_looks_like_ssl(exc: BaseException) -> bool:
+    t = str(exc).lower()
+    return (
+        "wrong version number" in t
+        or "ssl:" in t
+        or "sslerror" in t
+        or "certificate_verify_failed" in t
+        or "tlsv" in t
+    )
+
+
+def _http_no_proxy_env() -> dict:
+    env = os.environ.copy()
+    for key in list(env):
+        ku = key.upper()
+        if ku in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY"):
+            env.pop(key, None)
+    env["NO_PROXY"] = "*"
+    env["no_proxy"] = "*"
+    return env
+
+
+def _http_direct_opener() -> urllib.request.OpenerDirector:
+    """Ignore HTTP(S)_PROXY env vars. Those make urllib speak TLS to a plaintext proxy."""
+    ctx = ssl.create_default_context()
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
+
+
+def _curl_executable() -> Optional[str]:
+    if os.name == "nt":
+        found = shutil.which("curl.exe")
+        if found:
+            return found
+        windir = os.environ.get("WINDIR") or r"C:\Windows"
+        bundled = os.path.join(windir, "System32", "curl.exe")
+        if os.path.isfile(bundled):
+            return bundled
+        return None
+    return shutil.which("curl")
+
+
+def _http_get_bytes_curl(
+    url: str,
+    headers: Dict[str, str],
+    *,
+    timeout: float,
+    max_bytes: Optional[int],
+    byte_range: Optional[Tuple[int, int]],
+) -> bytes:
+    curl = _curl_executable()
+    if not curl:
+        raise urllib.error.URLError("curl not found")
+    cmd: List[str] = [
+        curl,
+        "-sS",
+        "-L",
+        "--noproxy",
+        "*",
+        "--max-time",
+        str(max(5, int(timeout))),
+        "-A",
+        headers.get("User-Agent") or USER_AGENT,
+    ]
+    if os.name == "nt":
+        cmd.append("--ssl-no-revoke")
+    for key, val in headers.items():
+        if not val or key.lower() == "user-agent":
+            continue
+        cmd.extend(["-H", f"{key}: {val}"])
+    if byte_range is not None:
+        rs, ln = byte_range
+        cmd.extend(["-H", f"Range: bytes={rs}-{rs + ln - 1}"])
+    cmd.append(url)
+    r = subprocess.run(
+        cmd,
+        capture_output=True,
+        timeout=max(timeout + 5.0, 30.0),
+        env=_http_no_proxy_env(),
+    )
+    if r.returncode != 0:
+        err = (r.stderr or b"").decode("utf-8", errors="replace").strip() or f"curl exit {r.returncode}"
+        if "SEC_E_INVALID_TOKEN" in err or "wrong version number" in err.lower():
+            cmd_tls12 = list(cmd)
+            if "--tlsv1.2" not in cmd_tls12:
+                cmd_tls12.insert(-1, "--tlsv1.2")
+            r = subprocess.run(
+                cmd_tls12,
+                capture_output=True,
+                timeout=max(timeout + 5.0, 30.0),
+                env=_http_no_proxy_env(),
+            )
+            if r.returncode == 0:
+                data = r.stdout or b""
+                if max_bytes is not None and byte_range is None and len(data) > max_bytes:
+                    data = data[:max_bytes]
+                if byte_range is not None:
+                    _rs, ln = byte_range
+                    if len(data) > ln:
+                        data = data[:ln]
+                return data
+            err = (r.stderr or b"").decode("utf-8", errors="replace").strip() or err
+        raise urllib.error.URLError(err)
+    data = r.stdout or b""
+    if max_bytes is not None and byte_range is None and len(data) > max_bytes:
+        data = data[:max_bytes]
+    if byte_range is not None:
+        _rs, ln = byte_range
+        if len(data) > ln:
+            data = data[:ln]
+    return data
+
+
+def _http_get_bytes_powershell(
+    url: str,
+    headers: Dict[str, str],
+    *,
+    timeout: float,
+    max_bytes: Optional[int],
+    byte_range: Optional[Tuple[int, int]],
+) -> bytes:
+    """Windows Schannel via PowerShell — same stack Chrome uses when curl.exe fails."""
+    if os.name != "nt":
+        raise urllib.error.URLError("powershell fetch is Windows-only")
+    fd, path = tempfile.mkstemp(prefix="sg_ps_")
+    os.close(fd)
+    try:
+        assigns: List[str] = []
+        for k, v in headers.items():
+            if not v:
+                continue
+            kk = str(k).replace("'", "''")
+            vv = str(v).replace("'", "''")
+            assigns.append(f"$h['{kk}'] = '{vv}'")
+        if byte_range is not None:
+            rs, ln = byte_range
+            assigns.append(f"$h['Range'] = 'bytes={rs}-{rs + ln - 1}'")
+        script = (
+            "$ProgressPreference = 'SilentlyContinue'\n"
+            "$h = @{}\n"
+            + "\n".join(assigns)
+            + "\n"
+            + f"Invoke-WebRequest -Uri $env:SG_HTTP_URL -OutFile $env:SG_HTTP_OUT "
+            f"-UseBasicParsing -TimeoutSec {max(5, int(timeout))} -Headers $h | Out-Null\n"
+        )
+        env = _http_no_proxy_env()
+        env["SG_HTTP_URL"] = url
+        env["SG_HTTP_OUT"] = path
+        r = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                script,
+            ],
+            capture_output=True,
+            timeout=max(timeout + 20.0, 45.0),
+            env=env,
+        )
+        if r.returncode != 0 or not os.path.isfile(path) or os.path.getsize(path) < 1:
+            err = (r.stderr or r.stdout or b"").decode("utf-8", errors="replace").strip() or (
+                f"powershell exit {r.returncode}"
+            )
+            raise urllib.error.URLError(err)
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if max_bytes is not None and byte_range is None and len(data) > max_bytes:
+            data = data[:max_bytes]
+        if byte_range is not None:
+            _rs, ln = byte_range
+            if len(data) > ln:
+                data = data[:ln]
+        return data
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def _http_get_bytes(
     url: str,
     header_block: str,
@@ -3114,8 +3650,8 @@ def _http_get_bytes(
         end = rs + eff_len - 1
         req.add_header("Range", f"bytes={rs}-{end}")
 
-    out = bytearray()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    def _read_resp(resp) -> bytes:
+        out = bytearray()
         chunk = 64 * 1024
         code = getattr(resp, "status", None) or resp.getcode()
         while True:
@@ -3134,14 +3670,44 @@ def _http_get_bytes(
             if not b:
                 break
             out.extend(b)
+        data = bytes(out)
+        if byte_range is not None and range_start is not None and range_len is not None:
+            if code == 200 and len(data) >= range_start + range_len:
+                data = data[range_start : range_start + range_len]
+            elif len(data) > range_len:
+                data = data[:range_len]
+        return data
 
-    data = bytes(out)
-    if byte_range is not None and range_start is not None and range_len is not None:
-        if code == 200 and len(data) >= range_start + range_len:
-            data = data[range_start : range_start + range_len]
-        elif len(data) > range_len:
-            data = data[:range_len]
-    return data
+    job_id = (_CURRENT_JOB_ID or "").strip()
+    use_browser = bool(job_id) and (
+        _CURRENT_BROWSER_HTTP or _hls_url_looks_one_shot(url)
+    )
+    # Signed CDNs only accept the browser's TLS. Chrome fetch works on every OS;
+    # do not fall through to curl.exe or PowerShell.
+    if use_browser:
+        return _http_get_bytes_extension(
+            url,
+            headers,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            byte_range=byte_range,
+            job_id=job_id,
+        )
+
+    try:
+        with _http_direct_opener().open(req, timeout=timeout) as resp:
+            return _read_resp(resp)
+    except (urllib.error.URLError, OSError, ssl.SSLError) as e:
+        if job_id and (_http_error_looks_like_ssl(e) or isinstance(e, ssl.SSLError)):
+            return _http_get_bytes_extension(
+                url,
+                headers,
+                timeout=timeout,
+                max_bytes=max_bytes,
+                byte_range=byte_range,
+                job_id=job_id,
+            )
+        raise
 
 
 def _http_get_text(url: str, header_block: str, timeout: float = 60.0) -> str:
@@ -4233,6 +4799,7 @@ def _build_ffmpeg_cmd_list(
     resume_from_sec: float = 0.0,
     playlist_text: Optional[str] = None,
     playlist_url: Optional[str] = None,
+    ffmpeg_input: Optional[str] = None,
 ):
     pre = [
         "ffmpeg",
@@ -4249,11 +4816,12 @@ def _build_ffmpeg_cmd_list(
     audio_only = False
     effective_playlist = playlist_text
     if is_hls and effective_playlist is None:
-        try:
-            _pu, effective_playlist = _resolve_variant_playlist_url(url, header_block)
-            playlist_url = playlist_url or _pu
-        except (urllib.error.URLError, OSError, ValueError, UnicodeError):
-            effective_playlist = None
+        if not _hls_url_looks_one_shot(url) and not (message or {}).get("oneShotHls"):
+            try:
+                _pu, effective_playlist = _resolve_variant_playlist_url(url, header_block)
+                playlist_url = playlist_url or _pu
+            except (urllib.error.URLError, OSError, ValueError, UnicodeError):
+                effective_playlist = None
     if effective_playlist:
         is_fmp4 = _hls_playlist_is_fmp4(effective_playlist)
         # Audio-only media playlists: no RESOLUTION and CODECS only mp4a, or EXT-X-MAP
@@ -4307,8 +4875,15 @@ def _build_ffmpeg_cmd_list(
         [
             "-headers",
             header_block,
+        ]
+    )
+    ua = ((message.get("userAgent") if message else None) or "").strip() or USER_AGENT
+    if ua:
+        pre.extend(["-user_agent", ua])
+    pre.extend(
+        [
             "-i",
-            url,
+            _ffmpeg_file_input(ffmpeg_input) if ffmpeg_input else url,
         ]
     )
     cmd = list(pre)
@@ -4323,7 +4898,13 @@ def _build_ffmpeg_cmd_list(
         and out_mp4
         and not _ffmpeg_force_stream_copy_hls_mp4()
     ):
-        preset = _ffmpeg_probe_transcode_preset(url, message, header_block)
+        preset = _ffmpeg_probe_transcode_preset(
+            url,
+            message,
+            header_block,
+            local_path=ffmpeg_input,
+            playlist_text=effective_playlist,
+        )
         cmd.extend(
             _ffmpeg_transcode_stable_mp4_from_url(
                 url,
@@ -4362,7 +4943,12 @@ def _handle_ffmpeg_encode_preset_probe(message: dict) -> None:
     env_locked = _ffmpeg_env_preset_override()
     header_block = build_ffmpeg_header_block(message, url)
     try:
-        dur, size = _ffmpeg_probe_transcode_stats(url, message, header_block)
+        dur, size = _ffmpeg_probe_transcode_stats(
+            url,
+            message,
+            header_block,
+            playlist_text=(message.get("playlistText") or None),
+        )
     except (urllib.error.URLError, OSError, ValueError, UnicodeError) as e:
         reply(success=False, error=str(e), applies=True)
         return
@@ -4720,6 +5306,7 @@ def _ffmpeg_probe_transcode_stats(
     header_block,
     *,
     local_path: Optional[str] = None,
+    playlist_text: Optional[str] = None,
 ) -> Tuple[float, Optional[int]]:
     """Inspect source duration/size for preset selection."""
     dur, size = _message_media_hints(message)
@@ -4728,16 +5315,24 @@ def _ffmpeg_probe_transcode_stats(
         dur = max(dur, ld)
         if ls:
             size = max(size or 0, ls) or ls
+    one_shot = bool((message or {}).get("oneShotHls")) or _hls_url_looks_one_shot(url)
+    pl = (playlist_text or "").strip() or None
     if _is_hls_input(url, message):
-        try:
-            var_url, var_text = _resolve_variant_playlist_url(url, header_block)
-            dur = max(dur, _hls_playlist_duration_seconds(var_text))
-            est = _hls_playlist_estimated_size_bytes(var_text, var_url)
+        if pl:
+            dur = max(dur, _hls_playlist_duration_seconds(pl))
+            est = _hls_playlist_estimated_size_bytes(pl, url)
             if est:
                 size = max(size or 0, est) or est
-        except (urllib.error.URLError, OSError, ValueError, UnicodeError):
-            pass
-    if dur <= 0.05 or size is None:
+        elif not one_shot:
+            try:
+                var_url, var_text = _resolve_variant_playlist_url(url, header_block)
+                dur = max(dur, _hls_playlist_duration_seconds(var_text))
+                est = _hls_playlist_estimated_size_bytes(var_text, var_url)
+                if est:
+                    size = max(size or 0, est) or est
+            except (urllib.error.URLError, OSError, ValueError, UnicodeError):
+                pass
+    if (dur <= 0.05 or size is None) and not one_shot:
         ud, us = _ffprobe_url_format_hints(url, header_block)
         dur = max(dur, ud)
         if us:
@@ -4751,9 +5346,14 @@ def _ffmpeg_probe_transcode_preset(
     header_block,
     *,
     local_path: Optional[str] = None,
+    playlist_text: Optional[str] = None,
 ) -> str:
     dur, size = _ffmpeg_probe_transcode_stats(
-        url, message, header_block, local_path=local_path
+        url,
+        message,
+        header_block,
+        local_path=local_path,
+        playlist_text=playlist_text,
     )
     return _ffmpeg_resolve_x264_preset(message, dur, size)
 
@@ -5428,8 +6028,15 @@ def _handle_hls_auth_refresh(new_message: dict) -> None:
         del _JOB_LIVE[job_id]
 
 
+def _clear_current_job_if(job_id: str) -> None:
+    global _CURRENT_JOB_ID, _CURRENT_BROWSER_HTTP
+    if _CURRENT_JOB_ID == job_id:
+        _CURRENT_JOB_ID = ""
+        _CURRENT_BROWSER_HTTP = False
+
+
 def run_ffmpeg_with_updates(url, filename, message):
-    global _active_ffmpeg, _CURRENT_JOB_ID
+    global _active_ffmpeg, _CURRENT_JOB_ID, _CURRENT_BROWSER_HTTP
     job_id = (message.get("jobId") or "").strip()
     with _PROC_LOCK:
         if _active_ffmpeg is not None and _active_ffmpeg.poll() is None:
@@ -5461,6 +6068,9 @@ def run_ffmpeg_with_updates(url, filename, message):
         )
         return
     _CURRENT_JOB_ID = job_id
+    _CURRENT_BROWSER_HTTP = bool((message or {}).get("oneShotHls")) or _hls_url_looks_one_shot(
+        url
+    )
     page_for_social = (message.get("pageUrl") or message.get("referer") or "").strip()
     effective_filename = filename
     # Sites whose media has to be found somewhere else arrive with nothing
@@ -5476,8 +6086,13 @@ def run_ffmpeg_with_updates(url, filename, message):
                 effective_filename = stem
     if _looks_like_vtt_url(url):
         _download_vtt_immediate(url, message, out_dir, effective_filename, job_id)
-        if _CURRENT_JOB_ID == job_id:
-            _CURRENT_JOB_ID = ""
+        _clear_current_job_if(job_id)
+        return
+
+    mega_url = _pick_mega_url(url, page_for_social)
+    if mega_url:
+        _download_mega_job(mega_url, message, out_dir, effective_filename, job_id)
+        _clear_current_job_if(job_id)
         return
 
     if _is_netflix_drm_context(url, page_for_social):
@@ -5491,14 +6106,14 @@ def run_ffmpeg_with_updates(url, filename, message):
                 job_id,
             )
         )
-        if _CURRENT_JOB_ID == job_id:
-            _CURRENT_JOB_ID = ""
+        _clear_current_job_if(job_id)
         return
 
     out_ext = _ffmpeg_preferred_container_ext(url, message)
     output_path = _resolve_output_path(message, out_dir, effective_filename, out_ext)
 
     proc: Optional[subprocess.Popen] = None
+    local_pl_path = ""
     try:
         platform_label = _social_platform_for_yt_dlp(url, page_for_social, message)
         if platform_label:
@@ -5564,12 +6179,53 @@ def run_ffmpeg_with_updates(url, filename, message):
                 )
             )
             try:
-                var_pair = _resolve_variant_playlist_url(url, header_block)
-            except Exception:
-                var_pair = None
+                var_pair = _hls_playlist_from_message(message, url, header_block)
+            except (urllib.error.URLError, OSError, ValueError, UnicodeError) as e:
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "error": _format_playlist_fetch_error(e),
+                        },
+                        job_id,
+                    )
+                )
+                return
             var_url_r, var_text_r = (
                 var_pair if var_pair is not None else ("", "")
             )
+            if not var_text_r or "#EXTM3U" not in var_text_r.upper():
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "error": (
+                                "Could not read the HLS playlist (the signed URL is already spent). "
+                                "Reload the lesson, wait until video is playing, then download."
+                            ),
+                        },
+                        job_id,
+                    )
+                )
+                return
+            try:
+                local_pl_path = _write_local_hls_playlist(
+                    var_text_r, var_url_r or url
+                )
+            except OSError as e:
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "error": f"Could not write a local HLS playlist: {e}",
+                        },
+                        job_id,
+                    )
+                )
+                return
             drm_err = _hls_playlist_drm_error(var_text_r)
             if drm_err:
                 # Last resort: if we somehow got FairPlay HLS without an Apple page route,
@@ -5599,6 +6255,32 @@ def run_ffmpeg_with_updates(url, filename, message):
                 )
                 return
 
+            one_shot = bool((message or {}).get("oneShotHls")) or _hls_url_looks_one_shot(
+                url
+            ) or _hls_url_looks_one_shot(var_url_r or "")
+            if one_shot and var_text_r and not _is_master_playlist(var_text_r):
+                clean_kind_os: Optional[str] = None
+                try:
+                    clean_kind_os = _classify_clean_fake_ext_hls(
+                        var_url_r, var_text_r, header_block
+                    )
+                except Exception:
+                    clean_kind_os = None
+                if clean_kind_os:
+                    _JOB_LIVE[job_id] = _job_live_from_message(
+                        output_path, url, message
+                    )
+                    _download_clean_hls_no_strip(
+                        message,
+                        output_path,
+                        header_block,
+                        job_id,
+                        clean_kind_os,
+                        var_url_r or url,
+                        var_text_r,
+                    )
+                    return
+
         def _fail_both(ffmpeg_err: str) -> None:
             send_message(
                 with_job_id(
@@ -5615,6 +6297,7 @@ def run_ffmpeg_with_updates(url, filename, message):
             resume_from_sec=0.0,
             playlist_text=var_text_r or None,
             playlist_url=var_url_r or None,
+            ffmpeg_input=local_pl_path or None,
         )
 
         if _is_hls_input(url, message):
@@ -5780,12 +6463,53 @@ def run_ffmpeg_with_updates(url, filename, message):
             err = f"ffmpeg exited with code {code}"
             if tail:
                 err = err + ": " + tail[-500:]
+            if (
+                _is_hls_input(url, message)
+                and var_text_r
+                and _ffmpeg_looks_like_network_fail(err)
+            ):
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "progress",
+                            "phase": "fetch",
+                            "detail": "ffmpeg could not re-open the CDN URL; downloading segments directly…",
+                            "output": output_path,
+                        },
+                        job_id,
+                    )
+                )
+                clean_kind_fb: Optional[str] = None
+                try:
+                    clean_kind_fb = _classify_clean_fake_ext_hls(
+                        var_url_r, var_text_r, header_block
+                    )
+                except Exception:
+                    clean_kind_fb = None
+                if not clean_kind_fb:
+                    clean_kind_fb = (
+                        "fmp4" if _hls_playlist_is_fmp4(var_text_r) else "ts"
+                    )
+                _download_clean_hls_no_strip(
+                    message,
+                    output_path,
+                    header_block,
+                    job_id,
+                    clean_kind_fb,
+                    var_url_r or url,
+                    var_text_r,
+                )
+                return
             _fail_both(err)
     finally:
+        if local_pl_path:
+            try:
+                os.remove(local_pl_path)
+            except OSError:
+                pass
         _clear_active_if(proc)
         _CANCEL_EVENT.clear()
-        if _CURRENT_JOB_ID == job_id:
-            _CURRENT_JOB_ID = ""
+        _clear_current_job_if(job_id)
         if job_id and job_id not in _SILENCE_FFMPEG_DONE:
             _JOB_LIVE.pop(job_id, None)
 
@@ -5842,6 +6566,29 @@ def _handle_health(message: dict) -> None:
             ytdlp_ok = False
             ytdlp_ver = str(e)[:120]
 
+    crypto_ok = False
+    crypto_ver = "missing"
+    try:
+        import cryptography
+
+        crypto_ok = True
+        crypto_ver = str(getattr(cryptography, "__version__", "") or "ok")
+    except Exception as e:
+        crypto_ok = False
+        crypto_ver = str(e)[:120]
+
+    pycrypto_ok = False
+    pycrypto_ver = "missing"
+    try:
+        from Cryptodome.Cipher import AES  # noqa: F401
+        import Cryptodome
+
+        pycrypto_ok = True
+        pycrypto_ver = str(getattr(Cryptodome, "__version__", "") or "ok")
+    except Exception as e:
+        pycrypto_ok = False
+        pycrypto_ver = str(e)[:120]
+
     write_ok = None
     write_error = None
     write_path = None
@@ -5883,6 +6630,14 @@ def _handle_health(message: dict) -> None:
                 "ok": bool(ytdlp_ok),
                 "version": ytdlp_ver or ("missing" if not ytdlp_ok else "ok"),
             },
+            "cryptography": {
+                "ok": bool(crypto_ok),
+                "version": crypto_ver or ("missing" if not crypto_ok else "ok"),
+            },
+            "pycryptodomex": {
+                "ok": bool(pycrypto_ok),
+                "version": pycrypto_ver or ("missing" if not pycrypto_ok else "ok"),
+            },
             "writeTest": {
                 "ran": do_write_test,
                 "ok": write_ok,
@@ -5901,6 +6656,9 @@ def main():
         mtype = (message.get("type") or "").lower()
         if mtype == "cancel":
             _request_cancel()
+            continue
+        if mtype == "http_get_result":
+            _http_get_result_from_ext(message)
             continue
         if mtype == "refresh":
             threading.Thread(

@@ -22,6 +22,9 @@ const FFMPEG_PRESET_MODE_KEY = 'ffmpegPresetMode';
 const YTDLP_MAX_H_KEY = 'ytDlpMaxHeight';
 const THEME_MODE_KEY = 'uiThemeMode';
 const THEME_ACCENT_KEY = 'uiThemeAccent';
+const DL_PROGRESS_LAYOUT_KEY = 'dlProgressLayout';
+const DL_PROGRESS_MORPH_KEY = 'dlProgressMorph';
+const UI_MORPH_KEY = 'uiMorphMotion';
 
 function showStatus(msg, kind) {
   const el = document.getElementById('status');
@@ -58,7 +61,7 @@ function syncCtxItemsRow() {
 
 function load() {
   chrome.storage.local.get(
-    [KEY, FLOAT_KEY, IMG_DL_KEY, IMG_SAVE_PATH_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY,
+    [KEY, FLOAT_KEY, IMG_DL_KEY, IMG_SAVE_PATH_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY, DL_PROGRESS_LAYOUT_KEY, DL_PROGRESS_MORPH_KEY, UI_MORPH_KEY,
      CTX_MENU_ENABLED_KEY, CTX_MENU_IMAGE_KEY, CTX_MENU_MEDIA_KEY, CTX_MENU_LINK_KEY, CTX_MENU_PAGE_KEY],
     (data) => {
     const err = chrome.runtime.lastError;
@@ -88,6 +91,16 @@ function load() {
     if (tm) tm.value = data[THEME_MODE_KEY] || 'system';
     const ta = document.getElementById('ui-theme-accent');
     if (ta) ta.value = data[THEME_ACCENT_KEY] || 'blue';
+    const dlLayout = document.getElementById('dl-progress-layout');
+    if (dlLayout) {
+      const v = data[DL_PROGRESS_LAYOUT_KEY];
+      dlLayout.value = v === 'circle' || v === 'pill' ? v : 'bar';
+    }
+    const dlMorph = document.getElementById('dl-progress-morph');
+    if (dlMorph) {
+      if (data[UI_MORPH_KEY] != null) dlMorph.checked = data[UI_MORPH_KEY] !== false;
+      else dlMorph.checked = data[DL_PROGRESS_MORPH_KEY] !== false;
+    }
     for (const [id, key] of CTX_MENU_BOXES) {
       const el = document.getElementById(id);
       if (el) el.checked = data[key] !== false; // default on
@@ -95,137 +108,173 @@ function load() {
     syncAccentRowVisibility();
     syncImgSavePathRow();
     syncCtxItemsRow();
+    markClean();
     if (typeof HLS_IOS_SELECT !== 'undefined' && HLS_IOS_SELECT.enhanceAll) {
       HLS_IOS_SELECT.enhanceAll(document);
     }
   });
 }
 
+const saveBtn = document.getElementById('save');
+let savedSnapshot = null;
+
+function boolField(id) {
+  const el = document.getElementById(id);
+  return !!(el && el.checked);
+}
+
+function selectField(id) {
+  const el = document.getElementById(id);
+  return el ? String(el.value || '') : '';
+}
+
+function fieldSnapshot() {
+  const pathEl = document.getElementById('path');
+  const hEl = document.getElementById('ytdlp-max-h');
+  const layout = selectField('dl-progress-layout');
+  const ctx = {};
+  for (const [id, key] of CTX_MENU_BOXES) {
+    ctx[key] = boolField(id);
+  }
+  return {
+    path: ((pathEl && pathEl.value) || '').trim(),
+    maxH: ((hEl && hEl.value) || '').trim(),
+    floatOn: boolField('float-on'),
+    imgDlOn: boolField('img-dl-on'),
+    imgSavePathOn: boolField('img-save-path-on'),
+    recDetachOn: boolField('rec-detach-on'),
+    ytdlpQuality: selectField('ytdlp-quality') === 'ask' ? 'ask' : 'auto',
+    ffmpegPreset: selectField('ffmpeg-preset-mode') === 'auto' ? 'auto' : 'ask',
+    themeMode: selectField('ui-theme-mode') || 'system',
+    themeAccent: selectField('ui-theme-accent') || 'blue',
+    dlLayout: layout === 'circle' || layout === 'pill' ? layout : 'bar',
+    morphOn: boolField('dl-progress-morph'),
+    ...ctx,
+  };
+}
+
+function isDirty() {
+  if (!savedSnapshot) return false;
+  return JSON.stringify(fieldSnapshot()) !== JSON.stringify(savedSnapshot);
+}
+
+function syncSaveButton() {
+  if (!saveBtn) return;
+  saveBtn.disabled = !isDirty();
+}
+
+function markClean() {
+  savedSnapshot = fieldSnapshot();
+  syncSaveButton();
+}
+
+function onFormEdit() {
+  const status = document.getElementById('status');
+  if (status && status.classList.contains('ok')) {
+    status.hidden = true;
+    status.textContent = '';
+  }
+  syncAccentRowVisibility();
+  syncImgSavePathRow();
+  syncCtxItemsRow();
+  syncSaveButton();
+}
+
+function persistMaxHeight(raw) {
+  if (!raw) {
+    chrome.storage.local.remove(YTDLP_MAX_H_KEY);
+    return;
+  }
+  const n = parseInt(raw, 10);
+  if (!Number.isNaN(n)) chrome.storage.local.set({ [YTDLP_MAX_H_KEY]: n });
+}
+
 function saveToLocalStorage({ quiet } = {}) {
-  const p = document.getElementById('path').value.trim();
-  if (!p) {
+  const snap = fieldSnapshot();
+  if (!snap.path && savedSnapshot && savedSnapshot.path) {
     if (!quiet) showStatus('Enter a folder path first.', 'err');
     return;
   }
-  chrome.storage.local.set({ [KEY]: p }, () => {
+  const toSet = {
+    [FLOAT_KEY]: snap.floatOn,
+    [IMG_DL_KEY]: snap.imgDlOn,
+    [IMG_SAVE_PATH_KEY]: snap.imgSavePathOn,
+    [REC_DETACH_KEY]: snap.recDetachOn,
+    [YTDLP_MODE_KEY]: snap.ytdlpQuality,
+    [FFMPEG_PRESET_MODE_KEY]: snap.ffmpegPreset,
+    [THEME_MODE_KEY]: snap.themeMode,
+    [THEME_ACCENT_KEY]: snap.themeAccent,
+    [DL_PROGRESS_LAYOUT_KEY]: snap.dlLayout,
+    [UI_MORPH_KEY]: snap.morphOn,
+    [DL_PROGRESS_MORPH_KEY]: snap.morphOn,
+  };
+  for (const [, key] of CTX_MENU_BOXES) {
+    toSet[key] = !!snap[key];
+  }
+  if (snap.path) toSet[KEY] = snap.path;
+  chrome.storage.local.set(toSet, () => {
     const err = chrome.runtime.lastError;
     if (err) {
       showStatus(String(err), 'err');
       return;
     }
+    persistMaxHeight(snap.maxH);
+    markClean();
     syncImgSavePathRow();
     if (!quiet) {
-      showStatus('Saved. That folder will be used for new downloads.', 'ok');
-    } else {
-      const el = document.getElementById('status');
-      el.hidden = false;
-      el.className = 'ok';
-      el.textContent = 'Saved to this browser (change anytime).';
+      showStatus(
+        snap.path
+          ? 'Saved. New downloads and page controls will use these settings.'
+          : 'Saved.',
+        'ok'
+      );
     }
   });
 }
 
-let debounceTimer;
+function trySave() {
+  if (!isDirty()) return;
+  saveToLocalStorage({ quiet: false });
+}
 
 const pathInput = document.getElementById('path');
-pathInput.addEventListener('input', () => {
-  clearTimeout(debounceTimer);
-  syncImgSavePathRow();
-  debounceTimer = setTimeout(() => {
-    const p = pathInput.value.trim();
-    if (p.length >= 3) saveToLocalStorage({ quiet: true });
-  }, 600);
+pathInput.addEventListener('input', onFormEdit);
+pathInput.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  trySave();
 });
 
-pathInput.addEventListener('blur', () => {
-  clearTimeout(debounceTimer);
-  const p = pathInput.value.trim();
-  if (p.length >= 3) saveToLocalStorage({ quiet: true });
-});
-
-document.getElementById('save').addEventListener('click', () => saveToLocalStorage({ quiet: false }));
-
-const floatOn = document.getElementById('float-on');
-if (floatOn) {
-  floatOn.addEventListener('change', () => {
-    chrome.storage.local.set({ [FLOAT_KEY]: !!floatOn.checked });
-  });
+if (saveBtn) {
+  saveBtn.addEventListener('click', () => trySave());
 }
 
-const imgDlOn = document.getElementById('img-dl-on');
-if (imgDlOn) {
-  imgDlOn.addEventListener('change', () => {
-    chrome.storage.local.set({ [IMG_DL_KEY]: !!imgDlOn.checked });
-    syncImgSavePathRow();
-  });
-}
-
-for (const [id, key] of CTX_MENU_BOXES) {
+[
+  'float-on',
+  'img-dl-on',
+  'img-save-path-on',
+  'rec-detach-on',
+  'ytdlp-quality',
+  'ffmpeg-preset-mode',
+  'ytdlp-max-h',
+  'ui-theme-mode',
+  'ui-theme-accent',
+  'dl-progress-layout',
+  'dl-progress-morph',
+  ...CTX_MENU_BOXES.map(([id]) => id),
+].forEach((id) => {
   const el = document.getElementById(id);
-  if (!el) continue;
-  el.addEventListener('change', () => {
-    chrome.storage.local.set({ [key]: !!el.checked });
-    if (key === CTX_MENU_ENABLED_KEY) syncCtxItemsRow();
-  });
-}
-
-const imgSavePathOn = document.getElementById('img-save-path-on');
-if (imgSavePathOn) {
-  imgSavePathOn.addEventListener('change', () => {
-    chrome.storage.local.set({ [IMG_SAVE_PATH_KEY]: !!imgSavePathOn.checked });
-  });
-}
-
-const recDetachOn = document.getElementById('rec-detach-on');
-if (recDetachOn) {
-  recDetachOn.addEventListener('change', () => {
-    chrome.storage.local.set({ [REC_DETACH_KEY]: !!recDetachOn.checked });
-  });
-}
-
-const ytdlpQuality = document.getElementById('ytdlp-quality');
-if (ytdlpQuality) {
-  ytdlpQuality.addEventListener('change', () => {
-    const v = ytdlpQuality.value === 'ask' ? 'ask' : 'auto';
-    chrome.storage.local.set({ [YTDLP_MODE_KEY]: v });
-  });
-}
-
-const ffmpegPresetMode = document.getElementById('ffmpeg-preset-mode');
-if (ffmpegPresetMode) {
-  ffmpegPresetMode.addEventListener('change', () => {
-    const v = ffmpegPresetMode.value === 'ask' ? 'ask' : 'auto';
-    chrome.storage.local.set({ [FFMPEG_PRESET_MODE_KEY]: v });
-  });
-}
+  if (!el) return;
+  el.addEventListener('change', onFormEdit);
+  if (el.matches('input[type="text"]')) el.addEventListener('input', onFormEdit);
+});
 
 const ytdlpMaxH = document.getElementById('ytdlp-max-h');
 if (ytdlpMaxH) {
-  const persistMaxH = () => {
-    const raw = ytdlpMaxH.value.trim();
-    if (!raw) {
-      chrome.storage.local.remove(YTDLP_MAX_H_KEY);
-      return;
-    }
-    const n = parseInt(raw, 10);
-    if (!Number.isNaN(n)) chrome.storage.local.set({ [YTDLP_MAX_H_KEY]: n });
-  };
-  ytdlpMaxH.addEventListener('change', persistMaxH);
-  ytdlpMaxH.addEventListener('blur', persistMaxH);
-}
-
-const themeMode = document.getElementById('ui-theme-mode');
-if (themeMode) {
-  themeMode.addEventListener('change', () => {
-    syncAccentRowVisibility();
-    chrome.storage.local.set({ [THEME_MODE_KEY]: themeMode.value || 'system' });
-  });
-}
-
-const themeAccent = document.getElementById('ui-theme-accent');
-if (themeAccent) {
-  themeAccent.addEventListener('change', () => {
-    chrome.storage.local.set({ [THEME_ACCENT_KEY]: themeAccent.value || 'blue' });
+  ytdlpMaxH.addEventListener('keydown', (ev) => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    trySave();
   });
 }
 

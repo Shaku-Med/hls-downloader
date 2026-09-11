@@ -455,11 +455,63 @@
     }
   }
 
+  /** 1×1 / ad pixels. Keep unloaded players that already take real layout space. */
+  function videoIsPixelJunk(video) {
+    try {
+      const r = video.getBoundingClientRect();
+      const layoutW = r && r.width ? r.width : 0;
+      const layoutH = r && r.height ? r.height : 0;
+      const mediaW = video.videoWidth || 0;
+      const mediaH = video.videoHeight || 0;
+      const w = Math.max(layoutW, mediaW);
+      const h = Math.max(layoutH, mediaH);
+      if (w === 0 && h === 0) return false;
+      return w < 32 && h < 32;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function videoSortArea(video) {
+    try {
+      const r = video.getBoundingClientRect();
+      const w = Math.max((r && r.width) || 0, video.videoWidth || 0);
+      const h = Math.max((r && r.height) || 0, video.videoHeight || 0);
+      let area = w * h;
+      if (video.paused === false) area += 1;
+      return area;
+    } catch (_) {
+      return 0;
+    }
+  }
+
+  function collectSameOriginDocuments(rootDoc, out, seen) {
+    if (!rootDoc || seen.has(rootDoc)) return;
+    seen.add(rootDoc);
+    out.push(rootDoc);
+    let frames;
+    try {
+      frames = rootDoc.querySelectorAll('iframe, frame');
+    } catch (_) {
+      return;
+    }
+    for (const iframe of frames) {
+      try {
+        const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+        if (doc) collectSameOriginDocuments(doc, out, seen);
+      } catch (_) {
+        // Cross-origin: all_frames scan covers that frame separately.
+      }
+    }
+  }
+
   /**
-   * Videos in this frame only (iframes are scanned separately via all_frames).
+   * Videos in this frame (iframes are scanned separately via all_frames).
    * Walks open shadow roots so custom players (Reddit, etc.) are not missed.
+   * Pass { deep: true } to also walk same-origin about:blank / srcdoc iframes
+   * when Rec was sent to the wrong frameId.
    */
-  function findVideoElements() {
+  function findVideoElements(opts) {
     const videos = [];
     const seen = new Set();
     const collect = (root) => {
@@ -471,7 +523,7 @@
         return;
       }
       for (const v of list) {
-        if (seen.has(v)) continue;
+        if (seen.has(v) || videoIsPixelJunk(v)) continue;
         seen.add(v);
         videos.push(v);
       }
@@ -492,7 +544,7 @@
         // Closed-shadow players sometimes hang the media element on the host.
         try {
           const inner = el.video || el.media;
-          if (inner && inner.tagName === 'VIDEO' && !seen.has(inner)) {
+          if (inner && inner.tagName === 'VIDEO' && !seen.has(inner) && !videoIsPixelJunk(inner)) {
             seen.add(inner);
             videos.push(inner);
           }
@@ -501,8 +553,41 @@
         }
       }
     };
-    collect(document);
+    if (opts && opts.deep) {
+      const docs = [];
+      collectSameOriginDocuments(document, docs, new Set());
+      for (const doc of docs) collect(doc);
+    } else {
+      collect(document);
+    }
+    videos.sort((a, b) => videoSortArea(b) - videoSortArea(a));
     return videos;
+  }
+
+  /** Rec/focus: this frame first, then same-origin child documents if needed. */
+  function videosForAction() {
+    const local = findVideoElements();
+    if (local.length) return local;
+    return findVideoElements({ deep: true });
+  }
+
+  function pageMediaUrls(videos) {
+    const out = [];
+    const seen = new Set();
+    for (const video of videos || []) {
+      const raw = (video && (video.currentSrc || video.src)) || '';
+      if (!raw || !/^https?:/i.test(raw)) continue;
+      let abs;
+      try {
+        abs = new URL(raw, location.href).href;
+      } catch (_) {
+        continue;
+      }
+      if (seen.has(abs)) continue;
+      seen.add(abs);
+      out.push(abs);
+    }
+    return out;
   }
 
   function labelForVideo(video, idx) {
@@ -552,7 +637,8 @@
       count: videos.length,
       // >0 means a cross-origin player is on the page that this frame cannot read.
       blockedFrames: blockedFrameCount(),
-      embeddedPlayers: embeddedPlayerUrls(),
+      embeddedPlayers: videos.length ? [] : embeddedPlayerUrls(),
+      mediaUrls: pageMediaUrls(videos),
       preferredStartIndex,
       recording: recording || recordings.size > 0,
       videos: videos.map((video, index) => {
@@ -641,18 +727,19 @@
   }
 
   function noVideoReason() {
-    // Only blame an embedded player when we actually found one to point at.
+    // A local <video> (including one nested in a same-origin blank iframe) is
+    // not "embedded from another site". Ad iframes used to trip this and lie.
+    if (videosForAction().length) {
+      return 'Couldn’t lock onto that video. Try Rec again.';
+    }
     if (embeddedPlayerUrls().length > 0) {
       return 'This player is embedded from another site, so the page cannot reach it. Open it in its own tab, or use a stream row from the list.';
-    }
-    if (blockedFrameCount() > 0) {
-      return 'No video element is reachable on this page. Use a stream row from the list instead.';
     }
     return 'That video disappeared. Open the list again.';
   }
 
   function focusVideo(index) {
-    const videos = findVideoElements();
+    const videos = videosForAction();
     const i = Math.max(0, Math.min(videos.length - 1, Number(index) | 0));
     const video = videos[i];
     if (!video) {
@@ -859,8 +946,11 @@
       try {
         if (el.captureStream) return el.captureStream();
         if (el.mozCaptureStream) return el.mozCaptureStream();
-      } catch (_) {
-        // CORS / site policy
+      } catch (e) {
+        const msg = `${(e && e.name) || ''} ${(e && e.message) || e}`;
+        if (/SecurityError|cross-origin|CORS|tainted/i.test(msg)) {
+          return 'blocked';
+        }
       }
       return null;
     }
@@ -898,6 +988,8 @@
     }
 
     let stream = captureElementStream(video);
+    let captureBlocked = stream === 'blocked';
+    if (stream === 'blocked') stream = null;
     if (!streamUsable(stream) && detachSaved) {
       try {
         restoreVideoAfterRecord(video, detachSaved);
@@ -907,10 +999,18 @@
       detachSaved = null;
       try { const p1 = video.play && video.play(); if (p1 && p1.catch) p1.catch(() => {}); } catch (_) {}
       stream = captureElementStream(video);
+      if (stream === 'blocked') {
+        captureBlocked = true;
+        stream = null;
+      }
     }
     if (!streamUsable(stream)) {
       restoreVideoAfterRecord(video, detachSaved);
-      return { idx, label, error: 'this video could not be recorded' };
+      return {
+        idx,
+        label,
+        error: captureBlocked ? 'site-blocks-capture' : 'this video could not be recorded',
+      };
     }
 
     let mime = '';
@@ -1146,9 +1246,21 @@
   }
 
   /* ───────────────────────── public actions ───────────────────────── */
+  function recStartError(first) {
+    const err = (first && first.error) || '';
+    if (err === 'site-blocks-capture' || /could not be recorded/i.test(err)) {
+      return (
+        'The video is on this page, but the site will not let the recorder tap into it. '
+        + 'Download a real stream from the list if one appears, or use the screen recorder.'
+      );
+    }
+    if (err && err !== 'stopped') return err;
+    return 'Couldn’t get a recording going on this video.';
+  }
+
   async function startRecording(opts) {
     if (recording) return { ok: false, error: 'Already recording' };
-    const videos = findVideoElements();
+    const videos = videosForAction();
     if (!videos.length) {
       return {
         ok: false,
@@ -1201,7 +1313,7 @@
       recordQueue = [];
       stopLoop();
       unmountOverlay();
-      return { ok: false, error: 'Couldn’t get a recording going on any of these videos', details };
+      return { ok: false, error: recStartError(first), details };
     }
 
     const pos = queuePosition();
@@ -1298,6 +1410,7 @@
       videos: listed.videos,
       blockedFrames: listed.blockedFrames,
       embeddedPlayers: listed.embeddedPlayers,
+      mediaUrls: listed.mediaUrls,
     };
   }
 

@@ -5,6 +5,14 @@
 #
 yt-dlp>=2024.8.0
 
+# AES for public mega.nz / mega.co.nz file and folder links.
+# Auto Download and python/install.py install this into the helper Python.
+cryptography>=42.0.0
+
+# yt-dlp's AES / RSA backend (HLS AES-128 without ffmpeg, Bilibili, and other
+# extractors that raise "pycryptodomex not found").
+pycryptodomex>=3.20.0
+
 # Browser impersonation (TLS/JA3 fingerprint). Dailymotion and a growing number
 # of sites refuse yt-dlp without it: "The extractor is attempting impersonation,
 # but none of these impersonate targets are available".

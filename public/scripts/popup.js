@@ -1,6 +1,45 @@
 const JOBS_KEY = 'hlsGrabJobsState';
 const STREAMS_REV_KEY = 'hlsGrabStreamsRev';
 
+function formatJobTime(job) {
+  if (window.HGR_THEME && typeof window.HGR_THEME.formatJobTime === 'function') {
+    return window.HGR_THEME.formatJobTime(job);
+  }
+  return '';
+}
+
+function paintJobTimeEl(el, job) {
+  if (!el || !job) return;
+  const text = formatJobTime(job);
+  el.textContent = text;
+  el.hidden = !text;
+  if (job.startedAt) el.setAttribute('data-job-started', String(job.startedAt));
+  if (job.percent != null) el.setAttribute('data-job-pct', String(job.percent));
+  if (job.playlistIndex != null) el.setAttribute('data-job-pi', String(job.playlistIndex));
+  if (job.playlistCount != null) el.setAttribute('data-job-pc', String(job.playlistCount));
+}
+
+let _jobTimeTick = 0;
+function ensureJobTimeTick() {
+  if (_jobTimeTick) return;
+  _jobTimeTick = setInterval(() => {
+    const nodes = document.querySelectorAll('[data-job-started]');
+    if (!nodes.length) {
+      clearInterval(_jobTimeTick);
+      _jobTimeTick = 0;
+      return;
+    }
+    nodes.forEach((el) => {
+      paintJobTimeEl(el, {
+        startedAt: Number(el.getAttribute('data-job-started')),
+        percent: Number(el.getAttribute('data-job-pct')),
+        playlistIndex: Number(el.getAttribute('data-job-pi')),
+        playlistCount: Number(el.getAttribute('data-job-pc')),
+      });
+    });
+  }, 1000);
+}
+
 /** Signature of stream list so live refresh can skip no-op re-renders. */
 let _lastStreamsSig = '';
 
@@ -405,6 +444,13 @@ function renderJobsBanner(jobs, meta) {
           job.mediaId ? ` · ${job.mediaId}` : ''
         }`;
         card.appendChild(pl);
+      }
+      const timeEl = document.createElement('div');
+      timeEl.className = 'job-time';
+      paintJobTimeEl(timeEl, job);
+      if (timeEl.textContent) {
+        card.appendChild(timeEl);
+        ensureJobTimeTick();
       }
     }
     if (typeof HLS_FFMPEG !== 'undefined' && HLS_FFMPEG.enhanceJobCard) {
@@ -1030,7 +1076,9 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
       h.textContent = pageOnly
         ? isAppleMusicPage
           ? 'Download this track'
-          : 'Download this video'
+          : kind === 'mega'
+            ? 'Download this MEGA file'
+            : 'Download this video'
         : n > 1
           ? `Stream ${i + 1} of ${n}` + (kind ? ` (${kind})` : '')
           : kind
@@ -1051,7 +1099,9 @@ function renderStreams(streams, pageTitle, hasPath, spotifyCtx) {
         intro.className = 'stream-page-intro';
         intro.textContent = isAppleMusicPage
           ? 'Apple Music: yt-dlp uses the song page URL below (not the FairPlay m3u8 stream).'
-          : 'This tab’s post URL. Playlist bits stay on. Tap Clean URL if you want tracking junk removed.';
+          : kind === 'mega'
+            ? 'MEGA public link. Keep the # key on the URL — without it the file cannot be opened.'
+            : 'This tab’s post URL. Playlist bits stay on. Tap Clean URL if you want tracking junk removed.';
         urlEl.appendChild(intro);
         urlEl.appendChild(urlView.el);
         // Clean URL only on the main tab item (not page links).
@@ -1563,6 +1613,8 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
 
   /** Cross-origin player: give the user a real button, not instructions. */
   function renderEmbedHint(list) {
+    // A <video> already on this page is not "played through another site".
+    if (videos.length) return false;
     if (Array.isArray(list) && list.length) embeds = list;
     if (!embeds.length) return false;
     statusEl.textContent = '';

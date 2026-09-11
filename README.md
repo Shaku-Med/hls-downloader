@@ -4,7 +4,7 @@ Personal use only. This is not on the Chrome Web Store, the Edge Add ons store, 
 
 It works in Chromium based browsers (Google Chrome, Microsoft Edge, Brave, Opera, and similar) as an unpacked extension, and in Firefox as a temporary add-on for personal use. Firefox temporary add-ons go away when you quit Firefox, so you load it again next time. That is expected for this personal setup.
 
-The extension watches what a page loads when a video or track plays, then hands the useful links to a small helper on your computer. That helper is a Python program. It runs ffmpeg and yt-dlp so the file can land on your disk. The extension alone cannot save files, so you have to install the helper once.
+The extension watches what a page loads when a video or track plays, then hands the useful links to a small helper on your computer. That helper is a Python program. It runs ffmpeg and yt-dlp so the file can land on your disk. Public MEGA file and folder links are downloaded the same way: open the link, hit Download this MEGA file, and the helper decrypts it. The extension alone cannot save files, so you have to install the helper once.
 
 
 Auto Download GUI
@@ -31,7 +31,7 @@ python -m auto_download
 
 The launchers work even when Python is missing. They detect Windows, macOS, or Linux, look for Python 3.9 or newer, and if none is there they show you the exact install command and ask before running it. Nothing installs unless you answer yes. On Windows it uses winget and picks the newest Python available. On macOS it uses Homebrew. On Linux it uses whichever of apt, dnf, pacman, zypper, or apk you have. After installing it tests that Python and pip actually work. If that test fails it stops, prints the reason, saves an error log, and tells you how to install Python yourself.
 
-Once Python is running, the app window checks the rest of the tools like ffmpeg, yt-dlp, Deno, and Node. Every install command is shown first and asks you to Allow or Deny. Prerequisites are checked first, so a package will not try to install until what it needs is ready. If a required tool fails to install, the run stops and you get the error log plus manual steps. Errors also show in the log pane.
+Once Python is running, the app window checks the rest of the tools like ffmpeg, yt-dlp, cryptography, pycryptodomex, Deno, and Node. Every install command is shown first and asks you to Allow or Deny. Prerequisites are checked first, so a package will not try to install until what it needs is ready. If a required tool fails to install, the run stops and you get the error log plus manual steps. Errors also show in the log pane.
 
 After the tools are ready, keep going with Load the extension and Install the helper below.
 
@@ -163,7 +163,31 @@ python -m yt_dlp --list-impersonate-targets
 If every row says `(unavailable)`, curl-cffi is not installed in the Python the helper runs. That is the important part: it has to go into the same interpreter as the helper, not just any Python on your PATH. Auto Download handles that for you and reads the helper wrapper to find the right one.
 
 
-6. A JavaScript runtime for YouTube (recommended)
+6. cryptography and pycryptodomex (needed to decrypt files)
+
+Two Python packages cover the sites that encrypt what they send you. Auto Download and `python/install.py` install both into the helper Python. You can also install them yourself:
+
+```text
+python -m pip install -U cryptography pycryptodomex
+```
+
+or from this folder:
+
+```text
+python -m pip install -r requirements.txt
+```
+
+`cryptography` is for public MEGA links. `pycryptodomex` is what yt-dlp uses to decrypt AES on other platforms (some HLS, Bilibili sign-in, and a long list of extractors). ffmpeg already unlocks ordinary AES-128 HLS when it can fetch the key. Widevine and FairPlay stay locked; those are DRM, not this kind of encryption.
+
+Check them:
+
+```text
+python -c "import cryptography; print('cryptography', cryptography.__version__)"
+python -c "from Cryptodome.Cipher import AES; import Cryptodome; print('pycryptodomex', Cryptodome.__version__)"
+```
+
+
+7. A JavaScript runtime for YouTube (recommended)
 
 For a lot of YouTube downloads, yt-dlp wants Deno or Node on your PATH. Install one of them if YouTube keeps failing with challenge or solver style errors.
 
@@ -184,7 +208,7 @@ winget install OpenJS.NodeJS.LTS
 or install Node from nodejs.org.
 
 
-7. This project folder
+8. This project folder
 
 Clone the repo from GitHub, then keep this Stuff Grabber folder somewhere stable on disk. If you move it later, you have to run the helper installer again.
 
@@ -265,7 +289,7 @@ It will ask for your Chromium Extension ID (from Load unpacked). You can also pa
 python python/install.py YOUR_EXTENSION_ID
 ```
 
-One run registers the native host for both Google Chrome and Firefox. The Firefox side uses the fixed id `stuff-grabber@local`. The script also installs or updates yt-dlp for that Python and checks for ffmpeg. On Windows it may try winget for ffmpeg if ffmpeg is missing.
+One run registers the native host for both Google Chrome and Firefox. The Firefox side uses the fixed id `stuff-grabber@local`. The script also installs or updates yt-dlp, cryptography, and pycryptodomex for that Python and checks for ffmpeg. On Windows it may try winget for ffmpeg if ffmpeg is missing.
 
 You can still load the unpacked extension in Edge, Brave, and other Chromium browsers. If downloads do not start from those browsers, use Google Chrome for the download step, or re run the installer after loading the extension there.
 
@@ -318,6 +342,36 @@ Open a song, album, or playlist page on `music.apple.com`. Stuff Grabber should 
 Do not expect the raw Apple stream links to work. Those are usually locked with FairPlay, so the extension ignores them on purpose and sticks to the page URL. If Apple or yt-dlp cannot give you a real file, the download fails with an error instead of leaving a silent unplayable file.
 
 
+How to download MEGA files
+
+Open a public mega.nz or mega.co.nz file, folder, or embed link. The key has to stay on the URL after `#`. Without that fragment the file is only ciphertext and nothing can open it.
+
+Stuff Grabber shows Download this MEGA file for those pages. yt-dlp has no Mega extractor, so the helper talks to Mega's public API and decrypts with `cryptography`. Files save under the name Mega stored. A folder link saves the files inside a folder with that name.
+
+These work:
+
+```text
+https://mega.nz/file/xxxxx#yyyyy
+https://mega.nz/folder/xxxxx#yyyyy
+https://mega.nz/embed/xxxxx#yyyyy
+https://mega.nz/#!xxxxx!yyyyy
+https://mega.nz/#F!xxxxx!yyyyy
+```
+
+The homepage or a `/file/xxxxx` link with no `#` key will not get a download row. Copy the full link from the address bar after Mega finishes loading, including the hash.
+
+If the job fails saying cryptography is missing, install it into the same Python the helper uses (see step 6), then run `python python/install.py` again or use Auto Download.
+
+
+Other encrypted platforms
+
+Ordinary HLS that uses `#EXT-X-KEY:METHOD=AES-128` is decrypted by ffmpeg when the playlist gives it a key URL. That is the usual case for a lot of lesson and VOD players.
+
+Other sites that encrypt inside yt-dlp (AES streams, a few login flows) need `pycryptodomex` in that same helper Python. Install it the same way as cryptography. If a download fails with `pycryptodomex not found`, that is the missing piece.
+
+DRM is a different thing. Netflix, Crunchyroll, FairPlay, Widevine, and SAMPLE-AES cannot be decrypted here. The popup says the video is protected and offers the screen recorder.
+
+
 Which pages yt-dlp is used on
 
 One file lists them, `public/data/ytdlp-sites.json`, and both sides read it, so
@@ -342,7 +396,11 @@ searchFallback  true where yt-dlp has no working extractor. The direct pull
 ytdlp           false where we know the site and yt-dlp is not the answer.
                 No row is offered and the helper will not route there, so
                 whatever the network capture found is used instead. The note
-                on the entry says why
+                on the entry says why. A handler (mega) still offers a row
+                and the helper uses that downloader instead of yt-dlp
+handler         mega = public mega.nz file and folder links. The decryption
+                key is the # fragment. requireHash keeps a row off until
+                that key is on the URL
 ```
 
 An endpoint matches on segment boundaries rather than as a plain prefix, since
@@ -360,7 +418,9 @@ API still answers 404, and the page serves plain audio the capture picks up,
 which is the real file rather than a lookalike. Threads has no extractor at
 all and used to be routed at Meta's other domains, where it could only fail.
 Crunchyroll is recognised only so yt-dlp can say it is DRM protected, and the
-protected content notice already offers the recorder there.
+protected content notice already offers the recorder there. MEGA is listed
+with a handler instead: a row is offered, and the helper downloads and
+decrypts the public file or folder itself.
 
 The other half of that check is that the row and the download agree. The
 registry decides whether a This page row appears, the helper decides which tool
@@ -429,6 +489,22 @@ python -m yt_dlp --version
 ```
 
 Then run `python python/install.py` again with the same Python.
+
+MEGA downloads fail with a missing cryptography package:
+
+```text
+python -m pip install -U cryptography
+```
+
+Then run `python python/install.py` again with the same Python, or use Auto Download.
+
+A site fails with "pycryptodomex not found":
+
+```text
+python -m pip install -U pycryptodomex
+```
+
+Same rule as the others: it has to go into the helper Python.
 
 A site fails with "attempting impersonation, but none of these impersonate targets are available". Install curl-cffi into the helper Python:
 
@@ -510,6 +586,8 @@ A Chromium browser (Chrome, Edge, Brave, or similar)
 Python 3.9 or newer with pip
 ffmpeg on PATH
 yt-dlp installed for that Python
+cryptography installed for that Python (MEGA)
+pycryptodomex installed for that Python (other AES / yt-dlp decrypt)
 curl-cffi installed for that Python (Dailymotion and similar)
 Deno or Node on PATH if you care about YouTube
 This repo cloned and the folder loaded as an unpacked extension

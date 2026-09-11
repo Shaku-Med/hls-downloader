@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import unittest
+import urllib.error
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))
@@ -337,6 +338,7 @@ SITE_SAMPLES = {
     "pinterest.com": "https://www.pinterest.com/pin/123456789012345678/",
     "linkedin.com": "https://www.linkedin.com/posts/x_s-activity-7123456789012345678-Ab3x/",
     "snapchat.com": "https://www.snapchat.com/spotlight/W7_ABCDEFG",
+    "mega.nz": "https://mega.nz/file/AbCdEfGh#abcdefghijklmnopqr-stuvwx",
 }
 
 
@@ -358,6 +360,11 @@ class RegistryAndRoutingAgree(unittest.TestCase):
         for site in host._ytdlp_sites():
             url = SITE_SAMPLES[site["hostname"]]
             offers = host._ytdlp_page_role(url) is not None
+            if site.get("handler") == "mega":
+                self.assertTrue(offers, url)
+                self.assertTrue(host._is_mega_public_url(url), url)
+                self.assertIsNone(host._social_platform_for_yt_dlp(url, url, {}))
+                continue
             routes = bool(host._social_platform_for_yt_dlp(url, url, {}))
             self.assertEqual(offers, routes, f"{site['hostname']} ({url})")
 
@@ -621,6 +628,142 @@ class YoutubeRefusalIsRetried(unittest.TestCase):
                      "ERROR: [youtube] private video",
                      ""):
             self.assertFalse(host._looks_like_youtube_blocked(tail), tail)
+
+
+class LocalHlsPlaylist(unittest.TestCase):
+    """Signed CDNs often reject a second GET of the same m3u8; ffmpeg then reports I/O."""
+
+    BASE = "https://cdn.example/pl/token/master.m3u8"
+
+    def test_relative_uris_become_absolute(self):
+        text = (
+            "#EXTM3U\n"
+            '#EXT-X-KEY:METHOD=AES-128,URI="key.bin"\n'
+            "#EXTINF:4.0,\n"
+            "seg0.ts\n"
+        )
+        out = host._rewrite_m3u8_absolute(text, self.BASE)
+        self.assertIn('URI="https://cdn.example/pl/token/key.bin"', out)
+        self.assertIn("https://cdn.example/pl/token/seg0.ts", out)
+
+    def test_cached_playlist_is_used_without_fetching(self):
+        media = "#EXTM3U\n#EXTINF:1,\nseg.ts\n"
+        url, text = host._hls_playlist_from_message(
+            {"playlistText": media, "playlistUrl": self.BASE},
+            "https://cdn.example/other.m3u8",
+            "User-Agent: test\r\n",
+        )
+        self.assertEqual(url, self.BASE)
+        self.assertIn("#EXTM3U", text)
+        self.assertIn("seg.ts", text)
+
+    def test_ffmpeg_io_error_is_treated_as_a_network_fail(self):
+        err = (
+            "ffmpeg exited with code 4294967291: r Error opening input file "
+            "https://example/master.m3u8. Error opening input files: I/O error"
+        )
+        self.assertTrue(host._ffmpeg_looks_like_network_fail(err))
+        self.assertFalse(host._ffmpeg_looks_like_network_fail("Invalid data found"))
+
+    def test_local_file_is_the_ffmpeg_input(self):
+        cmd, _ = host._build_ffmpeg_cmd_list(
+            self.BASE,
+            {"streamKind": "hls", "userAgent": "UA"},
+            "C:\\tmp\\out.ts",
+            "Referer: https://example/\r\n",
+            playlist_text="#EXTM3U\n#EXTINF:1,\nhttps://cdn.example/seg.ts\n",
+            playlist_url=self.BASE,
+            ffmpeg_input="C:\\tmp\\sg_hls_local.m3u8",
+        )
+        i = cmd.index("-i")
+        self.assertTrue(cmd[i + 1].startswith("file:"))
+        self.assertIn("sg_hls_local.m3u8", cmd[i + 1].replace("\\", "/"))
+        self.assertNotIn("https://cdn.example/pl/token/master.m3u8", cmd)
+        self.assertIn("file,http,https,tcp,tls,crypto,ffurl", cmd)
+
+    def test_gzip_path_tokens_are_one_shot(self):
+        url = (
+            "https://claritybusinessacademy.site/OJadn7Aal/pl/"
+            "H4sIAAAAAAAAAw3OW46DIBQA0C2BWBrnszNio_Um8vDBH6IJLWqNdax19TNnBQeFEUHd"
+            "OQwtophSGmLURxb3lAbn3p7NV4b9rj6vXZJUtPWcVZN72GTV.Y_FhrGp/master.m3u8"
+        )
+        self.assertTrue(host._hls_url_looks_one_shot(url))
+        self.assertFalse(host._hls_url_looks_one_shot("https://cdn.example/hls/master.m3u8"))
+
+    def test_openssl_wrong_version_is_an_ssl_fail(self):
+        exc = OSError("[SSL: WRONG_VERSION_NUMBER] wrong version number (_ssl.c:1028)")
+        self.assertTrue(host._http_error_looks_like_ssl(exc))
+        self.assertFalse(host._http_error_looks_like_ssl(OSError("timed out")))
+
+    def test_playlist_fetch_error_is_not_windows_specific(self):
+        msg = host._format_playlist_fetch_error(
+            urllib.error.URLError("extension fetch timed out")
+        )
+        self.assertIn("browser", msg.lower())
+        self.assertNotIn("powershell", msg.lower())
+        self.assertNotIn("curl", msg.lower())
+        ssl_msg = host._format_playlist_fetch_error(
+            OSError("[SSL: WRONG_VERSION_NUMBER] wrong version number")
+        )
+        self.assertNotIn("Windows", ssl_msg)
+        self.assertNotIn("curl", ssl_msg.lower())
+
+    def test_disguised_html_playlist_is_still_hls(self):
+        self.assertTrue(
+            host._is_hls_input("https://cdn.example/hls/playlist.html", {"streamKind": ""})
+        )
+
+
+class MegaPublicLinks(unittest.TestCase):
+    FILE = "https://mega.nz/file/AbCdEfGh#abcdefghijklmnopqr-stuvwx"
+    FOLDER = "https://mega.nz/folder/AbCdEfGh#abcdefghijklmnopqr-stuvwx"
+    OLD_FILE = "https://mega.nz/#!AbCdEfGh!abcdefghijklmnop"
+    OLD_FOLDER = "https://mega.nz/#F!AbCdEfGh!abcdefghijklmnop"
+
+    def setUp(self):
+        host._YTDLP_SITES_CACHE = None
+
+    def test_file_and_folder_urls_parse(self):
+        import mega_fetch
+
+        f = mega_fetch.parse_mega_url(self.FILE)
+        self.assertIsNotNone(f)
+        self.assertEqual(f.kind, "file")
+        self.assertEqual(f.handle, "AbCdEfGh")
+        d = mega_fetch.parse_mega_url(self.FOLDER)
+        self.assertEqual(d.kind, "folder")
+        self.assertEqual(mega_fetch.parse_mega_url(self.OLD_FILE).kind, "file")
+        self.assertEqual(mega_fetch.parse_mega_url(self.OLD_FOLDER).kind, "folder")
+        self.assertIsNone(mega_fetch.parse_mega_url("https://mega.nz/file/AbCdEfGh"))
+        self.assertIsNone(mega_fetch.parse_mega_url("https://mega.nz/"))
+        self.assertIsNone(mega_fetch.parse_mega_url("https://example.com/file/x#y"))
+
+    def test_row_is_offered_only_with_the_key(self):
+        found = host._ytdlp_page_role(self.FILE)
+        self.assertIsNotNone(found)
+        self.assertEqual(found["label"], "MEGA")
+        self.assertEqual(found.get("handler"), "mega")
+        self.assertIsNotNone(host._ytdlp_page_role(self.OLD_FILE))
+        self.assertIsNone(host._ytdlp_page_role("https://mega.nz/file/AbCdEfGh"))
+        self.assertIsNone(host._ytdlp_page_role("https://mega.nz/"))
+
+    def test_download_does_not_go_to_ytdlp(self):
+        self.assertTrue(host._is_mega_public_url(self.FILE))
+        self.assertIsNone(host._social_platform_for_yt_dlp(self.FILE, self.FILE, {}))
+        self.assertEqual(host._pick_mega_url("https://example.com/", self.FILE), self.FILE)
+
+
+class DecryptPackageHints(unittest.TestCase):
+    def test_pycryptodomex_missing_is_recognised(self):
+        self.assertTrue(
+            host._looks_like_missing_pycryptodomex(
+                "ERROR: pycryptodomex not found. Please install"
+            )
+        )
+        self.assertFalse(host._looks_like_missing_pycryptodomex("HTTP 403"))
+        hint = host._pycryptodomex_help_message()
+        self.assertIn("pycryptodomex", hint)
+        self.assertIn("pip install", hint)
 
 
 if __name__ == "__main__":

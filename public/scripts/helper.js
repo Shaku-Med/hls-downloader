@@ -63,6 +63,8 @@ function renderHelperHealth(res) {
   const idEl = document.getElementById('helper-ext-id');
   const ffmpegEl = document.getElementById('helper-ffmpeg');
   const ytdlpEl = document.getElementById('helper-ytdlp');
+  const cryptoEl = document.getElementById('helper-cryptography');
+  const pycryptoEl = document.getElementById('helper-pycryptodomex');
   const pythonEl = document.getElementById('helper-python');
 
   const status = (res && res.status) || 'error';
@@ -113,6 +115,12 @@ function renderHelperHealth(res) {
       if (res.ytdlp && !res.ytdlp.ok) {
         items.push('Install yt-dlp for the helper Python: <code>python -m pip install -U yt-dlp</code>');
       }
+      if (res.cryptography && !res.cryptography.ok) {
+        items.push('Install cryptography for MEGA downloads: <code>python -m pip install -U cryptography</code>');
+      }
+      if (res.pycryptodomex && !res.pycryptodomex.ok) {
+        items.push('Install pycryptodomex for other encrypted sites: <code>python -m pip install -U pycryptodomex</code>');
+      }
       if (res.writeTest && res.writeTest.ran && res.writeTest.ok === false) {
         items.push('Fix the save folder path in Settings, then run Test save folder again.');
       }
@@ -157,6 +165,8 @@ function renderHelperHealth(res) {
     if (showTools) {
       if (ffmpegEl) ffmpegEl.textContent = toolLine(res.ffmpeg);
       if (ytdlpEl) ytdlpEl.textContent = toolLine(res.ytdlp);
+      if (cryptoEl) cryptoEl.textContent = toolLine(res.cryptography);
+      if (pycryptoEl) pycryptoEl.textContent = toolLine(res.pycryptodomex);
       if (pythonEl) pythonEl.textContent = res.python || '…';
     }
   }

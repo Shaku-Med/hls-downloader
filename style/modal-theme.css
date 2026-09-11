@@ -78,6 +78,35 @@
 .hgr-modal-overlay[data-theme="light"][data-accent="rose"] { --accent: #ff2d55; --accent-2: #ff375f; }
 .hgr-modal-overlay[data-theme="light"][data-accent="orange"] { --accent: #ff9500; --accent-2: #ff9f0a; }
 
+@keyframes hgr-island-in {
+  0% { opacity: 0; transform: scale(0.72); filter: blur(8px); }
+  62% { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; transform: scale(1); filter: none; }
+}
+@keyframes hgr-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+.hgr-modal-overlay[data-morph="1"] {
+  animation: hgr-fade-in 280ms cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+.hgr-modal-overlay[data-morph="1"] .hgr-modal-box {
+  animation: hgr-island-in 480ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+.hgr-modal-overlay[data-morph="0"],
+.hgr-modal-overlay[data-morph="0"] .hgr-modal-box,
+.hgr-picker-overlay[data-morph="0"],
+.hgr-picker-overlay[data-morph="0"] .hgr-picker-sheet {
+  animation: none !important;
+}
+.hgr-picker-overlay[data-morph="1"] {
+  animation: hgr-fade-in 280ms cubic-bezier(0.32, 0.72, 0, 1) both;
+}
+.hgr-picker-overlay[data-morph="1"] .hgr-picker-sheet {
+  animation: hgr-island-in 460ms cubic-bezier(0.34, 1.25, 0.64, 1) both;
+}
+
 .hgr-modal-box {
   background: color-mix(in srgb, var(--surface) 92%, transparent);
   backdrop-filter: blur(28px) saturate(170%);

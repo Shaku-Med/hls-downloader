@@ -73,6 +73,29 @@ def _run_streaming(cmd, *, label=""):
     return subprocess.CompletedProcess(cmd, code, out, "")
 
 
+def install_pip_pkg(python_exe, spec, label):
+    print(f"\nInstalling {label} for the host Python...")
+    print(f"  using: {python_exe}")
+    sys.stdout.flush()
+    extra = list(spec) if isinstance(spec, (list, tuple)) else [spec]
+    base = [python_exe, "-m", "pip", "install", "-U", *extra]
+    r = _run_streaming(base, label=f"Downloading and installing {label}...")
+    if r.returncode != 0:
+        print("Retrying with --user ...")
+        sys.stdout.flush()
+        r = _run_streaming(base + ["--user"], label=f"Retrying {label} install for this user...")
+    if r.returncode == 0:
+        print(f"✓ {label} ready")
+        return True
+    print(f"WARNING: could not install {label} automatically.")
+    tail = (r.stderr or r.stdout or "").strip()[-400:]
+    if tail:
+        print("  " + tail.replace("\n", "\n  "))
+    shown = " ".join(extra)
+    print(f'  Do it by hand:  "{python_exe}" -m pip install -U --user {shown}')
+    return False
+
+
 def install_ytdlp(python_exe):
     print("\nInstalling yt-dlp for the host Python...")
     print(f"  using: {python_exe}")
@@ -411,6 +434,17 @@ def main():
 
     ensure_ffmpeg()
     install_ytdlp(sys.executable)
+    req = os.path.join(os.path.dirname(SCRIPT_DIR), "requirements.txt")
+    if os.path.isfile(req):
+        install_pip_pkg(
+            sys.executable,
+            ["-r", req],
+            "helper Python packages (requirements.txt)",
+        )
+    else:
+        install_pip_pkg(sys.executable, "cryptography", "cryptography (MEGA)")
+        install_pip_pkg(sys.executable, "pycryptodomex", "pycryptodomex (yt-dlp decrypt)")
+        install_pip_pkg(sys.executable, "curl-cffi", "curl-cffi")
 
     print(
         "\nAll set. Fully quit and reopen your browser so it picks up the host.\n"

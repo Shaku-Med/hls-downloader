@@ -7,7 +7,7 @@ body {
   font-family: var(--font);
   max-width: 640px;
   margin: 0 auto;
-  padding: 28px 20px 56px;
+  padding: 28px 20px calc(120px + env(safe-area-inset-bottom, 0px));
   color: var(--text);
   background:
     radial-gradient(1200px 420px at 10% -10%, color-mix(in srgb, var(--accent) 14%, transparent), transparent 60%),
@@ -147,8 +147,29 @@ input[type="text"]:focus {
   font-family: var(--font-mono);
 }
 
+.save-bar {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 20;
+  padding: 10px 20px calc(12px + env(safe-area-inset-bottom, 0px));
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border-top: 0.5px solid var(--separator);
+}
+
+.save-bar-inner {
+  max-width: 640px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
 .actions {
-  margin-top: 8px;
+  margin: 0;
   display: flex;
   gap: 10px;
   align-items: center;
@@ -165,17 +186,25 @@ button#save {
   cursor: pointer;
   font-family: inherit;
   letter-spacing: -0.01em;
+  width: 100%;
   transition: filter var(--transition), transform 120ms ease;
 }
 
-button#save:hover { filter: brightness(1.06); }
-button#save:active { transform: scale(0.98); }
+button#save:hover:not(:disabled) { filter: brightness(1.06); }
+button#save:active:not(:disabled) { transform: scale(0.98); }
+button#save:disabled {
+  opacity: 0.42;
+  cursor: default;
+  filter: none;
+}
 
 #status {
   font-size: 14px;
-  margin-top: 14px;
+  margin: 0;
   letter-spacing: -0.01em;
+  min-height: 0;
 }
+#status[hidden] { display: none; }
 #status.ok { color: var(--ok); }
 #status.err { color: var(--danger); }
 

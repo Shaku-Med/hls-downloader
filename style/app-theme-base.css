@@ -36,7 +36,33 @@
   --shadow-soft: 0 1px 0 rgba(255, 255, 255, 0.04) inset;
   --transition: 220ms cubic-bezier(0.25, 0.1, 0.25, 1);
   --spring: 320ms cubic-bezier(0.34, 1.2, 0.64, 1);
+  --spring-in: cubic-bezier(0.34, 1.25, 0.64, 1);
+  --spring-out: cubic-bezier(0.32, 0.72, 0, 1);
   --overlay-bg: rgba(0, 0, 0, 0.48);
+}
+
+/* Morph is for things you press or open — not headers, cards, or page chrome. */
+:root[data-morph="0"],
+:host([data-morph="0"]),
+.hls-grabber-fab-root[data-morph="0"] {
+  --transition: 0ms linear;
+  --spring: 0ms linear;
+}
+
+@keyframes hgr-island-in {
+  0% { opacity: 0; transform: scale(0.72); filter: blur(8px); }
+  62% { opacity: 1; filter: blur(0); }
+  100% { opacity: 1; transform: scale(1); filter: none; }
+}
+
+@keyframes hgr-island-out {
+  0% { opacity: 1; transform: scale(1); filter: none; }
+  100% { opacity: 0; transform: scale(0.78); filter: blur(6px); }
+}
+
+:root[data-morph="0"] .status-pop,
+:root[data-morph="0"] .ios-select-menu {
+  animation: none !important;
 }
 
 :root[data-theme="light"],

@@ -136,6 +136,19 @@
   touch-action: manipulation;
 }
 .panel.open { display: flex; opacity: 1; transform: scale(1); }
+:host([data-morph="1"]) .panel,
+.hls-grabber-fab-root[data-morph="1"] .panel {
+  transition: opacity 320ms cubic-bezier(0.32, 0.72, 0, 1), transform var(--spring);
+}
+:host([data-morph="0"]) .fab,
+:host([data-morph="0"]) .panel,
+:host([data-morph="0"]) .fab-icon,
+.hls-grabber-fab-root[data-morph="0"] .fab,
+.hls-grabber-fab-root[data-morph="0"] .panel,
+.hls-grabber-fab-root[data-morph="0"] .fab-icon {
+  transition: none !important;
+  animation: none !important;
+}
 .panel button,
 .panel .dl-btn,
 .panel .ios-select-trigger,

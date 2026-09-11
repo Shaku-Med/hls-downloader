@@ -167,8 +167,8 @@ def _python_from_host_wrapper() -> Optional[str]:
 def helper_python(minimum: Tuple[int, int] = MIN_PYTHON) -> Optional[PythonInfo]:
     """The interpreter the native host actually runs.
 
-    yt-dlp and curl-cffi have to be installed into this one, not just any
-    Python on PATH.
+    yt-dlp, curl-cffi, cryptography, and pycryptodomex have to be installed into this one,
+    not just any Python on PATH.
     """
     override = os.environ.get("HLS_GRABBER_PYTHON")
     if override and Path(override).is_file():
@@ -253,6 +253,22 @@ def has_ytdlp() -> bool:
 def has_curl_cffi() -> bool:
     """Browser impersonation backend; sites like Dailymotion refuse yt-dlp without it."""
     ok, _ = run_probe(helper_python_argv() + ["-c", "import curl_cffi"])
+    return ok
+
+
+def has_cryptography() -> bool:
+    """AES backend for public mega.nz file and folder downloads."""
+    ok, _ = run_probe(
+        helper_python_argv() + ["-c", "from cryptography.hazmat.primitives.ciphers import Cipher"]
+    )
+    return ok
+
+
+def has_pycryptodomex() -> bool:
+    """yt-dlp AES/RSA backend for extractors and HLS that need pycryptodomex."""
+    ok, _ = run_probe(
+        helper_python_argv() + ["-c", "from Cryptodome.Cipher import AES"]
+    )
     return ok
 
 

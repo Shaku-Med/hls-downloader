@@ -199,6 +199,26 @@ def curl_cffi_plans() -> List[CommandPlan]:
     ]
 
 
+def cryptography_plans() -> List[CommandPlan]:
+    argv = detect.helper_python_argv()
+    return [
+        CommandPlan(
+            label="Install cryptography with pip (MEGA)",
+            argv=[*argv, "-m", "pip", "install", "-U", "cryptography"],
+        )
+    ]
+
+
+def pycryptodomex_plans() -> List[CommandPlan]:
+    argv = detect.helper_python_argv()
+    return [
+        CommandPlan(
+            label="Install pycryptodomex with pip (yt-dlp decrypt)",
+            argv=[*argv, "-m", "pip", "install", "-U", "pycryptodomex"],
+        )
+    ]
+
+
 def deno_plans() -> List[CommandPlan]:
     plans: List[CommandPlan] = []
     family = osinfo.os_family()

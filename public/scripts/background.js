@@ -64,9 +64,43 @@ function netflixSegmentUrl(u) {
   return false;
 }
 
+function isOneShotHlsUrl(url) {
+  const u = String(url || '');
+  if (!u) return false;
+  // gzip+base64 token in the path (H4sI is the gzip magic)
+  if (/H4sIAAAA/i.test(u)) return true;
+  if (/\/[A-Za-z0-9._~\-]{80,}\/(?:master|index|playlist|manifest)[^/]*\.m3u8(?:[?#]|$)/i.test(u)) {
+    return true;
+  }
+  if (
+    /\.m3u8(?:[?#]|$)/i.test(u) &&
+    /[?&](token|signature|sig|expires|exp|policy|key-pair-id|hdnts)=/i.test(u)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** HTML shells (LMS / SCORM / hashed content folders) that hide the real stream. */
+function looksLikeWrappedMediaPage(url) {
+  try {
+    const p = new URL(url).pathname || '';
+    if (/\/page-\d+\.html$/i.test(p)) return true;
+    if (/\/content\/[a-f0-9]{8,}\/[a-f0-9]{8,}\//i.test(p)) return true;
+    if (/\/(lesson|module|scorm|courseware|elearning)\/.+\.html$/i.test(p)) return true;
+  } catch (_) {
+    // ignore
+  }
+  return false;
+}
+
 function shouldIgnoreAsNoiseUrl(url) {
   const u = String(url).toLowerCase();
   if (u.startsWith('blob:') || u.startsWith('data:')) return true;
+  // Playlists win over a token that happens to contain .js / .html / .json.
+  if (/\.m3u8(?:[?#]|$)/i.test(u) || /[/.]m3u(?:[?#]|$)/i.test(u) || isOneShotHlsUrl(url)) {
+    return false;
+  }
   if (
     u.includes('doubleclick') ||
     u.includes('googleads') ||
@@ -83,6 +117,8 @@ function shouldIgnoreAsNoiseUrl(url) {
     if (!/type=video|mime=video|contenttype=video/i.test(u)) return true;
   }
   if (/\/(seg[-_]?\d+\.|chunk|segment-?\d+|[a-f0-9]{4,20}\.m4s|init\.(mp4|m4a))(?:\?|$)/i.test(u)) return true;
+  // Player control / keepalive endpoints, not a file you can save.
+  if (/\/(remote_control|heartbeat|keepalive|watchdog)(?:\.php)?(?:[?#]|$)/i.test(u)) return true;
   if (hlsMediaSegmentUrl(u)) return true;
   if (netflixSegmentUrl(u)) return true;
   return false;
@@ -156,6 +192,24 @@ function isAppleMusicTrackPage(url) {
   }
 }
 
+function isMegaPublicUrl(url) {
+  try {
+    const u = new URL(String(url || ''));
+    const host = (u.hostname || '').toLowerCase().replace(/^www\./, '');
+    if (host !== 'mega.nz' && host !== 'mega.co.nz' && !host.endsWith('.mega.nz')) {
+      return false;
+    }
+    const path = u.pathname || '/';
+    const hash = (u.hash || '').replace(/^#/, '');
+    if (!hash) return false;
+    if (/^\/(file|folder|embed)\//i.test(path)) return true;
+    if (/^(!|F!)/.test(hash)) return true;
+    return false;
+  } catch (_) {
+    return false;
+  }
+}
+
 function isAppleMediaCdnUrl(url) {
   const h = hostOfUrl(url);
   if (!h) return false;
@@ -222,8 +276,19 @@ function classifyVideoFromUrl(url) {
     return { kind: 'social', reason: 'host' };
   }
 
+  if (isMegaPublicUrl(url)) {
+    return { kind: 'mega', reason: 'mega' };
+  }
+
   if (/[/.](m3u8|m3u)(?:[?#]|$)/.test(u)) {
     return { kind: 'hls', reason: 'path' };
+  }
+  // Playlists served as .html / .json / .js / .php the way some CDNs hide HLS.
+  if (
+    /[/.](html|json|js|txt|php|asp|aspx|ashx)(?:[?#]|$)/.test(u) &&
+    /(playlist|manifest|master|index-|\/hls\/|\/pl\/|\.m3u)/i.test(u)
+  ) {
+    return { kind: 'hls', reason: 'disguised' };
   }
   if (/[/.]mpd(?:[?#]|$)/.test(u) || (u.includes('dash') && (u.includes('manifest') || u.includes('.mpd')))) {
     return { kind: 'dash', reason: 'path' };
@@ -377,21 +442,331 @@ function genericBinaryMediaKind(url, headers) {
   return totalSizeFromHeaders(headers) >= GENERIC_MEDIA_MIN_BYTES ? 'direct' : null;
 }
 
+/**
+ * video/* on a .php path is often a control/API response, not a file.
+ * remote_control.php is the usual offender. Real php-served media still
+ * passes when it is seekable and large, or names a media file.
+ */
+function headerStreamCredible(url, headers, kind) {
+  if (kind !== 'by_header') return true;
+  let path = '';
+  try {
+    path = new URL(url).pathname || '';
+  } catch (_) {
+    path = String(url || '');
+  }
+  if (/\/(remote_control|heartbeat|keepalive|watchdog)(?:\.php)?(?:[?#]|$)/i.test(path)) {
+    return false;
+  }
+  if (!/\.php$/i.test(path)) return true;
+  const disposition = filenameFromContentDisposition(
+    getHeaderValue(headers, 'content-disposition')
+  );
+  if (MEDIA_FILE_RE.test(disposition) || MEDIA_FILE_RE.test(String(url || ''))) return true;
+  const seekable =
+    /bytes/i.test(getHeaderValue(headers, 'accept-ranges')) ||
+    !!getHeaderValue(headers, 'content-range');
+  return seekable && totalSizeFromHeaders(headers) >= GENERIC_MEDIA_MIN_BYTES;
+}
+
+/** url -> { text, playlistUrl, at } or { pending } — grabbed as soon as the page requests it. */
+const hlsPlaylistCache = new Map();
+const HLS_PLAYLIST_CACHE_MAX = 500000;
+const HLS_PLAYLIST_SESSION_KEY = 'sgHlsPlaylistCache';
+
+function persistHlsPlaylistRec(url, rec) {
+  if (!url || !rec || !rec.text) return;
+  if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.session) return;
+  const slim = {
+    text: rec.text,
+    playlistUrl: rec.playlistUrl || url,
+    at: rec.at || Date.now(),
+  };
+  const keys = [url];
+  if (rec.playlistUrl && rec.playlistUrl !== url) keys.push(rec.playlistUrl);
+  const fam = hlsPlaylistFamilyKey(url);
+  if (fam) keys.push(fam);
+  const fam2 = rec.playlistUrl ? hlsPlaylistFamilyKey(rec.playlistUrl) : '';
+  if (fam2 && fam2 !== fam) keys.push(fam2);
+  chrome.storage.session
+    .get(HLS_PLAYLIST_SESSION_KEY)
+    .then((got) => {
+      const bag = { ...(got[HLS_PLAYLIST_SESSION_KEY] || {}) };
+      for (const k of keys) bag[k] = slim;
+      const entries = Object.entries(bag);
+      if (entries.length > 48) {
+        entries.sort((a, b) => (a[1] && a[1].at ? a[1].at : 0) - (b[1] && b[1].at ? b[1].at : 0));
+        for (let i = 0; i < entries.length - 36; i += 1) {
+          delete bag[entries[i][0]];
+        }
+      }
+      return chrome.storage.session.set({ [HLS_PLAYLIST_SESSION_KEY]: bag });
+    })
+    .catch(() => {});
+}
+
+async function playlistFromSession(url) {
+  if (!url || typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.session) {
+    return null;
+  }
+  try {
+    const got = await chrome.storage.session.get(HLS_PLAYLIST_SESSION_KEY);
+    const bag = got[HLS_PLAYLIST_SESSION_KEY] || {};
+    const fam = hlsPlaylistFamilyKey(url);
+    const rec = bag[url] || (fam && bag[fam]) || null;
+    if (rec && rec.text) return rec;
+  } catch (_) {
+    // ignore
+  }
+  return null;
+}
+
+function isHlsStreamKind(kind) {
+  return kind === 'hls' || kind === 'hls_by_header';
+}
+
+function headersForPlaylistFetch(captured) {
+  const src = captured || {};
+  const out = {};
+  const map = {
+    cookie: 'Cookie',
+    referer: 'Referer',
+    origin: 'Origin',
+    authorization: 'Authorization',
+    'user-agent': 'User-Agent',
+    accept: 'Accept',
+    'accept-language': 'Accept-Language',
+  };
+  Object.keys(map).forEach((k) => {
+    if (src[k]) out[map[k]] = src[k];
+  });
+  if (!out['User-Agent']) {
+    try {
+      out['User-Agent'] = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+    } catch (_) {
+      // ignore
+    }
+  }
+  if (!out.Accept) out.Accept = '*/*';
+  return out;
+}
+
+function pickHighestBandwidthVariant(text, playlistUrl) {
+  const lines = String(text || '').split(/\r?\n/);
+  let bestBw = -1;
+  let bestUri = '';
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (!line.startsWith('#EXT-X-STREAM-INF')) continue;
+    const m = /BANDWIDTH=(\d+)/i.exec(line);
+    const bw = m ? parseInt(m[1], 10) : 0;
+    let uri = '';
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const ln = lines[j].trim();
+      if (!ln || ln.startsWith('#')) continue;
+      uri = ln;
+      break;
+    }
+    if (uri && bw >= bestBw) {
+      bestBw = bw;
+      bestUri = uri;
+    }
+  }
+  if (!bestUri) return '';
+  try {
+    return new URL(bestUri, playlistUrl).href;
+  } catch (_) {
+    return bestUri;
+  }
+}
+
+function attachPlaylistToStream(tabId, url, rec) {
+  if (!rec || !rec.text || !tabId || tabId < 0) return;
+  const list = detectedStreams[tabId] || [];
+  const fam = hlsPlaylistFamilyKey(url);
+  for (const found of list) {
+    if (!found || !found.url) continue;
+    if (found.url === url || (fam && hlsPlaylistFamilyKey(found.url) === fam)) {
+      found.playlistText = rec.text;
+      found.playlistUrl = rec.playlistUrl || found.url;
+      if (isOneShotHlsUrl(found.url) || isOneShotHlsUrl(url)) found.oneShotHls = true;
+    }
+  }
+}
+
+/** Group signed /pl/<token>/master.m3u8 and /pl/<token>/<id>/index.m3u8 together. */
+function hlsPlaylistFamilyKey(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname || '';
+    const pl = path.match(/^(.*\/pl\/[^/]+)\//i);
+    if (pl) return `${u.origin}${pl[1].toLowerCase()}`;
+    const gz = path.match(/^(.*\/h4siaaaa[^/]*)/i);
+    if (gz) return `${u.origin}${gz[1].toLowerCase()}`;
+    const dir = path.replace(/\/[^/]+\.m3u8$/i, '');
+    return dir ? `${u.origin}${dir.toLowerCase()}` : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function playlistRecordFromFamily(tabId, url) {
+  const fam = hlsPlaylistFamilyKey(url);
+  if (fam) {
+    const rec = hlsPlaylistCache.get(fam);
+    if (rec && rec.text) return rec;
+  }
+  if (tabId == null) return null;
+  const list = detectedStreams[tabId] || [];
+  for (const e of list) {
+    if (!e || !e.playlistText) continue;
+    if (e.url === url) return { text: e.playlistText, playlistUrl: e.playlistUrl || e.url };
+    if (fam && hlsPlaylistFamilyKey(e.url) === fam) {
+      return { text: e.playlistText, playlistUrl: e.playlistUrl || e.url };
+    }
+  }
+  return null;
+}
+
+async function fetchHlsPlaylistText(url, captured) {
+  const headers = headersForPlaylistFetch(captured);
+  if (!headers.Cookie) {
+    try {
+      const cookies = await chrome.cookies.getAll({ url });
+      if (cookies && cookies.length) {
+        headers.Cookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
+      }
+    } catch (_) {
+      // ignore
+    }
+  }
+  const res = await fetch(url, { method: 'GET', headers, redirect: 'follow' });
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status}`);
+  }
+  const text = await res.text();
+  if (text.length > HLS_PLAYLIST_CACHE_MAX) {
+    throw new Error('playlist too large');
+  }
+  if (!/#EXTM3U/i.test(text)) {
+    throw new Error('not an HLS playlist');
+  }
+  return text;
+}
+
+function storeHlsPlaylist(tabId, url, text, playlistUrl) {
+  if (!url || !text || !/#EXTM3U/i.test(text)) return null;
+  if (text.length > HLS_PLAYLIST_CACHE_MAX) return null;
+  const rec = { text, playlistUrl: playlistUrl || url, at: Date.now() };
+  hlsPlaylistCache.set(url, rec);
+  if (playlistUrl && playlistUrl !== url) hlsPlaylistCache.set(playlistUrl, rec);
+  const fam = hlsPlaylistFamilyKey(url);
+  if (fam) hlsPlaylistCache.set(fam, rec);
+  const fam2 = playlistUrl ? hlsPlaylistFamilyKey(playlistUrl) : '';
+  if (fam2 && fam2 !== fam) hlsPlaylistCache.set(fam2, rec);
+  attachPlaylistToStream(tabId, url, rec);
+  if (playlistUrl && playlistUrl !== url) attachPlaylistToStream(tabId, playlistUrl, rec);
+  persistHlsPlaylistRec(url, rec);
+  return rec;
+}
+
+/**
+ * Race the page: as soon as we see the m3u8 request, fetch it ourselves with
+ * the same headers. Signed CDN tokens often work for concurrent hits and fail
+ * if we wait until the user clicks Download.
+ */
+function prefetchHlsPlaylist(tabId, url, capturedHeaders) {
+  if (!url) return;
+  const existing = hlsPlaylistCache.get(url);
+  if (existing && existing.text) return;
+  const fam = hlsPlaylistFamilyKey(url);
+  const famRec = fam ? hlsPlaylistCache.get(fam) : null;
+  if (famRec && famRec.text) {
+    storeHlsPlaylist(tabId, url, famRec.text, famRec.playlistUrl || url);
+    return;
+  }
+  if (existing && existing.pending) return;
+  const pending = (async () => {
+    let text = await fetchHlsPlaylistText(url, capturedHeaders);
+    let playlistUrl = url;
+    try {
+      let guard = 0;
+      while (/#EXT-X-STREAM-INF/i.test(text) && guard < 8) {
+        guard += 1;
+        const variant = pickHighestBandwidthVariant(text, playlistUrl);
+        if (!variant || variant === playlistUrl) break;
+        text = await fetchHlsPlaylistText(variant, capturedHeaders);
+        playlistUrl = variant;
+      }
+    } catch (_) {
+      // Keep the master playlist if a later variant GET is rejected.
+    }
+    return storeHlsPlaylist(tabId, url, text, playlistUrl);
+  })();
+  hlsPlaylistCache.set(url, { pending });
+  pending.catch(() => {
+    const cur = hlsPlaylistCache.get(url);
+    if (cur && cur.pending === pending && !cur.text) {
+      hlsPlaylistCache.delete(url);
+    }
+  });
+}
+
+async function playlistRecordForUrl(url) {
+  let rec = hlsPlaylistCache.get(url);
+  if ((!rec || (!rec.text && !rec.pending)) && url) {
+    const fam = hlsPlaylistFamilyKey(url);
+    if (fam) rec = hlsPlaylistCache.get(fam) || rec;
+  }
+  if (!rec) {
+    rec = await playlistFromSession(url);
+    if (rec && rec.text) {
+      storeHlsPlaylist(null, url, rec.text, rec.playlistUrl || url);
+      return rec;
+    }
+  }
+  if (!rec) return null;
+  if (rec.pending) {
+    try {
+      return await rec.pending;
+    } catch (_) {
+      return hlsPlaylistCache.get(url) || (url && hlsPlaylistCache.get(hlsPlaylistFamilyKey(url))) || null;
+    }
+  }
+  return rec.text ? rec : null;
+}
+
 function upsertStream(tabId, url, capturedHeaders, streamKind) {
   if (!url || !tabId || tabId < 0) return;
   if (shouldIgnoreAsNoiseUrl(url)) return;
   if (!detectedStreams[tabId]) detectedStreams[tabId] = [];
   const list = detectedStreams[tabId];
+  const cached = hlsPlaylistCache.get(url);
+  const playlistPatch =
+    cached && cached.text
+      ? { playlistText: cached.text, playlistUrl: cached.playlistUrl || url }
+      : {};
   const found = list.find((e) => e.url === url);
   if (found) {
     found.capturedHeaders = { ...found.capturedHeaders, ...capturedHeaders };
     if (streamKind) found.streamKind = streamKind;
+    if (playlistPatch.playlistText) {
+      found.playlistText = playlistPatch.playlistText;
+      found.playlistUrl = playlistPatch.playlistUrl;
+    }
+    if (isOneShotHlsUrl(url)) found.oneShotHls = true;
     return;
   }
   const fromUrl = streamKind ? null : classifyVideoFromUrl(url);
   const kind = streamKind || (fromUrl && fromUrl.kind);
   if (!kind) return;
-  list.push({ url, streamKind: kind, capturedHeaders: { ...capturedHeaders } });
+  list.push({
+    url,
+    streamKind: kind,
+    capturedHeaders: { ...capturedHeaders },
+    oneShotHls: isOneShotHlsUrl(url) || undefined,
+    ...playlistPatch,
+  });
   console.log('Video stream:', kind, url);
   chrome.action.setBadgeText({ text: String(list.length), tabId });
   chrome.action.setBadgeBackgroundColor({ color: '#e53e3e', tabId });
@@ -578,7 +953,7 @@ function ensureRegistryPageRow(tabId, pageUrl) {
   list.unshift({
     url,
     cleanedUrl: url,
-    streamKind: 'social',
+    streamKind: known.handler === 'mega' ? 'mega' : 'social',
     pageDownload: true,
     urlSource: 'tab',
     siteRole: known.role,
@@ -710,6 +1085,9 @@ function pickForwardHeaders(requestHeaders) {
     'cookie',
     'referer',
     'origin',
+    'user-agent',
+    'accept',
+    'accept-language',
     'sec-fetch-mode',
     'sec-fetch-site',
     'sec-fetch-dest',
@@ -754,6 +1132,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
     const tabId = details.tabId;
     if (tabId < 0) return;
     const captured = pickForwardHeaders(details.requestHeaders);
+    if (hit.kind === 'hls') {
+      prefetchHlsPlaylist(tabId, url, captured);
+    }
     if (hit.kind === 'social' || hit.kind === 'yt') {
       upsertYtdlpPagePlaceholder(tabId, captured);
       return;
@@ -789,6 +1170,22 @@ chrome.webRequest.onHeadersReceived.addListener(
     if (tabId < 0) return;
     const url = details.url;
     if (url.startsWith('http:') === false && url.startsWith('https:') === false) return;
+    const ctEarly = getHeaderValue(details.responseHeaders, 'content-type');
+    const kindFromCt = streamKindFromContentType(ctEarly);
+    // mpegurl/dash even when the URL is disguised as .html / .json / .js
+    if (kindFromCt === 'hls_by_header' || kindFromCt === 'dash') {
+      if (kindFromCt === 'hls_by_header') {
+        prefetchHlsPlaylist(tabId, url, {});
+      }
+      chrome.tabs.get(tabId, (tab) => {
+        if (!chrome.runtime.lastError && tab && isAppleMusicPage(tab.url || '')) {
+          upsertYtdlpPagePlaceholder(tabId, {});
+          return;
+        }
+        upsertStream(tabId, url, {}, kindFromCt);
+      });
+      return;
+    }
     if (shouldIgnoreAsNoiseUrl(url)) return;
     const lower = String(url).toLowerCase();
     if (/[/.]ts(?:[?#]|$)/i.test(lower) && /(cdninstagram|fbcdn|twimg|googlevideo|akamai|cloudfront|fastly)/i.test(lower)) {
@@ -810,7 +1207,11 @@ chrome.webRequest.onHeadersReceived.addListener(
       streamKindFromContentType(ct) || genericBinaryMediaKind(url, details.responseHeaders);
     if (!k) return;
     if (k === 'by_header' && /[/.](ts|m2ts|mts|m4s)(?:[?#]|$)/i.test(lower)) return;
+    if (!headerStreamCredible(url, details.responseHeaders, k)) return;
     if (k === 'hls_by_header' || k === 'dash') {
+      if (k === 'hls_by_header') {
+        prefetchHlsPlaylist(tabId, url, {});
+      }
       chrome.tabs.get(tabId, (tab) => {
         if (!chrome.runtime.lastError && tab && isAppleMusicPage(tab.url || '')) {
           upsertYtdlpPagePlaceholder(tabId, {});
@@ -1079,6 +1480,12 @@ async function scanAllFrames(tabId) {
     for (const v of res.videos || []) {
       merged.push({ ...v, frameId, frameIndex: v.index, frameHost: host });
     }
+    for (const raw of res.mediaUrls || []) {
+      const mediaUrl = String(raw || '').trim();
+      if (!mediaUrl) continue;
+      const hit = classifyVideoFromUrl(mediaUrl);
+      upsertStream(tabId, mediaUrl, {}, (hit && hit.kind) || 'direct');
+    }
     // Only the top frame can see iframes worth offering as a fallback.
     if (frameId === 0 && Array.isArray(res.embeddedPlayers)) {
       embeddedPlayers = res.embeddedPlayers;
@@ -1145,6 +1552,23 @@ async function reinjectPageContentScripts(tabIds) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
+        files: ['public/scripts/hls-playlist-hook.js'],
+        world: 'MAIN',
+      });
+    } catch (_) {
+      // Restricted pages, discarded tabs, missing file-access, etc.
+    }
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
+        files: ['public/scripts/hls-playlist-bridge.js'],
+      });
+    } catch (_) {
+      // Restricted pages, discarded tabs, missing file-access, etc.
+    }
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId, allFrames: true },
         files: [RECORDER_SCRIPT],
       });
     } catch (_) {
@@ -1201,10 +1625,18 @@ function ensurePageScriptsOnTab(tabId, url) {
           void reinjectPageContentScripts([tabId]);
           return;
         }
-        if (!res.fab) {
-          chrome.tabs.sendMessage(tabId, { type: 'HLS_GRABBER_REMOUNT' }, () => {
-            void chrome.runtime.lastError;
-          });
+        if (!res.fab && !res.floatOff) {
+          try {
+            chrome.storage.local.get(FLOAT_GRABBER_KEY, (d) => {
+              if (chrome.runtime.lastError) return;
+              if (d && d[FLOAT_GRABBER_KEY] === false) return;
+              chrome.tabs.sendMessage(tabId, { type: 'HLS_GRABBER_REMOUNT' }, () => {
+                void chrome.runtime.lastError;
+              });
+            });
+          } catch (_) {
+            // ignore
+          }
         }
       });
     } catch (_) {
@@ -1883,6 +2315,7 @@ function notifyTabDownloadProgress(tabId, job) {
       streamUrl: streamUrl || null,
       pageUrl: pageUrl || null,
       error: job.error || null,
+      startedAt: job.startedAt || null,
     },
   };
   try {
@@ -2076,11 +2509,69 @@ function progressWriteIsDue(jobId, patch, prevDetail) {
   return false;
 }
 
+async function fulfillHostHttpGet(msg, slotIndex) {
+  const port = slots[slotIndex] && slots[slotIndex].port;
+  const requestId = msg && msg.requestId;
+  const jobId = msg && msg.jobId;
+  const reply = (payload) => {
+    if (!port || !requestId) return;
+    try {
+      port.postMessage({ type: 'http_get_result', requestId, jobId, ...payload });
+    } catch (_) {
+      // ignore
+    }
+  };
+  try {
+    const url = String((msg && msg.url) || '');
+    if (!url) throw new Error('No URL');
+    const headers = { ...((msg && msg.headers) || {}) };
+    if (msg.byteRange && msg.byteRange.length === 2) {
+      const rs = Number(msg.byteRange[0]);
+      const ln = Number(msg.byteRange[1]);
+      if (Number.isFinite(rs) && Number.isFinite(ln) && ln > 0) {
+        headers.Range = `bytes=${rs}-${rs + ln - 1}`;
+      }
+    }
+    const hasCookie = !!(headers.Cookie || headers.cookie);
+    const res = await fetch(url, {
+      method: 'GET',
+      headers,
+      redirect: 'follow',
+      credentials: hasCookie ? 'omit' : 'include',
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const buf = new Uint8Array(await res.arrayBuffer());
+    const chunkSize = 240000;
+    const total = Math.max(1, Math.ceil(buf.length / chunkSize) || 1);
+    if (!buf.length) {
+      reply({ ok: true, chunk: 0, total: 1, data: '' });
+      return;
+    }
+    for (let i = 0; i < total; i += 1) {
+      const slice = buf.subarray(i * chunkSize, Math.min(buf.length, (i + 1) * chunkSize));
+      let bin = '';
+      const step = 0x8000;
+      for (let j = 0; j < slice.length; j += step) {
+        bin += String.fromCharCode.apply(null, slice.subarray(j, j + step));
+      }
+      reply({ ok: true, chunk: i, total, data: btoa(bin) });
+    }
+  } catch (e) {
+    reply({ ok: false, error: String((e && e.message) || e) });
+  }
+}
+
 function onHostMessage(msg, slotIndex) {
+  if (msg && msg.type === 'http_get') {
+    void fulfillHostHttpGet(msg, slotIndex);
+    return;
+  }
   const jobId = msg && msg.jobId;
   if (!jobId) return;
   (async () => {
     if (msg.type === 'progress') {
+      const knownEarly = _jobCache.get(jobId);
+      if (knownEarly && knownEarly.status === 'canceled') return;
       const patch = {
         status: 'downloading',
         detail: msg.detail || msg.phase || 'Running',
@@ -2129,12 +2620,15 @@ function onHostMessage(msg, slotIndex) {
     if (msg.canceled) {
       const st = await readJobsState();
       const prev = (st.jobs || []).find((j) => j.id === jobId);
-      await patchJob(jobId, {
+      const jobs = await patchJob(jobId, {
         status: 'canceled',
         error: msg.error || 'Canceled',
         detail: '',
         outputPath: msg.output || prev?.outputPath || null,
       });
+      const job = (jobs || []).find((j) => j && j.id === jobId);
+      if (job) _jobCache.set(jobId, job);
+      if (job && job.tabId != null) notifyTabDownloadProgress(job.tabId, job);
     } else if (msg.success) {
       const jobs = await patchJob(jobId, {
         status: 'completed',
@@ -2155,8 +2649,21 @@ function onHostMessage(msg, slotIndex) {
       const job = (jobs || []).find((j) => j && j.id === jobId);
       if (job && job.tabId != null) notifyTabDownloadProgress(job.tabId, job);
     }
+    recycleSlotPort(slotIndex);
     tryDispatch();
   })();
+}
+
+function recycleSlotPort(slotIndex) {
+  const port = slots[slotIndex].port;
+  slots[slotIndex].port = null;
+  slots[slotIndex].jobId = null;
+  if (!port) return;
+  try {
+    port.disconnect();
+  } catch (_) {
+    // ignore
+  }
 }
 
 function onSlotDisconnect(slotIndex) {
@@ -2269,14 +2776,29 @@ async function waitForJobInactive(jobId, timeoutMs = 120000) {
   }
 }
 
+async function markJobCanceled(jobId, error) {
+  const jobs = await patchJob(jobId, {
+    status: 'canceled',
+    error: error || 'Canceled',
+    detail: '',
+  });
+  const job = (jobs || []).find((j) => j && j.id === jobId);
+  if (job) {
+    _jobCache.set(jobId, job);
+    if (job.tabId != null) notifyTabDownloadProgress(job.tabId, job);
+  }
+  return job;
+}
+
 /** Same cancel path as the Cancel button; optional wait until the slot is free. */
 async function cancelDownloadById(jobId, { wait = false } = {}) {
   if (removeFromPendingOnly(jobId)) {
-    await patchJob(jobId, { status: 'canceled', error: 'Canceled before it started', detail: '' });
+    await markJobCanceled(jobId, 'Canceled before it started');
     tryDispatch();
     return;
   }
   const si = findSlotIndexByJobId(jobId);
+  await markJobCanceled(jobId, 'Canceled');
   if (si >= 0 && slots[si].port) {
     try {
       slots[si].port.postMessage({ type: 'cancel', jobId });
@@ -2287,7 +2809,6 @@ async function cancelDownloadById(jobId, { wait = false } = {}) {
     }
   } else if (si >= 0) {
     slots[si].jobId = null;
-    await patchJob(jobId, { status: 'canceled', error: 'Canceled', detail: '' });
     tryDispatch();
   }
   if (wait) {
@@ -2448,6 +2969,8 @@ function probeHelperHealth(opts) {
       if (!msg || msg.type !== 'health_result' || msg.requestId !== requestId) return;
       const ffmpeg = msg.ffmpeg || {};
       const ytdlp = msg.ytdlp || {};
+      const cryptography = msg.cryptography || {};
+      const pycryptodomex = msg.pycryptodomex || {};
       const writeTest = msg.writeTest || {};
       const toolsOk = !!(ffmpeg.ok && ytdlp.ok);
       const writeFailed = testWrite && writeTest.ran && writeTest.ok === false;
@@ -2462,6 +2985,8 @@ function probeHelperHealth(opts) {
         ffmpeg,
         ffprobe: msg.ffprobe || {},
         ytdlp,
+        cryptography,
+        pycryptodomex,
         writeTest,
         ...base,
       });
@@ -2916,6 +3441,40 @@ function downloadUrlPromise(opts) {
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === 'HLS_PLAYLIST_CAPTURE') {
+    const tabId = sender && sender.tab && sender.tab.id;
+    storeHlsPlaylist(tabId, message.url, message.text, message.url);
+    respond(sendResponse, { ok: true });
+    return true;
+  }
+
+  if (message && message.type === 'PAGE_MEDIA_URLS') {
+    const tabId = sender && sender.tab && sender.tab.id;
+    const urls = Array.isArray(message.urls) ? message.urls : [];
+    for (const raw of urls) {
+      const url = String(raw || '').trim();
+      if (!url || !/^https?:/i.test(url)) continue;
+      if (shouldIgnoreAsNoiseUrl(url)) continue;
+      const hit = classifyVideoFromUrl(url);
+      upsertStream(tabId, url, {}, (hit && hit.kind) || 'direct');
+    }
+    respond(sendResponse, { ok: true });
+    return true;
+  }
+
+  if (message && message.type === 'HLS_EMBED_URLS') {
+    const tabId = sender && sender.tab && sender.tab.id;
+    const urls = Array.isArray(message.urls) ? message.urls : [];
+    for (const raw of urls) {
+      const url = String(raw || '').trim();
+      if (!url || !/^https?:/i.test(url)) continue;
+      prefetchHlsPlaylist(tabId, url, {});
+      upsertStream(tabId, url, {}, 'hls');
+    }
+    respond(sendResponse, { ok: true });
+    return true;
+  }
+
   if (message.type === 'POPUP_OPENED') {
     broadcastCloseFloatPanel();
     respond(sendResponse, { ok: true });
@@ -3471,7 +4030,40 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
         const res = await askFrame(tabId, frameId, forward);
-        respond(sendResponse, res || { ok: false, error: 'That frame stopped responding' });
+        if (res && res.ok) {
+          respond(sendResponse, res);
+          return;
+        }
+        // Rec/focus missed this frameId (about:blank player, stale index).
+        // Try every frame that actually has a <video> — do not blame ads.
+        if (message.action === 'start' || message.action === 'focus') {
+          const scan = await scanAllFrames(tabId);
+          const candidates = (scan.videos || []).slice().sort((a, b) => {
+            const aa = (Number(a.width) || 0) * (Number(a.height) || 0);
+            const bb = (Number(b.width) || 0) * (Number(b.height) || 0);
+            return bb - aa;
+          });
+          let last = res;
+          for (const v of candidates) {
+            const fid = Number(v.frameId);
+            if (!Number.isFinite(fid)) continue;
+            if (fid === frameId && last && last.error) continue;
+            const retry = Object.assign({}, forward);
+            if (message.action === 'focus') retry.index = v.frameIndex;
+            if (message.action === 'start') retry.startIndex = v.frameIndex;
+            const r2 = await askFrame(tabId, fid, retry);
+            if (r2 && r2.ok) {
+              respond(sendResponse, r2);
+              return;
+            }
+            if (r2) last = r2;
+          }
+          if (last) {
+            respond(sendResponse, last);
+            return;
+          }
+        }
+        respond(sendResponse, res || { ok: false, error: 'That player stopped responding' });
       } catch (e) {
         respond(sendResponse, { ok: false, error: String((e && e.message) || e) });
       }
@@ -3708,6 +4300,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         referer: payload.referer,
         pageUrl: payload.pageUrl,
         origin: payload.origin,
+        playlistText: payload.playlistText,
+        playlistUrl: payload.playlistUrl,
+        oneShotHls:
+          !!payload.oneShotHls ||
+          isOneShotHlsUrl(payload.url) ||
+          looksLikeWrappedMediaPage(tabUrl) ||
+          looksLikeWrappedMediaPage(payload.pageUrl),
       };
       if (!base.userAgent) {
         try {
@@ -3725,6 +4324,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
       }
       base.pageUrl = resolveYtdlpPageUrl(base.url || payload.url, tabUrl, base.pageUrl);
+      if (!base.playlistText) {
+        const rec = await playlistRecordForUrl(payload.url);
+        if (rec && rec.text) {
+          base.playlistText = rec.text;
+          base.playlistUrl = rec.playlistUrl || payload.url;
+        }
+      }
       const timeoutMs = 90000;
       let settled = false;
       const port = chrome.runtime.connectNative(NATIVE);
@@ -3877,6 +4483,39 @@ async function startDownloadJob(payload, fallbackTabId) {
     }
   }
   base.pageUrl = resolveYtdlpPageUrl(base.url || payload.url, tabUrl, base.pageUrl);
+  if (isHlsStreamKind(payload.streamKind) || /\.m3u8(?:[?#]|$)/i.test(String(payload.url || ''))) {
+    let rec = null;
+    const fromStream = (detectedStreams[tabIdForJob] || []).find((e) => e && e.url === payload.url);
+    if (fromStream && fromStream.playlistText) {
+      rec = { text: fromStream.playlistText, playlistUrl: fromStream.playlistUrl || payload.url };
+    }
+    if (!rec) rec = await playlistRecordForUrl(payload.url);
+    if (!rec || !rec.text) rec = playlistRecordFromFamily(tabIdForJob, payload.url);
+    if (!rec || !rec.text) {
+      try {
+        const captured = (fromStream && fromStream.capturedHeaders) || payload.capturedHeaders || {};
+        const text = await fetchHlsPlaylistText(payload.url, captured);
+        rec = storeHlsPlaylist(tabIdForJob, payload.url, text, payload.url) || {
+          text,
+          playlistUrl: payload.url,
+        };
+      } catch (_) {
+        // Host will try once more with the same headers.
+      }
+    }
+    if (rec && rec.text) {
+      base.playlistText = rec.text;
+      base.playlistUrl = rec.playlistUrl || payload.url;
+    }
+    if (
+      isOneShotHlsUrl(payload.url) ||
+      (fromStream && fromStream.oneShotHls) ||
+      looksLikeWrappedMediaPage(tabUrl) ||
+      looksLikeWrappedMediaPage(base.pageUrl)
+    ) {
+      base.oneShotHls = true;
+    }
+  }
   try {
     const mhStore = await chrome.storage.local.get(YTDLP_MAX_HEIGHT_KEY);
     const mhRaw = mhStore[YTDLP_MAX_HEIGHT_KEY];
@@ -3923,6 +4562,7 @@ async function startDownloadJob(payload, fallbackTabId) {
       streamUrl: payload.url,
       pageUrl: base.pageUrl || tabUrl || '',
       downloadPayload: base,
+      startedAt: Date.now(),
     });
   }
   return { ok: true, jobId };

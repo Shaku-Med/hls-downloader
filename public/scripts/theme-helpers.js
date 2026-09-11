@@ -1,6 +1,8 @@
 /** Shared theme helpers: read page body colors and apply them to extension UI. */
 (function (global) {
   const THEME_MODE_KEY = 'uiThemeMode';
+  const MORPH_KEY = 'uiMorphMotion';
+  const MORPH_KEY_LEGACY = 'dlProgressMorph';
   const THEME_ACCENT_KEY = 'uiThemeAccent';
   const THEME_CSS_VARS = [
     '--bg',
@@ -790,8 +792,84 @@
     });
   }
 
+  let _cachedMorph = true;
+  const _liveMorphHosts = new Set();
+
+  function morphFromStore(data) {
+    if (data && data[MORPH_KEY] != null) return data[MORPH_KEY] !== false;
+    if (data && data[MORPH_KEY_LEGACY] != null) return data[MORPH_KEY_LEGACY] !== false;
+    return true;
+  }
+
+  function applyMorphToHost(host, on) {
+    if (!host || !host.setAttribute) return;
+    const enabled = on == null ? _cachedMorph : on !== false;
+    host.setAttribute('data-morph', enabled ? '1' : '0');
+    _liveMorphHosts.add(host);
+  }
+
+  function refreshMorphCache(cb) {
+    const done = (on) => {
+      _cachedMorph = on !== false;
+      if (cb) cb(_cachedMorph);
+    };
+    try {
+      chrome.storage.local.get([MORPH_KEY, MORPH_KEY_LEGACY], (data) => {
+        if (chrome.runtime.lastError) {
+          done(_cachedMorph);
+          return;
+        }
+        done(morphFromStore(data));
+      });
+    } catch (_) {
+      done(_cachedMorph);
+    }
+  }
+
+  function paintMorphHosts(on) {
+    const enabled = on !== false;
+    _cachedMorph = enabled;
+    try {
+      if (typeof document !== 'undefined' && document.documentElement) {
+        applyMorphToHost(document.documentElement, enabled);
+      }
+      if (typeof document !== 'undefined' && document.body) {
+        applyMorphToHost(document.body, enabled);
+      }
+    } catch (_) {
+      // ignore
+    }
+    _liveMorphHosts.forEach((el) => {
+      if (!el || !el.isConnected) {
+        _liveMorphHosts.delete(el);
+        return;
+      }
+      applyMorphToHost(el, enabled);
+    });
+    _liveOverlays.forEach((el) => applyMorphToHost(el, enabled));
+  }
+
+  function initMorphMotion() {
+    if (global.__hgrMorphMotionInited) {
+      applyMorphToHost(typeof document !== 'undefined' ? document.documentElement : null, _cachedMorph);
+      return;
+    }
+    global.__hgrMorphMotionInited = true;
+    paintMorphHosts(_cachedMorph);
+    refreshMorphCache((on) => paintMorphHosts(on));
+    try {
+      chrome.storage.onChanged.addListener((changes, area) => {
+        if (area !== 'local' || (!changes[MORPH_KEY] && !changes[MORPH_KEY_LEGACY])) return;
+        refreshMorphCache((on) => paintMorphHosts(on));
+      });
+    } catch (_) {
+      // ignore
+    }
+  }
+
   function applyThemeToHost(host, mode, accent, varMap) {
     if (!host) return 'dark';
+    applyMorphToHost(host, _cachedMorph);
     host.setAttribute('data-theme-mode', mode || 'system');
     if (mode === 'page') {
       const palette = derivePalette(readPageColors());
@@ -818,6 +896,7 @@
     if (!root) return;
     root.setAttribute('data-theme', resolved);
     root.setAttribute('data-theme-mode', mode || 'system');
+    applyMorphToHost(root, _cachedMorph);
     if (mode === 'page') {
       root.removeAttribute('data-accent');
       if (colors) {
@@ -945,6 +1024,7 @@
   }
 
   function initExtensionPageTheme() {
+    initMorphMotion();
     readStoredTheme((mode, accent) => applyUiThemeToDocument(mode, accent));
     if (global.__hgrExtensionThemeInited) return;
     global.__hgrExtensionThemeInited = true;
@@ -1115,6 +1195,7 @@
 
   function hardenModalOverlay(overlay) {
     if (!overlay || !overlay.style) return;
+    applyMorphToHost(overlay, _cachedMorph);
     const s = overlay.style;
     s.setProperty('position', 'fixed', 'important');
     s.setProperty('inset', '0', 'important');
@@ -1581,6 +1662,8 @@
       offPage = onPageThemeChange((palette) => applyPalette(palette));
     };
 
+    initMorphMotion();
+    applyMorphToHost(host, _cachedMorph);
     refreshCachedTheme((mode, accent) => syncPageWatch(mode, accent));
 
     const onStorage = (changes, area) => {
@@ -1879,9 +1962,49 @@
     };
   }
 
+  function formatElapsed(ms) {
+    const s = Math.max(0, Math.floor(Number(ms) / 1000) || 0);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = s % 60;
+    if (h) return `${h}:${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}`;
+    return `${m}:${String(sec).padStart(2, '0')}`;
+  }
+
+  function jobProgressFraction(job) {
+    const pct = Number(job && job.percent);
+    if (Number.isFinite(pct) && pct >= 2) return Math.min(1, Math.max(0, pct / 100));
+    const i = Number(job && job.playlistIndex);
+    const n = Number(job && job.playlistCount);
+    if (Number.isFinite(i) && Number.isFinite(n) && n > 0 && i >= 1) {
+      return Math.min(0.99, i / n);
+    }
+    return NaN;
+  }
+
+  function formatJobTime(job) {
+    const start = Number(job && job.startedAt);
+    if (!Number.isFinite(start) || start <= 0) return '';
+    const elapsedMs = Date.now() - start;
+    if (elapsedMs < 0) return '';
+    const elapsed = formatElapsed(elapsedMs);
+    const frac = jobProgressFraction(job);
+    if (Number.isFinite(frac) && (frac >= 0.02 || Number(job && job.playlistIndex) >= 2)) {
+      const remain = elapsedMs / frac - elapsedMs;
+      if (Number.isFinite(remain) && remain > 800) {
+        return `${elapsed} elapsed · ~${formatElapsed(remain)} left`;
+      }
+    }
+    return `${elapsed} elapsed`;
+  }
+
   global.HGR_THEME = {
     THEME_MODE_KEY,
     THEME_ACCENT_KEY,
+    MORPH_KEY,
+    MORPH_KEY_LEGACY,
+    formatElapsed,
+    formatJobTime,
     readPageColors,
     derivePalette,
     getCurrentPagePalette,
@@ -1892,6 +2015,8 @@
     applyUiThemeToDocument,
     applyStoredThemeToElement,
     initExtensionPageTheme,
+    initMorphMotion,
+    applyMorphToHost,
     initPageThemeWatcher,
     onPageThemeChange,
     bindLiveThemeHost,
@@ -1914,6 +2039,7 @@
   try {
     if (global.location && /^https?:$/i.test(String(global.location.protocol))) {
       initPageThemeWatcher();
+      initMorphMotion();
     }
   } catch (_) {
     // ignore

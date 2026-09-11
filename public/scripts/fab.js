@@ -404,6 +404,7 @@
       sendResponse({
         ok: true,
         fab: !!(liveFabHost && (liveFabHost.isConnected || document.documentElement.contains(liveFabHost))),
+        floatOff: floatPrefKnownOn === false,
       });
       return true;
     }
@@ -515,28 +516,57 @@
     removeOrphanFabHosts();
   }
 
+  let floatPrefKnownOn = null;
+
+  function setFloatPrefKnown(on) {
+    floatPrefKnownOn = !!on;
+    try {
+      sessionStorage.setItem('sgFloatGrabberOn', on ? '1' : '0');
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  function readCachedFloatOn() {
+    if (floatPrefKnownOn === true || floatPrefKnownOn === false) return floatPrefKnownOn;
+    try {
+      const v = sessionStorage.getItem('sgFloatGrabberOn');
+      if (v === '0') return false;
+      if (v === '1') return true;
+    } catch (_) {
+      // ignore
+    }
+    return null;
+  }
+
   function syncFloatPreference() {
     if (!stillOwner()) return;
-    // Default is ON — mount right away so the button doesn't wait on storage /
-    // service-worker wake (that only happened after opening the popup before).
-    try {
-      mountGrabberUi();
-    } catch (e) {
-      if (isInvalidatedError(e)) return;
+    const cached = readCachedFloatOn();
+    if (cached === false) {
+      floatPrefKnownOn = false;
+      unmountGrabberUi();
+    } else if (cached === true) {
+      floatPrefKnownOn = true;
+      try {
+        if (!liveFabHost || !liveFabHost.isConnected) mountGrabberUi();
+      } catch (e) {
+        if (isInvalidatedError(e)) return;
+      }
     }
     if (!stillOwner()) return;
     try {
       chrome.storage.local.get([FLOAT_KEY], (d) => {
         if (!stillOwner()) return;
         if (chrome.runtime.lastError) return;
-        if (d && d[FLOAT_KEY] === false) {
+        const on = !(d && d[FLOAT_KEY] === false);
+        setFloatPrefKnown(on);
+        if (!on) {
           unmountGrabberUi();
           return;
         }
         if (!liveFabHost || !liveFabHost.isConnected) mountGrabberUi();
       });
     } catch (e) {
-      // Extension context invalidated
       if (isInvalidatedError(e)) return;
     }
   }
@@ -586,6 +616,7 @@
       if (!stillOwner()) return;
       if (area === 'local' && changes[FLOAT_KEY]) {
         const on = changes[FLOAT_KEY].newValue !== false;
+        setFloatPrefKnown(on);
         if (on) mountGrabberUi();
         else unmountGrabberUi();
       }
@@ -1638,6 +1669,16 @@
           }`;
           card.appendChild(pl);
         }
+        const timeEl = document.createElement('div');
+        timeEl.className = 'job-time';
+        const timeText =
+          window.HGR_THEME && typeof window.HGR_THEME.formatJobTime === 'function'
+            ? window.HGR_THEME.formatJobTime(job)
+            : '';
+        if (timeText) {
+          timeEl.textContent = timeText;
+          card.appendChild(timeEl);
+        }
       }
       if (typeof HLS_FFMPEG !== 'undefined' && HLS_FFMPEG.enhanceJobCard) {
         HLS_FFMPEG.enhanceJobCard(job, card, { onRefresh: refreshPanelJobsOnly });
@@ -2307,7 +2348,9 @@
         h.textContent = pageOnly
           ? isAppleMusicPage
             ? 'Download this track'
-            : 'Download this video'
+            : kind === 'mega'
+              ? 'Download this MEGA file'
+              : 'Download this video'
           : n > 1
             ? `Stream ${i + 1} of ${n}` + (kind ? ` (${kind})` : '')
             : kind
@@ -2328,7 +2371,9 @@
           intro.className = 'stream-page-intro';
           intro.textContent = isAppleMusicPage
             ? 'Apple Music: yt-dlp uses the song page URL below (not the FairPlay m3u8 stream).'
-            : 'This tab’s post URL. Playlist bits stay on. Tap Clean URL if you want tracking junk removed.';
+            : kind === 'mega'
+              ? 'MEGA public link. Keep the # key on the URL — without it the file cannot be opened.'
+              : 'This tab’s post URL. Playlist bits stay on. Tap Clean URL if you want tracking junk removed.';
           urlEl.appendChild(intro);
           urlEl.appendChild(urlView.el);
           if (urlSource === 'tab' && cleanedUrl && cleanedUrl !== url) {
@@ -2787,6 +2832,8 @@
 
   /** Cross-origin player: give the user a real button, not instructions. */
   function renderFabEmbedHint(list) {
+    // A <video> already on this page is not "played through another site".
+    if (fabVideos.length) return false;
     if (Array.isArray(list) && list.length) fabEmbeds = list;
     if (!fabRecStatus || !fabEmbeds.length) return false;
     fabRecStatus.textContent = '';

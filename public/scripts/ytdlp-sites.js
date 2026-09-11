@@ -131,11 +131,22 @@
    * @returns {null | {label: string, role: string, searchFallback: boolean,
    *                   hostname: string, endpoint: string}}
    */
+  function hashOf(url) {
+    try {
+      return (new URL(String(url || '')).hash || '').replace(/^#/, '');
+    } catch (_) {
+      return '';
+    }
+  }
+
   function lookup(url) {
     const site = siteFor(url);
-    if (!site || site.ytdlp === false) return null;
+    if (!site) return null;
+    if (site.ytdlp === false && !site.handler) return null;
     const path = pathOf(url);
     if (!path) return null;
+    const hash = hashOf(url);
+    if (site.requireHash && !hash) return null;
     // Several of these put the language in the path, so /us/album/... has to
     // match an endpoint of /album. Both spellings are tried.
     const paths = [path];
@@ -153,6 +164,10 @@
         const re = patternFor(page.match);
         if (re && paths.some((p) => re.test(p))) hit = String(page.match);
       }
+      if (!hit && page.hashMatch) {
+        const re = patternFor(page.hashMatch);
+        if (re && re.test(hash)) hit = String(page.hashMatch);
+      }
       if (!hit) continue;
       // Longest match wins, so /browse/track/ beats /.
       if (!best || hit.length > best.endpoint.length) {
@@ -166,6 +181,7 @@
       searchFallback: !!site.searchFallback,
       hostname: site.hostname,
       endpoint: best.endpoint,
+      handler: site.handler || '',
     };
   }
 

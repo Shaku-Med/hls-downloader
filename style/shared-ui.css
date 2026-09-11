@@ -241,11 +241,13 @@
   0% { transform: translateX(-120%); }
   100% { transform: translateX(280%); }
 }
-.job-playlist {
+.job-playlist, .job-time {
   margin-top: 6px;
   font-size: 11px;
   color: var(--muted);
+  font-variant-numeric: tabular-nums;
 }
+.job-time { letter-spacing: 0.01em; }
 
 /* ── Stream cards ── */
 .stream-list {

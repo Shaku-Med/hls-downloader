@@ -5,7 +5,9 @@ from typing import Dict, List
 from . import detect, osinfo
 from .models import Package
 from .platform_cmds import (
+    cryptography_plans,
     curl_cffi_plans,
+    pycryptodomex_plans,
     deno_plans,
     ffmpeg_plans,
     node_plans,
@@ -31,7 +33,7 @@ def build_catalog() -> List[Package]:
         Package(
             id="python",
             title=f"Python {'.'.join(str(p) for p in osinfo.MIN_PYTHON)}+",
-            summary="Runs the Stuff Grabber helper and installs yt-dlp.",
+            summary="Runs the Stuff Grabber helper and installs yt-dlp, cryptography, pycryptodomex, and curl-cffi.",
             required=True,
             detect=detect.has_python,
             prerequisites=("pkg_manager",),
@@ -41,7 +43,7 @@ def build_catalog() -> List[Package]:
         Package(
             id="pip",
             title="pip",
-            summary="Python package installer used for yt-dlp.",
+            summary="Python package installer used for yt-dlp, curl-cffi, cryptography, and pycryptodomex.",
             required=True,
             detect=detect.has_pip,
             prerequisites=("python",),
@@ -86,6 +88,26 @@ def build_catalog() -> List[Package]:
             prerequisites=("python", "pip"),
             build_plans=curl_cffi_plans,
             missing_hint="Without it yt-dlp fails with 'attempting impersonation, but none of these impersonate targets are available'.",
+        ),
+        Package(
+            id="cryptography",
+            title="cryptography",
+            summary="AES for public MEGA file and folder links.",
+            required=True,
+            detect=detect.has_cryptography,
+            prerequisites=("python", "pip"),
+            build_plans=cryptography_plans,
+            missing_hint="Python and pip must work before cryptography can install. MEGA downloads need it.",
+        ),
+        Package(
+            id="pycryptodomex",
+            title="pycryptodomex",
+            summary="AES and RSA for yt-dlp. Other encrypted platforms need it (HLS AES, Bilibili, and similar).",
+            required=True,
+            detect=detect.has_pycryptodomex,
+            prerequisites=("python", "pip"),
+            build_plans=pycryptodomex_plans,
+            missing_hint="Python and pip must work before pycryptodomex can install. yt-dlp raises 'pycryptodomex not found' without it.",
         ),
         Package(
             id="deno",

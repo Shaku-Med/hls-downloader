@@ -153,13 +153,33 @@
         </select>
         <div class="hint">Used for Always light, Always dark, and Match my browser. Hidden when matching the page.</div>
       </div>
+      <div class="row">
+        <label for="dl-progress-layout">Download progress layout</label>
+        <select id="dl-progress-layout">
+          <option value="bar">Bar (default)</option>
+          <option value="circle">Floating circle</option>
+          <option value="pill">Compact pill</option>
+        </select>
+        <div class="hint">How the on-page download chip looks. <strong>Bar</strong> is the current card. <strong>Circle</strong> is a draggable ring with the percent. <strong>Pill</strong> is a slim chip, defaulting to the top. Every style can be dragged; it stays on screen. Open tabs pick up the change right away.</div>
+      </div>
+      <div class="row">
+        <label class="row-check" for="dl-progress-morph">
+          <input id="dl-progress-morph" type="checkbox" checked />
+          <span>Smooth Apple-style motion</span>
+        </label>
+        <div class="hint">On by default. Buttons, menus, dialogs, the floating button, and the download chip spring when you use them. Headers and cards stay still. Turn it off for an instant look with no motion.</div>
+      </div>
     </div>
   </section>
 
-  <div class="actions">
-    <button type="button" id="save">Save</button>
+  <div class="save-bar">
+    <div class="save-bar-inner">
+      <div id="status" hidden></div>
+      <div class="actions">
+        <button type="button" id="save" disabled>Save</button>
+      </div>
+    </div>
   </div>
-  <div id="status" hidden></div>
 
   <script src="/public/scripts/ios-select.js"></script>
   <script src="/public/scripts/theme-helpers.js"></script>

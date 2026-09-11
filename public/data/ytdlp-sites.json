@@ -15,7 +15,12 @@
     "ytdlp       false means we know the site and yt-dlp is not the answer there.",
     "            No This page row is offered and the helper will not route to it,",
     "            so whatever the network capture picks up is used instead. The",
-    "            note says why. Absent means true.",
+    "            note says why. Absent means true. A handler (mega) still offers",
+    "            a This page row; the helper uses that downloader instead.",
+    "handler     mega = public mega.nz file/folder links (key is in the # hash).",
+    "            Files and folders are decrypted by the helper, not yt-dlp.",
+    "requireHash true = do not offer a row until the URL has a fragment (MEGA keys).",
+    "hashMatch   like match, but against the URL fragment (old mega.nz/#!id!key).",
     "role        audio, video, or both. Drives whether yt-dlp is asked to",
     "            extract audio or to pick video plus audio and merge them.",
     "searchFallback  true where yt-dlp has no working extractor, checked against",
@@ -414,6 +419,22 @@
       "role": "video",
       "searchFallback": false,
       "pages": [{ "endpoint": "/spotlight/", "role": "video" }]
+    },
+    {
+      "hostname": "mega.nz",
+      "aliases": ["mega.co.nz"],
+      "label": "MEGA",
+      "role": "both",
+      "ytdlp": false,
+      "handler": "mega",
+      "requireHash": true,
+      "searchFallback": false,
+      "pages": [
+        { "endpoint": "/file/", "role": "both" },
+        { "endpoint": "/folder/", "role": "both" },
+        { "endpoint": "/embed/", "role": "both" },
+        { "hashMatch": "^(!|F!)", "role": "both" }
+      ]
     }
   ]
 }
