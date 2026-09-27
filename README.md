@@ -458,6 +458,41 @@ The same applies to Amazon Music, Tidal, Deezer, Apple Music, Pandora, Qobuz, An
 Tracks are saved as "Artist - Title", read from the track page rather than from the link, so a saved file is not named after the id in the URL. The title and artist are written into the file as tags too, so it does not turn up untitled in a music player. An album or playlist link has no single track to name after, so those still fall back to a name built from the link.
 
 
+Plain files are copied, not demuxed
+
+A link that points straight at a file the server hands over whole, an mp4 or an
+mp3 rather than a playlist, is copied byte for byte instead of going through
+ffmpeg. That is not just faster. A progressive mp4 keeps its index at the end of
+the file, so ffmpeg has to reach the end before it can write a single frame, and
+plenty of CDNs answer a range request with the whole file from byte zero. On
+those, ffmpeg reads the entire download, writes an empty file and exits
+successfully. Measured against a stand in for one of those CDNs, ffmpeg wrote
+261 bytes of a 9,589,374 byte file and reported success. Copying the bytes gets
+the file exactly, in half the traffic, and survives a dropped connection by
+picking up where it stopped.
+
+Media with no extension in the link is included, since the server is asked what
+it is before anything is saved, and an error page or a playlist is never written
+out under a video name. Anything that needs a real conversion, a webm saved as
+mp4 for instance, still goes to ffmpeg, as do HLS and DASH.
+
+
+Knowing whether it is working
+
+The card says what is happening the whole way through. ffmpeg ends each of its
+progress updates with a carriage return and never a newline, so the helper used
+to sit waiting for a line that only arrived once the process exited. On a long
+download that meant the card read "Starting ffmpeg" for twenty minutes and then
+jumped straight to finished or failed.
+
+Two parts of a normal run are silent even so, opening a slow input and the final
+pass that moves the index to the front, so during those the card reports the
+file growing on disk. If it stops growing you are told that too, along with how
+long it has been quiet, which is the difference between a slow server and a
+stuck one. A connection that goes completely dead now gives up after a minute
+instead of hanging until you close the browser.
+
+
 Where things can fail
 
 Some sites wrap media in DRM. Netflix and similar services are a good example. The extension might see a manifest, but the segments stay encrypted and neither ffmpeg nor yt-dlp can unlock them. Nothing gets around that, so on those pages the popup and the floating panel say the video is protected and offer the screen recorder instead. One button opens it. See Screen recorder below.

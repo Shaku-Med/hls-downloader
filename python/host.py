@@ -548,6 +548,131 @@ def _parse_ffmpeg_progress(line):
     return out
 
 
+def _iter_proc_lines(stream):
+    """
+    Lines from a child process, broken on carriage returns as well as newlines.
+
+    ffmpeg ends every -stats update with a carriage return and never a newline,
+    so readline() sits on the pipe for the whole run and hands the entire set of
+    updates over in one piece once the process exits. Progress that only shows
+    up after the download finished is not progress, and the card was left
+    reading "Starting ffmpeg" for as long as the download took.
+
+    read1 rather than read: a buffered read(n) waits for all n bytes, which
+    turns a single stats line into another stall.
+    """
+    reader = getattr(stream, "read1", None) or stream.read
+    buf = b""
+    while True:
+        try:
+            chunk = reader(256)
+        except (OSError, ValueError):
+            break
+        if not chunk:
+            break
+        buf += chunk
+        while True:
+            cuts = [i for i in (buf.find(b"\n"), buf.find(b"\r")) if i >= 0]
+            if not cuts:
+                break
+            cut = min(cuts)
+            raw, buf = buf[:cut], buf[cut + 1 :]
+            if raw.strip():
+                yield raw.decode("utf-8", errors="replace")
+        # A child that never terminates a line must not grow this without end.
+        if len(buf) > 64 * 1024:
+            yield buf.decode("utf-8", errors="replace")
+            buf = b""
+    if buf.strip():
+        yield buf.decode("utf-8", errors="replace")
+
+
+def _fmt_size(n: float) -> str:
+    step = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if step < 1024 or unit == "GB":
+            return f"{step:.0f} {unit}" if unit == "B" else f"{step:.1f} {unit}"
+        step /= 1024
+    return f"{n} B"
+
+
+def _fmt_elapsed(sec: float) -> str:
+    sec = int(max(0.0, sec))
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60:02d}s"
+    return f"{sec // 3600}h {(sec % 3600) // 60:02d}m"
+
+
+def _file_size_or_zero(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+# No stats and no growth for this long means the server, not ffmpeg, is the holdup.
+_FFMPEG_STALL_SEC = 25.0
+
+
+def _ffmpeg_heartbeat(
+    job_id: str,
+    output_path: str,
+    last_stat: List[float],
+    stop: threading.Event,
+) -> None:
+    """
+    Report that work is happening while ffmpeg itself is saying nothing.
+
+    Two phases of a normal download are completely silent. A progressive file
+    whose index sits at the end has to be read to the end before one frame can
+    be written, and the faststart pass afterwards rewrites the file with the
+    stats line already gone. Both are indistinguishable from a hang, so the
+    output file on disk is reported instead: it either grows or it does not,
+    and the card says which.
+    """
+    started = time.monotonic()
+    seen = _file_size_or_zero(output_path)
+    grew_at = started
+    while not stop.wait(2.0):
+        now = time.monotonic()
+        # ffmpeg's own numbers are better than ours whenever they are flowing.
+        if now - last_stat[0] < 4.0:
+            continue
+        size = _file_size_or_zero(output_path)
+        if size > seen:
+            seen = size
+            grew_at = now
+        quiet = now - grew_at
+        if size and quiet < _FFMPEG_STALL_SEC:
+            detail = f"Downloading, {_fmt_size(size)} in {_fmt_elapsed(now - started)}"
+        elif size:
+            detail = (
+                f"Waiting on the server, {_fmt_size(size)} so far, "
+                f"nothing new for {_fmt_elapsed(quiet)}"
+            )
+        elif quiet < _FFMPEG_STALL_SEC:
+            detail = f"Opening the stream, {_fmt_elapsed(now - started)}"
+        else:
+            detail = f"Waiting on the server, {_fmt_elapsed(now - started)} so far"
+        # ffmpeg may have exited while the size was being read. A late progress
+        # message would push a finished job back to "downloading".
+        if stop.is_set():
+            return
+        send_message(
+            with_job_id(
+                {
+                    "type": "progress",
+                    "phase": "starting",
+                    "detail": detail,
+                    "output": output_path,
+                },
+                job_id,
+            )
+        )
+
+
 def _is_hls_input(url: str, message) -> bool:
     u = (url or "").lower()
     if ".m3u8" in u or u.endswith(".m3u") or re.search(r"\.m3u8[?#]", u):
@@ -684,6 +809,19 @@ def _ffmpeg_hls_network_fflags() -> List[str]:
     Omit +igndts — rewriting DTS clashes with coded frame order in -c:v copy and
     yields smeared/decoded freezes while audio stays fine."""
     return ["-fflags", "+genpts+discardcorrupt"]
+
+
+def _ffmpeg_network_timeout_args(url: str) -> List[str]:
+    """
+    Give up on a socket that has gone quiet instead of waiting forever.
+
+    Without this a CDN that accepts the connection and then sends nothing keeps
+    ffmpeg blocked until the browser is closed. Sixty seconds is far longer than
+    any throttled CDN takes between chunks, so a trickle still counts as alive.
+    """
+    if not (url or "").lower().startswith(("http://", "https://")):
+        return []
+    return ["-rw_timeout", "60000000"]
 
 
 def _ffmpeg_local_file_remux_fflags() -> List[str]:
@@ -1381,6 +1519,40 @@ def _netloc_host(url: str) -> str:
         return h
     except Exception:
         return ""
+
+
+def _same_site(a: str, b: str) -> bool:
+    """Whether two URLs are close enough for one's credentials to reach the other."""
+    ha, hb = _netloc_host(a), _netloc_host(b)
+    if not ha or not hb:
+        return False
+    return ha == hb or ha.endswith("." + hb) or hb.endswith("." + ha)
+
+
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """
+    Follow redirects without carrying the site's credentials off to another host.
+
+    urllib repeats every header it was given on a redirect, so a CDN link that
+    bounces elsewhere would hand that host the cookies, referer and auth token
+    belonging to the site the link came from. Schemes other than http(s) are
+    refused outright rather than followed.
+    """
+
+    _PRIVATE = ("Authorization", "Cookie", "Referer")
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        scheme = urlsplit(newurl).scheme.lower()
+        if scheme not in ("http", "https"):
+            raise urllib.error.HTTPError(
+                newurl, code, f"refused a redirect to {scheme or 'an unknown scheme'}",
+                headers, fp,
+            )
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and not _same_site(req.full_url, newurl):
+            for name in self._PRIVATE:
+                new.remove_header(name)
+        return new
 
 
 def _url_is_youtube_page(url: str) -> bool:
@@ -2477,13 +2649,7 @@ def _yt_dlp_header_args(message: dict, target_url: str = "") -> List[str]:
 
     same_site = True
     if target_url and referer:
-        target_host = _netloc_host(target_url)
-        referer_host = _netloc_host(referer)
-        same_site = bool(target_host) and bool(referer_host) and (
-            target_host == referer_host
-            or target_host.endswith("." + referer_host)
-            or referer_host.endswith("." + target_host)
-        )
+        same_site = _same_site(target_url, referer)
 
     args: List[str] = []
     if referer and same_site:
@@ -2904,79 +3070,58 @@ def run_yt_dlp_with_updates(
         def read_stderr() -> None:
             nonlocal last_send, last_percent, last_playlist_index, last_playlist_count, last_media_id
             try:
-                # yt-dlp may still emit \\r progress without --newline on older builds.
-                buf = b""
-                while True:
-                    chunk = proc.stderr.read(256)
-                    if not chunk:
-                        break
-                    buf += chunk
-                    while True:
-                        cut = -1
-                        for sep in (b"\n", b"\r"):
-                            i = buf.find(sep)
-                            if i >= 0 and (cut < 0 or i < cut):
-                                cut = i
-                        if cut < 0:
-                            break
-                        raw = buf[:cut]
-                        buf = buf[cut + 1 :]
-                        if not raw.strip():
-                            continue
-                        line = raw.decode("utf-8", errors="replace")
-                        stderr_lines.append(line + "\n")
-                        if len(stderr_lines) > 250:
-                            stderr_lines.pop(0)
-                        pr = _parse_yt_dlp_progress(line)
-                        if not pr:
-                            continue
-                        if "percent" in pr:
-                            last_percent = pr["percent"]
-                        if "playlistIndex" in pr:
-                            last_playlist_index = pr["playlistIndex"]
-                        if "playlistCount" in pr:
-                            last_playlist_count = pr["playlistCount"]
-                        if "mediaId" in pr:
-                            last_media_id = str(pr["mediaId"])
+                # yt-dlp still emits \r progress without --newline on older builds.
+                for line in _iter_proc_lines(proc.stderr):
+                    stderr_lines.append(line + "\n")
+                    if len(stderr_lines) > 250:
+                        stderr_lines.pop(0)
+                    pr = _parse_yt_dlp_progress(line)
+                    if not pr:
+                        continue
+                    if "percent" in pr:
+                        last_percent = pr["percent"]
+                    if "playlistIndex" in pr:
+                        last_playlist_index = pr["playlistIndex"]
+                    if "playlistCount" in pr:
+                        last_playlist_count = pr["playlistCount"]
+                    if "mediaId" in pr:
+                        last_media_id = str(pr["mediaId"])
 
-                        parts: List[str] = []
-                        if last_playlist_index is not None and last_playlist_count is not None:
-                            parts.append(f"Item {last_playlist_index}/{last_playlist_count}")
-                        if last_media_id:
-                            parts.append(str(last_media_id))
-                        if pr.get("detail") and "%" in str(pr.get("detail")):
-                            parts.append(str(pr["detail"]))
-                        elif last_percent is not None and not any("%" in p for p in parts):
-                            parts.append(f"{last_percent:g}%")
-                        elif pr.get("detail") and not str(pr["detail"]).startswith("Item "):
-                            parts.append(str(pr["detail"]))
-                        det = " · ".join(parts) if parts else (pr.get("detail") or line.strip()[:140])
+                    parts: List[str] = []
+                    if last_playlist_index is not None and last_playlist_count is not None:
+                        parts.append(f"Item {last_playlist_index}/{last_playlist_count}")
+                    if last_media_id:
+                        parts.append(str(last_media_id))
+                    if pr.get("detail") and "%" in str(pr.get("detail")):
+                        parts.append(str(pr["detail"]))
+                    elif last_percent is not None and not any("%" in p for p in parts):
+                        parts.append(f"{last_percent:g}%")
+                    elif pr.get("detail") and not str(pr["detail"]).startswith("Item "):
+                        parts.append(str(pr["detail"]))
+                    det = " · ".join(parts) if parts else (pr.get("detail") or line.strip()[:140])
 
-                        now = time.monotonic()
-                        # Always flush playlist/id changes; throttle percent-only spam lightly.
-                        force = "playlistIndex" in pr or "mediaId" in pr
-                        min_gap = 0.2 if "percent" in pr else throttle_s
-                        if not force and now - last_send < min_gap:
-                            continue
-                        last_send = now
-                        payload: Dict[str, Any] = {
-                            "type": "progress",
-                            "phase": "downloading",
-                            "detail": det,
-                            "output": output_path,
-                        }
-                        if last_percent is not None:
-                            payload["percent"] = last_percent
-                        if last_playlist_index is not None:
-                            payload["playlistIndex"] = last_playlist_index
-                        if last_playlist_count is not None:
-                            payload["playlistCount"] = last_playlist_count
-                        if last_media_id:
-                            payload["mediaId"] = last_media_id
-                        send_message(with_job_id(payload, job_id))
-                if buf.strip():
-                    line = buf.decode("utf-8", errors="replace")
-                    stderr_lines.append(line)
+                    now = time.monotonic()
+                    # Always flush playlist/id changes; throttle percent-only spam lightly.
+                    force = "playlistIndex" in pr or "mediaId" in pr
+                    min_gap = 0.2 if "percent" in pr else throttle_s
+                    if not force and now - last_send < min_gap:
+                        continue
+                    last_send = now
+                    payload: Dict[str, Any] = {
+                        "type": "progress",
+                        "phase": "downloading",
+                        "detail": det,
+                        "output": output_path,
+                    }
+                    if last_percent is not None:
+                        payload["percent"] = last_percent
+                    if last_playlist_index is not None:
+                        payload["playlistIndex"] = last_playlist_index
+                    if last_playlist_count is not None:
+                        payload["playlistCount"] = last_playlist_count
+                    if last_media_id:
+                        payload["mediaId"] = last_media_id
+                    send_message(with_job_id(payload, job_id))
             finally:
                 try:
                     proc.stderr.close()
@@ -3470,6 +3615,7 @@ def _http_direct_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(
         urllib.request.ProxyHandler({}),
         urllib.request.HTTPSHandler(context=ctx),
+        _SafeRedirect(),
     )
 
 
@@ -3510,10 +3656,21 @@ def _http_get_bytes_curl(
     ]
     if os.name == "nt":
         cmd.append("--ssl-no-revoke")
+    # curl strips Authorization and Cookie itself when a redirect crosses to
+    # another host, but a Referer passed with -H is resent as is, which hands
+    # that host the page the link came from. Handing it over with -e ";auto"
+    # instead lets curl replace it with the redirecting URL on each hop, while
+    # a request that never redirects still carries the real one.
+    referer = ""
     for key, val in headers.items():
         if not val or key.lower() == "user-agent":
             continue
+        if key.lower() == "referer":
+            referer = val
+            continue
         cmd.extend(["-H", f"{key}: {val}"])
+    if referer:
+        cmd.extend(["-e", f"{referer};auto"])
     if byte_range is not None:
         rs, ln = byte_range
         cmd.extend(["-H", f"Range: bytes={rs}-{rs + ln - 1}"])
@@ -3574,6 +3731,13 @@ def _http_get_bytes_powershell(
         assigns: List[str] = []
         for k, v in headers.items():
             if not v:
+                continue
+            # Invoke-WebRequest follows redirects and resends what it was given.
+            # .NET drops the credentials on the way but keeps the referer, which
+            # would hand another host the page this link came from. There is no
+            # per hop referer here the way curl has one, and this runs only when
+            # both other fetchers have already failed, so it goes without.
+            if str(k).lower() == "referer":
                 continue
             kk = str(k).replace("'", "''")
             vv = str(v).replace("'", "''")
@@ -3797,6 +3961,210 @@ def _download_vtt_immediate(url: str, message: dict, out_dir: str, filename: str
             job_id,
         )
     )
+
+
+_PROGRESSIVE_MEDIA_EXTS = frozenset(
+    {
+        ".mp4", ".m4v", ".mov", ".webm", ".mkv", ".m4a", ".mp3", ".aac",
+        ".ogg", ".opus", ".flac", ".wav", ".ts", ".m4b", ".3gp",
+    }
+)
+
+# Plenty of CDNs serve media from a path with no extension at all, so the
+# content type is the first thing asked and the path only the fallback.
+_CONTENT_TYPE_TO_EXT = {
+    "video/mp4": ".mp4",
+    "video/x-m4v": ".m4v",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "audio/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "video/mp2t": ".ts",
+}
+
+
+def _probe_progressive_media(
+    url: str, header_block: str, timeout: float = 20.0
+) -> Optional[Tuple[str, int, bool]]:
+    """
+    Ask the server what sits behind a URL, in one request.
+
+    Returns (extension, total_bytes, server_supports_range), or None when this
+    is not a plain file worth copying byte for byte. The single byte Range is
+    what reveals whether a dropped connection can be picked back up, and it
+    costs nothing on top of the request we need anyway.
+
+    Anything unexpected here answers None, which puts the job back on ffmpeg,
+    so a CDN that will only talk to the browser is no worse off than before.
+    """
+    if not (url or "").lower().startswith(("http://", "https://")):
+        return None
+    headers = _headers_dict_from_block(header_block)
+    headers["Range"] = "bytes=0-0"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with _http_direct_opener().open(req, timeout=timeout) as resp:
+            code = getattr(resp, "status", None) or resp.getcode()
+            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            supports_range = code == 206
+            total = 0
+            if supports_range:
+                m = re.search(r"/\s*(\d+)\s*$", resp.headers.get("Content-Range") or "")
+                if m:
+                    total = int(m.group(1))
+            else:
+                raw = (resp.headers.get("Content-Length") or "").strip()
+                if raw.isdigit():
+                    total = int(raw)
+    except (urllib.error.URLError, OSError, ssl.SSLError, ValueError):
+        return None
+
+    # An error page or a playlist is not something to save under a .mp4 name.
+    if ctype.startswith("text/") or ctype in ("application/json", "application/xml"):
+        return None
+    ext = _CONTENT_TYPE_TO_EXT.get(ctype, "")
+    if not ext:
+        guess = os.path.splitext(urlsplit(url).path)[1].lower()
+        if guess in _PROGRESSIVE_MEDIA_EXTS:
+            ext = guess
+    if not ext:
+        return None
+    return ext, total, supports_range
+
+
+_DIRECT_CHUNK = 256 * 1024
+_DIRECT_RESUME_TRIES = 4
+
+
+def _download_progressive_media(
+    url: str,
+    header_block: str,
+    output_path: str,
+    job_id: str,
+    *,
+    total: int,
+    supports_range: bool,
+) -> Tuple[bool, str]:
+    """
+    Copy a plain file to disk rather than handing it to ffmpeg.
+
+    ffmpeg cannot be trusted with these. A progressive MP4 keeps its index at
+    the end of the file, so the demuxer has to reach the end before it can
+    write a single frame, and a CDN that answers a Range request with the whole
+    file from byte zero leaves ffmpeg reading the entire download, writing an
+    empty file and exiting 0. Copying bytes is also half the traffic, survives
+    a dropped connection, and is the only way to show a real percentage.
+    """
+    part_path = output_path + ".part"
+    got = 0
+    started = time.monotonic()
+    last_send = 0.0
+
+    def report(force: bool = False) -> None:
+        nonlocal last_send
+        now = time.monotonic()
+        if not force and now - last_send < 0.35:
+            return
+        last_send = now
+        elapsed = max(0.001, now - started)
+        payload: Dict[str, Any] = {
+            "type": "progress",
+            "phase": "downloading",
+            "detail": (
+                f"{_fmt_size(got)} of {_fmt_size(total)} · {_fmt_size(got / elapsed)}/s"
+                if total
+                else f"{_fmt_size(got)} · {_fmt_size(got / elapsed)}/s"
+            ),
+            "output": output_path,
+        }
+        if total:
+            payload["percent"] = max(0.0, min(100.0, got * 100.0 / total))
+        send_message(with_job_id(payload, job_id))
+
+    headers = _headers_dict_from_block(header_block)
+    try:
+        for attempt in range(_DIRECT_RESUME_TRIES):
+            if _CANCEL_EVENT.is_set():
+                return False, "Canceled"
+            req_headers = dict(headers)
+            # Only ask to continue where we stopped when the server proved it
+            # honors ranges; otherwise a "range" reply is the whole file again.
+            resume = got if (got and supports_range) else 0
+            if resume:
+                req_headers["Range"] = f"bytes={resume}-"
+            req = urllib.request.Request(url, headers=req_headers, method="GET")
+            try:
+                with _http_direct_opener().open(req, timeout=60.0) as resp:
+                    code = getattr(resp, "status", None) or resp.getcode()
+                    if resume and code != 206:
+                        resume = 0
+                    if not total:
+                        raw = (resp.headers.get("Content-Length") or "").strip()
+                        if raw.isdigit():
+                            total = int(raw) + resume
+                    mode = "r+b" if resume else "wb"
+                    with open(part_path, mode) as f:
+                        if resume:
+                            f.seek(resume)
+                            f.truncate()
+                            got = resume
+                        else:
+                            got = 0
+                        report(force=True)
+                        while True:
+                            if _CANCEL_EVENT.is_set():
+                                return False, "Canceled"
+                            block = resp.read(_DIRECT_CHUNK)
+                            if not block:
+                                break
+                            f.write(block)
+                            got += len(block)
+                            report()
+                if total and got < total:
+                    raise OSError(f"connection ended at {got} of {total} bytes")
+                total = total or got
+                report(force=True)
+                break
+            except (urllib.error.URLError, OSError, ssl.SSLError, ValueError) as e:
+                if _CANCEL_EVENT.is_set():
+                    return False, "Canceled"
+                # Without ranges there is nothing to resume from, so a broken
+                # connection means starting over rather than a corrupt file.
+                if not supports_range:
+                    got = 0
+                if attempt == _DIRECT_RESUME_TRIES - 1:
+                    return False, f"Download failed: {e}"
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "progress",
+                            "phase": "downloading",
+                            "detail": f"Connection dropped, retrying ({attempt + 1})",
+                            "output": output_path,
+                        },
+                        job_id,
+                    )
+                )
+                time.sleep(min(8.0, 1.5 * (attempt + 1)))
+    except OSError as e:
+        return False, f"Could not write the file: {e}"
+
+    if not got:
+        return False, "The server sent an empty response."
+    try:
+        os.replace(part_path, output_path)
+    except OSError as e:
+        return False, f"Could not save the file: {e}"
+    return True, ""
 
 
 def _is_master_playlist(text: str) -> bool:
@@ -4207,18 +4575,18 @@ def _ffmpeg_remux_combined_to_output(
     last_send = 0.0
     throttle_s = 0.35
 
+    last_stat = [time.monotonic()]
+
     def read_stderr_ff():
         nonlocal last_send
         try:
-            for raw in iter(proc.stderr.readline, b""):
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace")
-                stderr_lines.append(line)
+            for line in _iter_proc_lines(proc.stderr):
+                stderr_lines.append(line + "\n")
                 if len(stderr_lines) > 200:
                     stderr_lines.pop(0)
                 if "time=" not in line:
                     continue
+                last_stat[0] = time.monotonic()
                 parsed = _parse_ffmpeg_progress(line)
                 now = time.monotonic()
                 if now - last_send < throttle_s:
@@ -4251,7 +4619,18 @@ def _ffmpeg_remux_combined_to_output(
 
     t_ff = threading.Thread(target=read_stderr_ff, daemon=True)
     t_ff.start()
-    code = proc.wait()
+    beat_stop = threading.Event()
+    beat = threading.Thread(
+        target=_ffmpeg_heartbeat,
+        args=(job_id, output_path, last_stat, beat_stop),
+        daemon=True,
+    )
+    beat.start()
+    try:
+        code = proc.wait()
+    finally:
+        beat_stop.set()
+    beat.join(timeout=2.0)
     t_ff.join(timeout=2.0)
     _clear_active_if(proc)
 
@@ -4871,6 +5250,8 @@ def _build_ffmpeg_cmd_list(
                 "10",
             ]
         )
+    if not ffmpeg_input:
+        pre.extend(_ffmpeg_network_timeout_args(url))
     pre.extend(
         [
             "-headers",
@@ -5898,13 +6279,10 @@ def _handle_hls_auth_refresh(new_message: dict) -> None:
 
         def _drain_cont_err():
             try:
-                for raw in iter(cproc.stderr.readline, b""):
-                    if not raw:
-                        break
-                    line = raw.decode("utf-8", errors="replace")
+                for line in _iter_proc_lines(cproc.stderr):
                     if len(stderr_lines) > 120:
                         stderr_lines.pop(0)
-                    stderr_lines.append(line)
+                    stderr_lines.append(line + "\n")
             finally:
                 try:
                     cproc.stderr.close()
@@ -6164,6 +6542,61 @@ def run_ffmpeg_with_updates(url, filename, message):
 
         header_block = build_ffmpeg_header_block(message, url)
 
+        # A plain file the server hands over whole never needed a demuxer.
+        if not _is_hls_input(url, message) and not _is_dash_input(url, message):
+            probed = _probe_progressive_media(url, header_block)
+            if probed and probed[0] == out_ext:
+                _, total_bytes, ranged = probed
+                _JOB_LIVE[job_id] = _job_live_from_message(output_path, url, message)
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "progress",
+                            "phase": "downloading",
+                            "detail": (
+                                f"Downloading {_fmt_size(total_bytes)}"
+                                if total_bytes
+                                else "Downloading"
+                            ),
+                            "output": output_path,
+                        },
+                        job_id,
+                    )
+                )
+                ok, err = _download_progressive_media(
+                    url,
+                    header_block,
+                    output_path,
+                    job_id,
+                    total=total_bytes,
+                    supports_range=ranged,
+                )
+                if _CANCEL_EVENT.is_set():
+                    _send_done_canceled(job_id)
+                    return
+                if ok:
+                    ok, err = _verify_ffmpeg_output_playable(output_path)
+                if not ok:
+                    send_message(
+                        with_job_id(
+                            {"type": "done", "success": False, "error": err},
+                            job_id,
+                        )
+                    )
+                    return
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": True,
+                            "output": output_path,
+                            "detail": "Finished",
+                        },
+                        job_id,
+                    )
+                )
+                return
+
         var_pair: Optional[Tuple[str, str]] = None
         var_url_r, var_text_r = "", ""
         if _is_hls_input(url, message):
@@ -6382,17 +6815,17 @@ def run_ffmpeg_with_updates(url, filename, message):
         stderr_lines = []
         last_send = 0.0
         throttle_s = 0.35
+        last_stat = [time.monotonic()]
 
         def read_stderr():
             nonlocal last_send
             try:
-                for raw in iter(proc.stderr.readline, b""):
-                    if not raw:
-                        break
-                    line = raw.decode("utf-8", errors="replace")
-                    stderr_lines.append(line)
+                for line in _iter_proc_lines(proc.stderr):
+                    stderr_lines.append(line + "\n")
                     if len(stderr_lines) > 200:
                         stderr_lines.pop(0)
+                    if "time=" in line:
+                        last_stat[0] = time.monotonic()
                     if "time=" in line and job_id in _JOB_LIVE:
                         parsed0 = _parse_ffmpeg_progress(line)
                         if parsed0.get("tsec") is not None:
@@ -6434,7 +6867,18 @@ def run_ffmpeg_with_updates(url, filename, message):
 
         t = threading.Thread(target=read_stderr, daemon=True)
         t.start()
-        code = proc.wait()
+        beat_stop = threading.Event()
+        beat = threading.Thread(
+            target=_ffmpeg_heartbeat,
+            args=(job_id, output_path, last_stat, beat_stop),
+            daemon=True,
+        )
+        beat.start()
+        try:
+            code = proc.wait()
+        finally:
+            beat_stop.set()
+        beat.join(timeout=2.0)
         t.join(timeout=2.0)
 
         if job_id in _SILENCE_FFMPEG_DONE:

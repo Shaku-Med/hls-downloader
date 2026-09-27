@@ -5,11 +5,17 @@ Run from the repo root:  python -m unittest discover test
 Or directly:             python test/test_host.py
 """
 
+import http.server
+import io
 import os
 import re
+import shutil
 import sys
+import tempfile
+import threading
 import unittest
 import urllib.error
+import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "python"))
@@ -764,6 +770,280 @@ class DecryptPackageHints(unittest.TestCase):
         hint = host._pycryptodomex_help_message()
         self.assertIn("pycryptodomex", hint)
         self.assertIn("pip install", hint)
+
+
+class ProgressSurvivesCarriageReturns(unittest.TestCase):
+    """
+    ffmpeg ends every -stats update with \\r, never \\n. Reading with readline
+    held every update back until the process exited, so the card sat on
+    "Starting ffmpeg" for as long as the download took.
+    """
+
+    STATS = (
+        b"Input #0, mov,mp4\n"
+        b"frame=  100 fps=25 time=00:00:04.00 speed=1.0x\r"
+        b"frame=  200 fps=25 time=00:00:08.00 speed=1.0x\r"
+        b"frame=  300 fps=25 time=00:00:12.00 speed=1.0x\r"
+    )
+
+    def test_each_update_arrives_on_its_own(self):
+        lines = [ln for ln in host._iter_proc_lines(io.BytesIO(self.STATS)) if "time=" in ln]
+        self.assertEqual(len(lines), 3)
+        self.assertIn("00:00:04.00", lines[0])
+        self.assertIn("00:00:12.00", lines[-1])
+
+    def test_readline_would_have_held_them_back(self):
+        held = [ln for ln in io.BytesIO(self.STATS).readlines() if b"time=" in ln]
+        # One blob, all three updates, released only at the end of the run.
+        self.assertEqual(len(held), 1)
+        self.assertEqual(held[0].count(b"time="), 3)
+
+    def test_a_trailing_line_without_a_terminator_is_not_dropped(self):
+        self.assertEqual(list(host._iter_proc_lines(io.BytesIO(b"one\rtwo"))), ["one", "two"])
+
+    def test_a_child_that_never_ends_a_line_cannot_grow_the_buffer(self):
+        chunks = list(host._iter_proc_lines(io.BytesIO(b"x" * (300 * 1024))))
+        self.assertTrue(chunks)
+        self.assertTrue(all(len(c) <= 64 * 1024 + 256 for c in chunks))
+
+
+class DeadSocketsTimeOut(unittest.TestCase):
+    def test_network_input_gets_a_read_timeout(self):
+        self.assertEqual(
+            host._ffmpeg_network_timeout_args("https://cdn.example.com/a.mp4"),
+            ["-rw_timeout", "60000000"],
+        )
+
+    def test_local_input_is_left_alone(self):
+        self.assertEqual(host._ffmpeg_network_timeout_args(r"C:\clips\a.mp4"), [])
+
+
+class _Serve(http.server.BaseHTTPRequestHandler):
+    """Stands in for a CDN. Class attributes set per test."""
+
+    protocol_version = "HTTP/1.1"
+    body = b""
+    ctype = "video/mp4"
+    honor_range = False
+    cut_after = 0  # bytes to send before hanging up, 0 for none
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        start, end, status = 0, len(self.body) - 1, 200
+        if self.honor_range and (self.headers.get("Range") or "").startswith("bytes="):
+            a, _, b = self.headers["Range"][6:].partition("-")
+            start = int(a or 0)
+            end = int(b) if b else len(self.body) - 1
+            status = 206
+        chunk = self.body[start : end + 1]
+        self.send_response(status)
+        self.send_header("Content-Type", self.ctype)
+        self.send_header("Content-Length", str(len(chunk)))
+        if self.honor_range:
+            self.send_header("Accept-Ranges", "bytes")
+            if status == 206:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(self.body)}")
+        self.end_headers()
+        if self.cut_after and len(chunk) > self.cut_after:
+            self.wfile.write(chunk[: self.cut_after])
+            self.close_connection = True
+            type(self).cut_after = 0  # only break the first attempt
+            return
+        self.wfile.write(chunk)
+
+
+class PlainFilesAreCopiedNotDemuxed(unittest.TestCase):
+    """
+    A progressive MP4 keeps its index at the end, so ffmpeg cannot write a frame
+    until it has read the whole download, and a CDN that ignores Range leaves it
+    writing an empty file and exiting 0. Copy the bytes instead.
+    """
+
+    BODY = bytes(range(256)) * 4096  # 1 MiB, no two chunks alike
+
+    def setUp(self):
+        host._CANCEL_EVENT.clear()
+        self.sent = []
+        real_send = host.send_message
+        host.send_message = self.sent.append
+        self.addCleanup(setattr, host, "send_message", real_send)
+        self.addCleanup(host._CANCEL_EVENT.clear)
+
+        _Serve.body = self.BODY
+        _Serve.ctype = "video/mp4"
+        _Serve.honor_range = False
+        _Serve.cut_after = 0
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Serve)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}/clip.mp4"
+
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.out = os.path.join(self.dir, "clip.mp4")
+
+    def _fetch(self):
+        probe = host._probe_progressive_media(self.url, "")
+        self.assertIsNotNone(probe)
+        ext, total, ranged = probe
+        ok, err = host._download_progressive_media(
+            self.url, "", self.out, "job", total=total, supports_range=ranged
+        )
+        return ext, ok, err
+
+    def test_bytes_come_through_untouched(self):
+        ext, ok, err = self._fetch()
+        self.assertEqual(ext, ".mp4")
+        self.assertTrue(ok, err)
+        with open(self.out, "rb") as fh:
+            self.assertEqual(fh.read(), self.BODY)
+
+    def test_the_card_gets_a_real_percentage(self):
+        self._fetch()
+        pcts = [m["percent"] for m in self.sent if "percent" in m]
+        self.assertTrue(pcts)
+        self.assertAlmostEqual(max(pcts), 100.0, places=3)
+
+    def test_no_part_file_is_left_behind(self):
+        self._fetch()
+        self.assertFalse(os.path.exists(self.out + ".part"))
+
+    def test_a_dropped_connection_is_picked_back_up(self):
+        _Serve.honor_range = True
+        _Serve.cut_after = 300_000
+        _, ok, err = self._fetch()
+        self.assertTrue(ok, err)
+        with open(self.out, "rb") as fh:
+            self.assertEqual(fh.read(), self.BODY)
+
+    def test_an_error_page_is_not_saved_as_a_video(self):
+        _Serve.ctype = "text/html"
+        _Serve.body = b"<html>Access denied</html>"
+        self.assertIsNone(host._probe_progressive_media(self.url, ""))
+
+    def test_media_with_no_extension_is_still_recognised(self):
+        url = f"http://127.0.0.1:{self.srv.server_address[1]}/stream/9f2c1"
+        probe = host._probe_progressive_media(url, "")
+        self.assertIsNotNone(probe)
+        self.assertEqual(probe[0], ".mp4")
+
+    def test_a_different_container_is_left_to_ffmpeg(self):
+        _Serve.ctype = "video/webm"
+        # The caller only copies when this matches the container it is writing.
+        self.assertEqual(host._probe_progressive_media(self.url, "")[0], ".webm")
+
+
+class _Bounce(http.server.BaseHTTPRequestHandler):
+    """Redirects /go elsewhere and records what the follow-up request carried."""
+
+    protocol_version = "HTTP/1.1"
+    target = ""
+    seen = {}
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path == "/go":
+            self.send_response(302)
+            self.send_header("Location", self.target)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        type(self).seen = {k.lower(): v for k, v in self.headers.items()}
+        self.send_response(200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Length", "4")
+        self.end_headers()
+        self.wfile.write(b"data")
+
+
+class CredentialsDoNotFollowARedirect(unittest.TestCase):
+    """
+    urllib repeats every header on a redirect. A CDN link that bounces to
+    another host would otherwise hand it the cookies, referer and bearer token
+    belonging to the site the link came from.
+    """
+
+    BLOCK = (
+        "User-Agent: UA\r\n"
+        "Referer: https://tube.example/watch\r\n"
+        "Cookie: session=secret\r\n"
+        "Authorization: Bearer secret\r\n"
+    )
+
+    def setUp(self):
+        _Bounce.seen = {}
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Bounce)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.addCleanup(self.srv.server_close)
+        self.addCleanup(self.srv.shutdown)
+        self.port = self.srv.server_address[1]
+
+    def test_another_host_gets_nothing_private(self):
+        _Bounce.target = f"http://localhost:{self.port}/take"
+        host._http_get_bytes(f"http://127.0.0.1:{self.port}/go", self.BLOCK)
+        for name in ("authorization", "cookie", "referer"):
+            self.assertNotIn(name, _Bounce.seen)
+        self.assertEqual(_Bounce.seen.get("user-agent"), "UA")
+
+    def test_the_same_host_still_gets_them(self):
+        _Bounce.target = f"http://127.0.0.1:{self.port}/take"
+        host._http_get_bytes(f"http://127.0.0.1:{self.port}/go", self.BLOCK)
+        self.assertEqual(_Bounce.seen.get("authorization"), "Bearer secret")
+        self.assertEqual(_Bounce.seen.get("cookie"), "session=secret")
+
+    def test_a_redirect_off_http_is_refused(self):
+        _Bounce.target = "file:///C:/Windows/win.ini"
+        with self.assertRaises(urllib.error.HTTPError):
+            host._http_get_bytes(f"http://127.0.0.1:{self.port}/go", self.BLOCK)
+
+
+class FallbackFetchersDoNotLeakTheReferer(unittest.TestCase):
+    """
+    curl and PowerShell follow redirects too. Both drop the credentials on a
+    cross host hop by themselves, but each would resend the referer as given.
+    """
+
+    HEADERS = {
+        "User-Agent": "UA",
+        "Referer": "https://tube.example/watch",
+        "Cookie": "s=secret",
+    }
+
+    def _argv(self):
+        captured = {}
+
+        class R:
+            returncode = 0
+            stdout = b"x"
+            stderr = b""
+
+        real = host.subprocess.run
+        host.subprocess.run = lambda cmd, *a, **k: (captured.update(cmd=cmd), R())[1]
+        try:
+            host._http_get_bytes_curl(
+                "https://cdn.example/a.mp4", dict(self.HEADERS),
+                timeout=30, max_bytes=None, byte_range=None,
+            )
+        finally:
+            host.subprocess.run = real
+        return captured["cmd"]
+
+    @unittest.skipUnless(host._curl_executable(), "curl not available")
+    def test_curl_hands_the_referer_over_for_curl_to_manage(self):
+        argv = self._argv()
+        # -e "<url>;auto" makes curl replace it with the redirecting URL per hop.
+        self.assertIn("-e", argv)
+        self.assertEqual(argv[argv.index("-e") + 1], "https://tube.example/watch;auto")
+        self.assertFalse(any(str(x).lower().startswith("referer:") for x in argv))
+
+    @unittest.skipUnless(host._curl_executable(), "curl not available")
+    def test_curl_still_sends_the_other_headers(self):
+        self.assertTrue(any("Cookie:" in str(x) for x in self._argv()))
 
 
 if __name__ == "__main__":
