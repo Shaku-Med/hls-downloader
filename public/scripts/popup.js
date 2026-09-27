@@ -1803,6 +1803,10 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
 
   function updateStatus() {
     sendToTab('status', (res) => {
+      // Nobody answered is not the same as nothing running. Dropping out of the
+      // recording UI here would take the stop button with it while the
+      // recording carried on.
+      if (res && res.answered === false) return;
       if (!res || !res.recording) {
         if (isRecording) { exitRecordingUi(); setStatus('Recording saved.'); }
         return;
@@ -1939,6 +1943,12 @@ document.getElementById('open-options')?.addEventListener('click', (e) => {
             if (fail.length) msg += ` (${fail.length} skipped)`;
             setStatus(msg);
           }
+        } else if (/already recording/i.test(String((res && res.error) || ''))) {
+          // Something is running that we had not caught up with. Show the
+          // recording UI rather than the complaint, so there is a way to stop
+          // it instead of a dead end.
+          enterRecordingUi();
+          updateStatus();
         } else if (!renderEmbedHint(res && res.embeddedPlayers)) {
           setStatus(res?.error || 'Couldn’t start recording');
         }

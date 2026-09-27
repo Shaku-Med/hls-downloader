@@ -1515,6 +1515,54 @@ async function scanAllFrames(tabId) {
   };
 }
 
+/**
+ * Recording state across every frame, not just the top one.
+ *
+ * An embedded player records inside its own iframe, and asking only frame 0
+ * comes back "not recording" while it is plainly still going. The panel polls
+ * this once a second, so that answer put the button back to Rec, said
+ * "Recording saved", and left no way to stop the thing that was still running.
+ * Pressing Rec again then reached the right frame and was told it was already
+ * recording, which is exactly the dead end this fixes.
+ */
+async function statusAllFrames(tabId) {
+  const frameIds = [0, ...knownRecorderFrameIds(tabId)];
+  const payload = { type: 'VIDEO_RECORDER', action: 'status' };
+  const answers = await Promise.all(frameIds.map((fid) => askFrame(tabId, fid, payload)));
+
+  const out = {
+    ok: true,
+    // False when not one frame replied. "Not recording" and "nobody answered"
+    // are different things, and telling them apart is what keeps the panel from
+    // announcing a save that never happened and hiding the stop button.
+    answered: answers.some((r) => !!r),
+    recording: false,
+    active: [],
+    sequential: false,
+    queueTotal: 0,
+    queueRemaining: 0,
+    position: 0,
+    total: 0,
+  };
+  for (let i = 0; i < answers.length; i++) {
+    const res = answers[i];
+    if (!res || !res.recording) continue;
+    out.recording = true;
+    // Tag each one so the panel can tell two players apart.
+    for (const a of res.active || []) {
+      out.active.push({ ...a, frameId: frameIds[i] });
+    }
+    out.sequential = out.sequential || !!res.sequential;
+    out.queueTotal += Number(res.queueTotal) || 0;
+    out.queueRemaining += Number(res.queueRemaining) || 0;
+    out.total += Number(res.total) || 0;
+    // Position only reads sensibly from the frame actually working through a
+    // queue, so the first recording frame supplies it.
+    if (!out.position) out.position = Number(res.position) || 0;
+  }
+  return out;
+}
+
 const IMAGE_GRABBER_KEY = 'imageHoverDownloadEnabled';
 const FLOAT_GRABBER_KEY = 'floatGrabberEnabled';
 
@@ -4011,6 +4059,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
         if (message.action === 'scan') {
           respond(sendResponse, await scanAllFrames(tabId));
+          return;
+        }
+        // Like stop: a recording may be running in a frame other than the top.
+        if (message.action === 'status') {
+          respond(sendResponse, await statusAllFrames(tabId));
           return;
         }
         // focus / start / stop go to the frame that owns the video.

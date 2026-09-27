@@ -3007,6 +3007,9 @@
 
   function fabUpdateRecStatus() {
     fabSendRecorder('status', (res) => {
+      // Nobody answered is not the same as nothing running; dropping out here
+      // would take the stop button with it while the recording carried on.
+      if (res && res.answered === false) return;
       if (!res || !res.recording) {
         if (fabIsRecording) setFabRecordingState(false, '');
         return;
@@ -3145,6 +3148,13 @@
               if (fail.length) m += ` (${fail.length} skipped)`;
             }
             setFabRecordingState(true, m);
+          } else if (/already recording/i.test(String((res && res.error) || ''))) {
+            // Something is running that we had not caught up with. Show the
+            // recording UI rather than the complaint, so there is a way to stop
+            // it instead of a dead end.
+            setFabRecordUiVisible(true);
+            setFabRecordingState(true);
+            fabUpdateRecStatus();
           } else if (!renderFabEmbedHint(res && res.embeddedPlayers)) {
             fabRecStatus.textContent = res?.error || 'No videos on this page right now.';
           }
@@ -3210,12 +3220,14 @@
       return;
     }
     if (!st) return;
+    // This reads our own frame only, so it can say a recording started but
+    // never that one stopped: an embedded player records in its own iframe and
+    // would look idle from here. Turning the state off is left to the polled
+    // status, which the background collects from every frame.
     if (st.recording && !fabIsRecording) {
       setFabRecordUiVisible(true);
       setFabRecordingState(true);
       fabUpdateRecStatus();
-    } else if (!st.recording && fabIsRecording) {
-      setFabRecordingState(false, '');
     }
   }, 1500);
   try {
