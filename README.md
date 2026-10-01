@@ -516,6 +516,14 @@ ffmpeg not found. Install ffmpeg, put it on PATH, open a new terminal, then chec
 ffmpeg -version
 ```
 
+If that works in a terminal but downloads still say ffmpeg is missing, the
+browser was open when you installed it. Windows hands every program the PATH it
+had when it started and never updates it, so the browser, and the helper it
+launches, kept the old one. The helper now reads the current PATH from Windows
+itself and also checks the folders winget, Chocolatey and Scoop install into, so
+reloading the extension is enough. If ffmpeg lives somewhere else entirely,
+close every browser window and open it again.
+
 yt-dlp missing or stale for the helper Python:
 
 ```text

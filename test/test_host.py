@@ -1046,5 +1046,64 @@ class FallbackFetchersDoNotLeakTheReferer(unittest.TestCase):
         self.assertTrue(any("Cookie:" in str(x) for x in self._argv()))
 
 
+@unittest.skipUnless(os.name == "nt", "the stale PATH problem is a Windows one")
+class ToolsInstalledAfterTheBrowserOpened(unittest.TestCase):
+    """
+    The browser hands the helper the PATH it had when it opened, and Windows
+    never updates a running process. ffmpeg installed with winget while the
+    browser was open was in the registry PATH but not ours, so every download
+    said it was missing.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        open(os.path.join(self.dir, "sgfaketool.exe"), "wb").close()
+
+        old_path = os.environ.get("PATH", "")
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        self.addCleanup(setattr, host, "_PATH_REFRESHED_AT", host._PATH_REFRESHED_AT)
+        self.reads = 0
+        real = host._registry_path_dirs
+
+        def fake():
+            self.reads += 1
+            return [self.dir]
+
+        host._registry_path_dirs = fake
+        self.addCleanup(setattr, host, "_registry_path_dirs", real)
+        # What the browser passed in: none of our folders.
+        os.environ["PATH"] = os.pathsep.join([r"C:\Windows\System32", r"C:\Windows"])
+
+    def test_a_tool_only_the_registry_knows_about_is_found(self):
+        self.assertIsNone(shutil.which("sgfaketool"))
+        host._refresh_tool_path(force=True)
+        self.assertIsNotNone(shutil.which("sgfaketool"))
+
+    def test_the_browsers_own_entries_stay_first(self):
+        before = os.environ["PATH"].split(os.pathsep)
+        host._refresh_tool_path(force=True)
+        after = os.environ["PATH"].split(os.pathsep)
+        self.assertEqual(after[: len(before)], before)
+
+    def test_a_folder_is_never_added_twice(self):
+        host._refresh_tool_path(force=True)
+        host._refresh_tool_path(force=True)
+        hits = [p for p in os.environ["PATH"].split(os.pathsep)
+                if os.path.normcase(p) == os.path.normcase(self.dir)]
+        self.assertEqual(len(hits), 1)
+
+    def test_folders_that_do_not_exist_are_skipped(self):
+        host._registry_path_dirs = lambda: [os.path.join(self.dir, "missing")]
+        host._refresh_tool_path(force=True)
+        self.assertNotIn("missing", os.environ["PATH"])
+
+    def test_the_registry_is_not_read_on_every_message(self):
+        host._refresh_tool_path(force=True)
+        host._refresh_tool_path()
+        host._refresh_tool_path()
+        self.assertEqual(self.reads, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

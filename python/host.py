@@ -370,6 +370,85 @@ def with_job_id(data, job_id):
     return d
 
 
+def _registry_path_dirs() -> List[str]:
+    """The PATH Windows holds right now, machine first, then the user's."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    found: List[str] = []
+    for root, sub in (
+        (winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+        (winreg.HKEY_CURRENT_USER, "Environment"),
+    ):
+        try:
+            with winreg.OpenKey(root, sub) as key:
+                value, _ = winreg.QueryValueEx(key, "Path")
+        except OSError:
+            continue
+        expanded = winreg.ExpandEnvironmentStrings(str(value or ""))
+        found.extend(p.strip() for p in expanded.split(";") if p.strip())
+    return found
+
+
+def _known_tool_dirs() -> List[str]:
+    """Where winget, Chocolatey and Scoop put their command shims."""
+    local = os.environ.get("LOCALAPPDATA") or os.path.join(
+        os.path.expanduser("~"), "AppData", "Local"
+    )
+    program_data = os.environ.get("ProgramData") or r"C:\ProgramData"
+    return [
+        os.path.join(local, "Microsoft", "WinGet", "Links"),
+        os.path.join(program_data, "chocolatey", "bin"),
+        os.path.join(os.path.expanduser("~"), "scoop", "shims"),
+    ]
+
+
+_PATH_REFRESHED_AT = 0.0
+
+
+def _refresh_tool_path(force: bool = False) -> None:
+    """
+    Find tools installed after the browser started.
+
+    The browser launches this helper with the PATH it had when it opened, and
+    Windows never updates a running process. Install ffmpeg with winget while
+    the browser is open and the new folder lands in the registry but not here,
+    so every download reported "ffmpeg not found" for a tool that was plainly
+    installed. The registry is read again instead, along with the folders the
+    package managers use, and anything missing is added.
+
+    Appended, never put in front, so a tool the browser could already see keeps
+    winning and nothing gets shadowed by a copy found later.
+    """
+    global _PATH_REFRESHED_AT
+    if os.name != "nt":
+        return
+    now = time.monotonic()
+    if not force and now - _PATH_REFRESHED_AT < 10.0:
+        return
+    _PATH_REFRESHED_AT = now
+    current = [p for p in (os.environ.get("PATH") or "").split(os.pathsep) if p]
+    seen = {os.path.normcase(os.path.normpath(p)) for p in current}
+    added: List[str] = []
+    for d in _registry_path_dirs() + _known_tool_dirs():
+        key = os.path.normcase(os.path.normpath(d))
+        if key in seen or not os.path.isdir(d):
+            continue
+        seen.add(key)
+        added.append(d)
+    if added:
+        os.environ["PATH"] = os.pathsep.join(current + added)
+
+
+def _ffmpeg_missing_message() -> str:
+    return (
+        "ffmpeg was not found. Install it with the Auto Download app or put it on "
+        "PATH. If it is installed somewhere unusual, close every browser window "
+        "and open the browser again so it picks up the new PATH."
+    )
+
+
 def _job_live_from_message(output, url, message) -> Dict[str, Any]:
     live: Dict[str, Any] = {"output": output, "tsec": 0.0, "url": url}
     raw_preset = (message.get("ffmpegPreset") or "").strip().lower()
@@ -4559,7 +4638,7 @@ def _ffmpeg_remux_combined_to_output(
     except FileNotFoundError:
         send_message(
             with_job_id(
-                {"type": "done", "success": False, "error": "ffmpeg not found in PATH"},
+                {"type": "done", "success": False, "error": _ffmpeg_missing_message()},
                 job_id,
             )
         )
@@ -6799,7 +6878,7 @@ def run_ffmpeg_with_updates(url, filename, message):
                 stderr=subprocess.PIPE,
             )
         except FileNotFoundError:
-            _fail_both("ffmpeg not found in PATH")
+            _fail_both(_ffmpeg_missing_message())
             return
         except Exception as e:
             _fail_both(str(e))
@@ -7093,10 +7172,13 @@ def _handle_health(message: dict) -> None:
 
 
 def main():
+    _refresh_tool_path(force=True)
     while True:
         message = read_message()
         if message is None:
             break
+        # The helper can outlive an install, so look again now and then.
+        _refresh_tool_path()
         mtype = (message.get("type") or "").lower()
         if mtype == "cancel":
             _request_cancel()
