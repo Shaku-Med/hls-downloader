@@ -1600,7 +1600,7 @@ async function reinjectPageContentScripts(tabIds) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
-        files: ['public/scripts/hls-playlist-hook.js'],
+        files: ['public/scripts/devtools-cloak.js', 'public/scripts/hls-playlist-hook.js'],
         world: 'MAIN',
       });
     } catch (_) {

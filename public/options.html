@@ -46,6 +46,13 @@
         </label>
         <div class="hint">Off by default. When on: hover an image for the download popover, plus the Images list in the popup and floating panel. Applies to open tabs automatically. The right‑click menu is separate and has its own settings below.</div>
       </div>
+      <div class="row">
+        <label class="row-check" for="cloak-dt-on">
+          <input id="cloak-dt-on" type="checkbox" checked />
+          <span>Keep pages from noticing DevTools</span>
+        </label>
+        <div class="hint">On by default. Stops a lot of sites from pausing the video or kicking you out when you open Inspect. A <code>debugger</code> baked into their own file can still pause: press Ctrl+F8 in DevTools to deactivate breakpoints. Reload the tab after saving.</div>
+      </div>
       <div class="row" id="img-save-path-row" hidden>
         <label class="row-check" for="img-save-path-on">
           <input id="img-save-path-on" type="checkbox" />

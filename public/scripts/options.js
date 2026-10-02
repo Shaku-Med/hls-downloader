@@ -25,6 +25,7 @@ const THEME_ACCENT_KEY = 'uiThemeAccent';
 const DL_PROGRESS_LAYOUT_KEY = 'dlProgressLayout';
 const DL_PROGRESS_MORPH_KEY = 'dlProgressMorph';
 const UI_MORPH_KEY = 'uiMorphMotion';
+const CLOAK_DT_KEY = 'hideDevtoolsFromPages';
 
 function showStatus(msg, kind) {
   const el = document.getElementById('status');
@@ -61,7 +62,7 @@ function syncCtxItemsRow() {
 
 function load() {
   chrome.storage.local.get(
-    [KEY, FLOAT_KEY, IMG_DL_KEY, IMG_SAVE_PATH_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY, DL_PROGRESS_LAYOUT_KEY, DL_PROGRESS_MORPH_KEY, UI_MORPH_KEY,
+    [KEY, FLOAT_KEY, IMG_DL_KEY, IMG_SAVE_PATH_KEY, REC_DETACH_KEY, YTDLP_MODE_KEY, FFMPEG_PRESET_MODE_KEY, YTDLP_MAX_H_KEY, THEME_MODE_KEY, THEME_ACCENT_KEY, DL_PROGRESS_LAYOUT_KEY, DL_PROGRESS_MORPH_KEY, UI_MORPH_KEY, CLOAK_DT_KEY,
      CTX_MENU_ENABLED_KEY, CTX_MENU_IMAGE_KEY, CTX_MENU_MEDIA_KEY, CTX_MENU_LINK_KEY, CTX_MENU_PAGE_KEY],
     (data) => {
     const err = chrome.runtime.lastError;
@@ -76,6 +77,8 @@ function load() {
     if (imgDlEl) imgDlEl.checked = data[IMG_DL_KEY] === true; // default OFF
     const imgSavePathEl = document.getElementById('img-save-path-on');
     if (imgSavePathEl) imgSavePathEl.checked = data[IMG_SAVE_PATH_KEY] !== false; // default ON when shown
+    const cloakEl = document.getElementById('cloak-dt-on');
+    if (cloakEl) cloakEl.checked = data[CLOAK_DT_KEY] !== false; // default ON
     const recDetachEl = document.getElementById('rec-detach-on');
     if (recDetachEl) recDetachEl.checked = data[REC_DETACH_KEY] !== false; // default ON
     const qEl = document.getElementById('ytdlp-quality');
@@ -149,6 +152,7 @@ function fieldSnapshot() {
     themeAccent: selectField('ui-theme-accent') || 'blue',
     dlLayout: layout === 'circle' || layout === 'pill' ? layout : 'bar',
     morphOn: boolField('dl-progress-morph'),
+    cloakDtOn: boolField('cloak-dt-on'),
     ...ctx,
   };
 }
@@ -207,6 +211,7 @@ function saveToLocalStorage({ quiet } = {}) {
     [DL_PROGRESS_LAYOUT_KEY]: snap.dlLayout,
     [UI_MORPH_KEY]: snap.morphOn,
     [DL_PROGRESS_MORPH_KEY]: snap.morphOn,
+    [CLOAK_DT_KEY]: snap.cloakDtOn,
   };
   for (const [, key] of CTX_MENU_BOXES) {
     toSet[key] = !!snap[key];
@@ -261,6 +266,7 @@ if (saveBtn) {
   'ui-theme-accent',
   'dl-progress-layout',
   'dl-progress-morph',
+  'cloak-dt-on',
   ...CTX_MENU_BOXES.map(([id]) => id),
 ].forEach((id) => {
   const el = document.getElementById(id);

@@ -5,9 +5,33 @@
 (function () {
   const MSG = '__SG_HLS_PLAYLIST__';
   const MEDIA_MSG = '__SG_PAGE_MEDIA__';
+  const CLOAK_MSG = '__SG_DT_CLOAK__';
+  const CLOAK_KEY = 'hideDevtoolsFromPages';
   const MAX_URLS = 20;
   let lastSent = '';
   let lastMediaSent = '';
+
+  function postCloakFlag(on) {
+    try {
+      window.postMessage({ source: CLOAK_MSG, on: on !== false }, '*');
+    } catch (_) {
+      // ignore
+    }
+  }
+
+  postCloakFlag(true);
+  try {
+    chrome.storage.local.get([CLOAK_KEY], (data) => {
+      if (chrome.runtime.lastError) return;
+      postCloakFlag(!(data && data[CLOAK_KEY] === false));
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area !== 'local' || !changes[CLOAK_KEY]) return;
+      postCloakFlag(changes[CLOAK_KEY].newValue !== false);
+    });
+  } catch (_) {
+    // ignore
+  }
 
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;

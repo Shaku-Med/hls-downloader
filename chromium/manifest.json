@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Stuff Grabber",
-  "version": "1.4.7",
+  "version": "1.4.8",
   "description": "Grabs HLS, DASH, direct video URLs, and page images; saves via helper tools",
   "permissions": [
     "webRequest",
@@ -47,6 +47,7 @@
         "file:///*"
       ],
       "js": [
+        "public/scripts/devtools-cloak.js",
         "public/scripts/hls-playlist-hook.js"
       ],
       "all_frames": true,
