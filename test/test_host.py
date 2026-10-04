@@ -10,6 +10,7 @@ import io
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -1103,6 +1104,208 @@ class ToolsInstalledAfterTheBrowserOpened(unittest.TestCase):
         host._refresh_tool_path()
         host._refresh_tool_path()
         self.assertEqual(self.reads, 1)
+
+
+VOD_PLAYLIST = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:4
+#EXTINF:4.0,
+seg0.ts
+#EXTINF:4.0,
+seg1.ts
+#EXTINF:2.5,
+seg2.ts
+#EXT-X-ENDLIST
+"""
+
+
+class HlsPlaylistFacts(unittest.TestCase):
+    def test_a_finished_playlist_gives_every_segment_start(self):
+        self.assertEqual(host._hls_segment_timeline(VOD_PLAYLIST), [0.0, 4.0, 8.0, 10.5])
+
+    def test_a_live_playlist_has_no_length_yet(self):
+        live = VOD_PLAYLIST.replace("#EXT-X-ENDLIST\n", "")
+        self.assertIsNone(host._hls_segment_timeline(live))
+
+    def test_a_master_playlist_lists_variants_not_segments(self):
+        master = "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1\nlow.m3u8\n#EXT-X-ENDLIST\n"
+        self.assertIsNone(host._hls_segment_timeline(master))
+
+    def test_a_nonsense_duration_is_not_believed(self):
+        broken = VOD_PLAYLIST.replace("#EXTINF:2.5,", "#EXTINF:99999,")
+        self.assertIsNone(host._hls_segment_timeline(broken))
+
+    def test_aes128_is_recognised_as_encrypted(self):
+        enc = VOD_PLAYLIST.replace("#EXTINF:4.0,", '#EXT-X-KEY:METHOD=AES-128,URI="k"\n#EXTINF:4.0,', 1)
+        self.assertTrue(host._hls_is_encrypted(enc))
+
+    def test_method_none_and_no_key_are_clear(self):
+        self.assertFalse(host._hls_is_encrypted(VOD_PLAYLIST))
+        self.assertFalse(host._hls_is_encrypted(
+            VOD_PLAYLIST.replace("#EXTINF:4.0,", "#EXT-X-KEY:METHOD=NONE\n#EXTINF:4.0,", 1)))
+
+
+class ProgressReadsLikeTheSegmentDownloader(unittest.TestCase):
+    """
+    ffmpeg reports how far into the video it is. Against the playlist that
+    becomes [N/M], a percentage and an estimate, instead of a clock with
+    nothing to measure it by.
+    """
+
+    TIMELINE = [0.0, 4.0, 8.0, 10.5]
+
+    def test_segment_count_percent_and_time_left(self):
+        detail, pct = host._ffmpeg_progress_view(
+            {"tsec": 5.0, "speed": "2.0x"}, self.TIMELINE)
+        self.assertTrue(detail.startswith("[2/3]"), detail)
+        self.assertIn("0:05 of 0:10", detail)
+        self.assertIn("2s left", detail)
+        self.assertAlmostEqual(pct, 5.0 * 100 / 10.5, places=3)
+
+    def test_no_zero_seconds_left_at_the_very_end(self):
+        detail, pct = host._ffmpeg_progress_view(
+            {"tsec": 10.4, "speed": "2.0x"}, self.TIMELINE)
+        self.assertNotIn("left", detail)
+
+    def test_past_the_end_is_held_at_100(self):
+        _, pct = host._ffmpeg_progress_view({"tsec": 99.0}, self.TIMELINE)
+        self.assertEqual(pct, 100.0)
+
+    def test_a_step_label_comes_first(self):
+        detail, _ = host._ffmpeg_progress_view({"tsec": 1.0}, [0.0, 10.0], "Re-encoding")
+        self.assertTrue(detail.startswith("Re-encoding"), detail)
+        self.assertNotIn("[", detail)  # one span, no segment count
+
+    def test_without_a_timeline_it_says_what_it_always_said(self):
+        detail, pct = host._ffmpeg_progress_view(
+            {"time": "00:16:12.24", "tsec": 972.24, "size": "96512KiB", "speed": "7.96x"})
+        self.assertEqual(detail, "time 00:16:12.24, size 96512KiB, 7.96x")
+        self.assertIsNone(pct)
+
+
+class SavedPlaylistStartsOnCurrentFfmpeg(unittest.TestCase):
+    """
+    -headers and -user_agent are HTTP options. Against a playlist saved to disk
+    nothing consumes them, and ffmpeg 9 refuses to start when an input option
+    goes unused, so every one of these jobs failed before fetching a byte.
+    """
+
+    def _cmd(self, local):
+        cmd, _ = host._build_ffmpeg_cmd_list(
+            "http://cdn.example/index.m3u8",
+            {"streamKind": "hls", "userAgent": "UA"},
+            os.path.join(os.path.dirname(local), "out.mkv"),
+            "Referer: http://cdn.example/\r\n",
+            playlist_text=VOD_PLAYLIST,
+            playlist_url="http://cdn.example/index.m3u8",
+            ffmpeg_input=local,
+        )
+        return cmd
+
+    def test_no_http_options_against_a_file(self):
+        cmd = self._cmd(os.path.join(tempfile.gettempdir(), "x.m3u8"))
+        self.assertNotIn("-headers", cmd)
+        self.assertNotIn("-user_agent", cmd)
+
+    def test_they_stay_for_a_url(self):
+        cmd, _ = host._build_ffmpeg_cmd_list(
+            "http://cdn.example/a.mp4", {"userAgent": "UA"},
+            os.path.join(tempfile.gettempdir(), "out.mkv"),
+            "Referer: http://cdn.example/\r\n",
+        )
+        self.assertIn("-headers", cmd)
+        self.assertIn("-user_agent", cmd)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_ffmpeg_actually_runs_it(self):
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, True)
+        for i in range(3):
+            subprocess.run(
+                ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 f"testsrc2=size=160x90:rate=10:duration={2.5 if i == 2 else 4}",
+                 "-c:v", "libx264", "-preset", "ultrafast", "-f", "mpegts",
+                 os.path.join(work, f"seg{i}.ts")],
+                check=True, capture_output=True,
+            )
+        local = os.path.join(work, "index.m3u8")
+        with open(local, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(VOD_PLAYLIST)
+        r = subprocess.run(self._cmd(local), capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        self.assertTrue(os.path.getsize(os.path.join(work, "out.mkv")) > 1000)
+
+
+class QualityListAnswers(unittest.TestCase):
+    """
+    Asking yt-dlp for a page's formats named a variable that did not exist, so
+    it died in its thread without replying, after writing the browser's
+    cookies to a temp file and before the code that deletes it.
+    """
+
+    def test_it_replies_and_cleans_up_the_cookie_file(self):
+        sent, written, ran = [], [], []
+        real = (host.send_message, host._yt_dlp_invocation_prefix,
+                host.subprocess.run, host._write_netscape_cookie_file)
+
+        def fake_cookie_file(jar):
+            fd, path = tempfile.mkstemp(prefix="sg_cookies_test_", suffix=".txt")
+            os.close(fd)
+            written.append(path)
+            return path
+
+        class Done:
+            returncode = 0
+            stdout = '{"formats": []}'
+            stderr = ""
+
+        host.send_message = sent.append
+        host._yt_dlp_invocation_prefix = lambda: ["yt-dlp"]
+        host.subprocess.run = lambda cmd, **kw: (ran.append(cmd), Done())[1]
+        host._write_netscape_cookie_file = fake_cookie_file
+        try:
+            host._handle_ytdlp_formats({
+                "requestId": "r1",
+                "pageUrl": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "cookieJar": [{"name": "a", "value": "b", "domain": ".youtube.com"}],
+            })
+        finally:
+            (host.send_message, host._yt_dlp_invocation_prefix,
+             host.subprocess.run, host._write_netscape_cookie_file) = real
+
+        replies = [m for m in sent if m.get("type") == "ytdlp_formats_result"]
+        self.assertEqual(len(replies), 1)
+        self.assertEqual(replies[0]["requestId"], "r1")
+        self.assertTrue(ran, "yt-dlp was never reached")
+        self.assertTrue(written)
+        self.assertFalse(os.path.exists(written[0]), "the cookie file was left behind")
+
+
+class SegmentsOnAnotherSiteGetNoCookies(unittest.TestCase):
+    """
+    The cookie and auth token were captured for the playlist's site. A playlist
+    can list segments on any host, and a browser would never send one site's
+    cookies to another.
+    """
+
+    BLOCK = (
+        "Referer: https://tube.example/watch\r\n"
+        "User-Agent: UA\r\n"
+        "Cookie: session=secret\r\n"
+        "Authorization: Bearer secret\r\n"
+    )
+    PLAYLIST = "https://tube.example/hls/index.m3u8"
+
+    def test_another_site_gets_neither(self):
+        out = host._scope_header_block(self.BLOCK, self.PLAYLIST, "https://evil.example/seg1.ts")
+        self.assertNotIn("Cookie", out)
+        self.assertNotIn("Authorization", out)
+        self.assertIn("Referer: https://tube.example/watch", out)
+        self.assertIn("User-Agent: UA", out)
+
+    def test_the_same_site_and_its_cdn_keep_them(self):
+        for target in ("https://tube.example/seg1.ts", "https://cdn.tube.example/seg1.ts"):
+            self.assertEqual(host._scope_header_block(self.BLOCK, self.PLAYLIST, target), self.BLOCK)
 
 
 if __name__ == "__main__":

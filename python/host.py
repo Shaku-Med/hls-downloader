@@ -19,6 +19,7 @@ import tempfile
 import shutil
 import glob
 import base64
+import bisect
 import binascii
 import urllib.error
 import urllib.request
@@ -695,6 +696,121 @@ def _file_size_or_zero(path: str) -> int:
 _FFMPEG_STALL_SEC = 25.0
 
 
+def _hls_segment_timeline(playlist_text: Optional[str]) -> Optional[List[float]]:
+    """
+    Where each segment of a finished media playlist starts, ending with the total.
+
+    ffmpeg only says how far into the video it has got. The playlist says how
+    long the video is and where every segment begins, which is what lets the
+    plain ffmpeg route show the same [N/M] and percentage the segment
+    downloader does instead of a running clock with nothing to measure it by.
+
+    None for a live playlist, whose length is not settled yet, and for a master
+    playlist, which lists variants rather than segments.
+    """
+    if not playlist_text or "#EXT-X-ENDLIST" not in playlist_text.upper():
+        return None
+    starts = [0.0]
+    for line in playlist_text.splitlines():
+        m = re.match(r"\s*#EXTINF:\s*([0-9]+(?:\.[0-9]+)?)", line, re.I)
+        if not m:
+            continue
+        dur = float(m.group(1))
+        # A segment longer than an hour is a broken tag, not a real duration.
+        if dur > 3600:
+            return None
+        starts.append(starts[-1] + dur)
+    if len(starts) < 2 or starts[-1] <= 0:
+        return None
+    return starts
+
+
+def _scope_header_block(header_block: str, owner_url: str, target_url: str) -> str:
+    """
+    The header block without the cookie and auth token when the request leaves the site.
+
+    Both were captured from the browser's request for the playlist and belong to
+    that site. A playlist can list its segments on any host, and a browser
+    fetching them would never hand one site's cookies to another, so neither do
+    we. The referer, origin and user agent stay: browsers send those across
+    sites too, and CDNs check them.
+    """
+    if not header_block or not owner_url or not target_url or _same_site(owner_url, target_url):
+        return header_block
+    kept = [
+        ln for ln in header_block.split("\r\n")
+        if ln.strip() and ln.split(":", 1)[0].strip().lower() not in ("cookie", "authorization")
+    ]
+    return "".join(ln + "\r\n" for ln in kept)
+
+
+def _hls_is_encrypted(playlist_text: Optional[str]) -> bool:
+    """
+    Whether any segment is behind an EXT-X-KEY.
+
+    The segment downloader copies bytes as they come and has no decryption, so
+    an AES-128 playlist has to go to ffmpeg, which fetches the key and decrypts.
+    """
+    for line in (playlist_text or "").splitlines():
+        s = line.strip()
+        if not s.upper().startswith("#EXT-X-KEY:"):
+            continue
+        m = re.search(r"METHOD\s*=\s*([A-Z0-9-]+)", s, re.I)
+        if m and m.group(1).upper() != "NONE":
+            return True
+    return False
+
+
+def _fmt_clock(sec: float) -> str:
+    sec = int(max(0.0, sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _ffmpeg_progress_view(
+    parsed: Dict[str, Any], timeline: Optional[List[float]] = None, label: str = ""
+) -> Tuple[str, Optional[float]]:
+    """
+    Card text and percentage for one ffmpeg stats line.
+
+    With a timeline the card reads like the segment downloader's,
+    "[147/290] · 16:12 of 31:40 · 7.96x · 1m 57s left", and the bar fills.
+    Without one it says what it always said.
+    """
+    tsec = parsed.get("tsec")
+    if timeline and tsec is not None and timeline[-1] > 0:
+        total = timeline[-1]
+        done = min(max(float(tsec), 0.0), total)
+        parts: List[str] = [label] if label else []
+        count = len(timeline) - 1
+        if count > 1:
+            seg = min(max(bisect.bisect_right(timeline, done), 1), count)
+            parts.append(f"[{seg}/{count}]")
+        parts.append(f"{_fmt_clock(done)} of {_fmt_clock(total)}")
+        speed = str(parsed.get("speed") or "")
+        if speed:
+            parts.append(speed)
+        try:
+            rate = float(speed.rstrip("x"))
+        except ValueError:
+            rate = 0.0
+        left = (total - done) / rate if rate > 0 else 0.0
+        # Under a second it would only ever read "0s left".
+        if left >= 1:
+            parts.append(f"{_fmt_elapsed(left)} left")
+        return " · ".join(parts), done * 100.0 / total
+
+    parts = []
+    if parsed.get("time"):
+        parts.append(f"time {parsed['time']}")
+    if parsed.get("size"):
+        parts.append(f"size {parsed['size']}")
+    if parsed.get("speed"):
+        parts.append(parsed["speed"])
+    return ", ".join(parts), None
+
+
 def _ffmpeg_heartbeat(
     job_id: str,
     output_path: str,
@@ -724,7 +840,12 @@ def _ffmpeg_heartbeat(
             seen = size
             grew_at = now
         quiet = now - grew_at
-        if size and quiet < _FFMPEG_STALL_SEC:
+        # Past the last segment the silence is the index being moved to the
+        # front of the file, which is work, not a stall.
+        finishing = len(last_stat) > 1 and last_stat[1] >= 99.5
+        if finishing:
+            detail = f"Finishing the file, {_fmt_size(size)}" if size else "Finishing the file"
+        elif size and quiet < _FFMPEG_STALL_SEC:
             detail = f"Downloading, {_fmt_size(size)} in {_fmt_elapsed(now - started)}"
         elif size:
             detail = (
@@ -2965,7 +3086,7 @@ def _handle_ytdlp_formats(message: dict) -> None:
     ]
     cmd.extend(_yt_dlp_youtube_cli_extras(message, target))
     cmd.extend(_yt_dlp_cookies_args(message, target))
-    cmd.extend(_yt_dlp_header_args(message, target_url))
+    cmd.extend(_yt_dlp_header_args(message, target))
     cmd.append(target)
     run_kw: Dict[str, Any] = {
         "capture_output": True,
@@ -4481,7 +4602,8 @@ def _detect_obfuscated_segments(
     sample_url, sample_br = seg_entries[0]
     try:
         head = _http_get_bytes(
-            sample_url, header_block, max_bytes=4 * 1024 * 1024, timeout=90.0, byte_range=sample_br
+            sample_url, _scope_header_block(header_block, var_url, sample_url),
+            max_bytes=4 * 1024 * 1024, timeout=90.0, byte_range=sample_br
         )
     except (urllib.error.URLError, OSError, ValueError):
         return None, 0
@@ -4527,7 +4649,10 @@ def _detect_obfuscated_segments(
         return k, 0
 
     try:
-        full = _http_get_bytes(sample_url, header_block, max_bytes=None, timeout=120.0, byte_range=sample_br)
+        full = _http_get_bytes(
+            sample_url, _scope_header_block(header_block, var_url, sample_url),
+            max_bytes=None, timeout=120.0, byte_range=sample_br,
+        )
     except (urllib.error.URLError, OSError, ValueError):
         return None, 0
 
@@ -4654,7 +4779,12 @@ def _ffmpeg_remux_combined_to_output(
     last_send = 0.0
     throttle_s = 0.35
 
-    last_stat = [time.monotonic()]
+    last_stat = [time.monotonic(), 0.0]
+    # The segments are already on disk by now, so the length is one probe away.
+    whole = _ffprobe_duration_seconds(combined_path)
+    timeline = [0.0, whole] if whole and whole > 0 else None
+    # The download's bar has already filled once, so say which step this is.
+    step = "Re-encoding" if transcoding else "Joining the segments"
 
     def read_stderr_ff():
         nonlocal last_send
@@ -4667,29 +4797,24 @@ def _ffmpeg_remux_combined_to_output(
                     continue
                 last_stat[0] = time.monotonic()
                 parsed = _parse_ffmpeg_progress(line)
+                detail, pct = _ffmpeg_progress_view(parsed, timeline, step)
+                if pct is not None:
+                    last_stat[1] = pct
                 now = time.monotonic()
-                if now - last_send < throttle_s:
+                final = pct is not None and pct >= 99.5
+                if now - last_send < throttle_s and not final:
                     continue
                 last_send = now
-                parts = []
-                if parsed.get("time"):
-                    parts.append(f"time {parsed['time']}")
-                if parsed.get("size"):
-                    parts.append(f"size {parsed['size']}")
-                if parsed.get("speed"):
-                    parts.append(parsed["speed"])
-                send_message(
-                    with_job_id(
-                        {
-                            "type": "progress",
-                            "phase": "encoding",
-                            "detail": ", ".join(parts) if parts else line.strip()[:120],
-                            "output": output_path,
-                            **parsed,
-                        },
-                        job_id,
-                    )
-                )
+                payload: Dict[str, Any] = {
+                    "type": "progress",
+                    "phase": "encoding",
+                    "detail": detail or line.strip()[:120],
+                    "output": output_path,
+                    **parsed,
+                }
+                if pct is not None:
+                    payload["percent"] = round(pct, 2)
+                send_message(with_job_id(payload, job_id))
         finally:
             try:
                 proc.stderr.close()
@@ -4788,7 +4913,8 @@ def _classify_clean_fake_ext_hls(
     init_kind: Optional[str] = None
     if map_url:
         init_head = _http_get_bytes(
-            map_url, header_block, max_bytes=1024 * 1024, timeout=60.0, byte_range=map_br
+            map_url, _scope_header_block(header_block, var_url, map_url),
+            max_bytes=1024 * 1024, timeout=60.0, byte_range=map_br
         )
         if not init_head:
             return None
@@ -4798,7 +4924,8 @@ def _classify_clean_fake_ext_hls(
 
     seg0_url, seg0_br = seg_entries[0]
     seg_head = _http_get_bytes(
-        seg0_url, header_block, max_bytes=4 * 1024 * 1024, timeout=90.0, byte_range=seg0_br
+        seg0_url, _scope_header_block(header_block, var_url, seg0_url),
+        max_bytes=4 * 1024 * 1024, timeout=90.0, byte_range=seg0_br
     )
     if not seg_head:
         return None
@@ -4840,7 +4967,7 @@ def _download_clean_hls_no_strip(
                 {
                     "type": "progress",
                     "phase": "fetch",
-                    "detail": "Downloading HLS (raw fMP4 / TS, no unwrap)…",
+                    "detail": "Downloading the segments…",
                     "output": output_path,
                 },
                 job_id,
@@ -4860,7 +4987,7 @@ def _download_clean_hls_no_strip(
         init_bin = b""
         if container == "fmp4" and map_url:
             try:
-                init_bin = _download_segment_bytes(map_url, header_block, byte_range=map_br)
+                init_bin = _download_segment_bytes(map_url, _scope_header_block(header_block, var_url, map_url), byte_range=map_br)
             except (urllib.error.URLError, OSError, ValueError) as e:
                 send_message(
                     with_job_id(
@@ -4910,12 +5037,14 @@ def _download_clean_hls_no_strip(
                         "phase": "fetch",
                         "detail": f"[{i}/{total}] Downloading…",
                         "output": output_path,
+                        # Sent before segment i is fetched, so i - 1 are done.
+                        "percent": round((i - 1) * 100.0 / total, 2) if total else 0.0,
                     },
                     job_id,
                 )
             )
             try:
-                raw = _download_segment_bytes(seg_url, header_block, byte_range=seg_br)
+                raw = _download_segment_bytes(seg_url, _scope_header_block(header_block, var_url, seg_url), byte_range=seg_br)
             except (urllib.error.URLError, OSError, ValueError) as e:
                 send_message(
                     with_job_id(
@@ -5070,7 +5199,7 @@ def _download_obfuscated_hls(
         init_bin = b""
         if map_url:
             try:
-                init_raw = _download_segment_bytes(map_url, header_block, byte_range=map_br)
+                init_raw = _download_segment_bytes(map_url, _scope_header_block(header_block, var_url, map_url), byte_range=map_br)
                 init_bin = _extract_ts_payload(init_raw, kind_hint)
             except (urllib.error.URLError, OSError, ValueError) as e:
                 send_message(
@@ -5114,12 +5243,14 @@ def _download_obfuscated_hls(
                         "phase": "fetch",
                         "detail": f"[{i}/{total}] Downloading…",
                         "output": output_path,
+                        # Sent before segment i is fetched, so i - 1 are done.
+                        "percent": round((i - 1) * 100.0 / total, 2) if total else 0.0,
                     },
                     job_id,
                 )
             )
             try:
-                raw = _download_segment_bytes(seg_url, header_block, byte_range=seg_br)
+                raw = _download_segment_bytes(seg_url, _scope_header_block(header_block, var_url, seg_url), byte_range=seg_br)
             except (urllib.error.URLError, OSError, ValueError) as e:
                 send_message(
                     with_job_id(
@@ -5331,15 +5462,15 @@ def _build_ffmpeg_cmd_list(
         )
     if not ffmpeg_input:
         pre.extend(_ffmpeg_network_timeout_args(url))
-    pre.extend(
-        [
-            "-headers",
-            header_block,
-        ]
-    )
-    ua = ((message.get("userAgent") if message else None) or "").strip() or USER_AGENT
-    if ua:
-        pre.extend(["-user_agent", ua])
+        # These are HTTP options. Against a playlist saved to disk the input
+        # opens through the file protocol, which has no use for them: ffmpeg
+        # never passed them on to the segments even when it accepted them, and
+        # ffmpeg 9 refuses to start at all when an input option goes unused,
+        # which failed every one of these downloads before a byte was fetched.
+        pre.extend(["-headers", header_block])
+        ua = ((message.get("userAgent") if message else None) or "").strip() or USER_AGENT
+        if ua:
+            pre.extend(["-user_agent", ua])
     pre.extend(
         [
             "-i",
@@ -6770,7 +6901,21 @@ def run_ffmpeg_with_updates(url, filename, message):
             one_shot = bool((message or {}).get("oneShotHls")) or _hls_url_looks_one_shot(
                 url
             ) or _hls_url_looks_one_shot(var_url_r or "")
-            if one_shot and var_text_r and not _is_master_playlist(var_text_r):
+            # Fetching the segments ourselves is the normal route, not the
+            # exception. It sends the page's referer, cookies and user agent
+            # with every segment, where ffmpeg reading a saved playlist sends
+            # none of them and gets turned away by any CDN that checks. It also
+            # counts [N/M], retries a segment rather than the whole job, and can
+            # go through the browser for CDNs that only accept its connection.
+            # ffmpeg keeps what only it can do: AES-128, which it decrypts, and
+            # live playlists, which it follows as they grow.
+            finished = _hls_segment_timeline(var_text_r) is not None
+            if (
+                (one_shot or finished)
+                and var_text_r
+                and not _is_master_playlist(var_text_r)
+                and not _hls_is_encrypted(var_text_r)
+            ):
                 clean_kind_os: Optional[str] = None
                 try:
                     clean_kind_os = _classify_clean_fake_ext_hls(
@@ -6894,7 +7039,10 @@ def run_ffmpeg_with_updates(url, filename, message):
         stderr_lines = []
         last_send = 0.0
         throttle_s = 0.35
-        last_stat = [time.monotonic()]
+        last_stat = [time.monotonic(), 0.0]
+        # Read from the playlist ffmpeg is about to work through, so the card
+        # can say how far along it is and not just how much time has passed.
+        timeline = _hls_segment_timeline(var_text_r) if _is_hls_input(url, message) else None
 
         def read_stderr():
             nonlocal last_send
@@ -6915,29 +7063,26 @@ def run_ffmpeg_with_updates(url, filename, message):
                     if "time=" not in line:
                         continue
                     parsed = _parse_ffmpeg_progress(line)
+                    detail, pct = _ffmpeg_progress_view(parsed, timeline)
+                    if pct is not None:
+                        last_stat[1] = pct
                     now = time.monotonic()
-                    if now - last_send < throttle_s:
+                    # The last line always goes out, or the card can stop short
+                    # of 100 because it landed inside the throttle window.
+                    final = pct is not None and pct >= 99.5
+                    if now - last_send < throttle_s and not final:
                         continue
                     last_send = now
-                    parts = []
-                    if parsed.get("time"):
-                        parts.append(f"time {parsed['time']}")
-                    if parsed.get("size"):
-                        parts.append(f"size {parsed['size']}")
-                    if parsed.get("speed"):
-                        parts.append(parsed["speed"])
-                    send_message(
-                        with_job_id(
-                            {
-                                "type": "progress",
-                                "phase": "encoding",
-                                "detail": ", ".join(parts) if parts else line.strip()[:120],
-                                "output": output_path,
-                                **parsed,
-                            },
-                            job_id,
-                        )
-                    )
+                    payload: Dict[str, Any] = {
+                        "type": "progress",
+                        "phase": "encoding",
+                        "detail": detail or line.strip()[:120],
+                        "output": output_path,
+                        **parsed,
+                    }
+                    if pct is not None:
+                        payload["percent"] = round(pct, 2)
+                    send_message(with_job_id(payload, job_id))
             finally:
                 try:
                     proc.stderr.close()

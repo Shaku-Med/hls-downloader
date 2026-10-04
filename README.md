@@ -493,6 +493,28 @@ stuck one. A connection that goes completely dead now gives up after a minute
 instead of hanging until you close the browser.
 
 
+How an HLS stream is downloaded
+
+A finished HLS playlist is fetched one segment at a time, shown as [300/500]
+with the bar filling as it goes, then joined into one file. That is the normal
+route now, not a special case. Each segment is requested with the page's
+referer, cookies and user agent, which is what most streaming CDNs check before
+they hand anything over. ffmpeg reading the playlist itself sends none of them,
+so on those sites it was turned away. The cookies and auth token only ever go
+to the site they were taken from, never to a segment host somewhere else.
+
+Two kinds still go straight to ffmpeg, since only ffmpeg can do them: playlists
+encrypted with AES-128, which it decrypts, and live playlists, which it keeps
+following as they grow. An encrypted one still shows [N/M] and a percentage,
+worked out from the playlist. A live one has no end yet, so it shows how far it
+has got instead. Segments disguised as images are unwrapped first, as before.
+
+ffmpeg 9 refuses to start when an option it was given goes unused, and the
+helper used to hand it web options against a playlist saved to disk. Every HLS
+download on ffmpeg 9 failed at that point and fell through to another route.
+That is fixed.
+
+
 Where things can fail
 
 Some sites wrap media in DRM. Netflix and similar services are a good example. The extension might see a manifest, but the segments stay encrypted and neither ffmpeg nor yt-dlp can unlock them. Nothing gets around that, so on those pages the popup and the floating panel say the video is protected and offer the screen recorder instead. One button opens it. See Screen recorder below.
