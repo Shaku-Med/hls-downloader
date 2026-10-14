@@ -247,7 +247,7 @@ If `chromium` is missing, run once from this repo:
 python python/setup_browser_roots.py
 ```
 
-The browser shows an Extension ID under the name. Copy that full ID. You need it when you run the helper installer.
+The browser shows an Extension ID under the name. Copy that full ID if you want Chrome, Edge, or Brave to use the helper. Firefox does not have this ID. Skip it when you only use Firefox.
 
 
 Firefox (personal temporary add-on)
@@ -270,7 +270,7 @@ If `firefox` is missing, run once:
 python python/setup_browser_roots.py
 ```
 
-Firefox will unload the add-on when you quit the browser. Load it again the same way next time. That is the supported personal Firefox path. The Firefox id is fixed as `stuff-grabber@local`, so you do not paste a Firefox id into the installer.
+Firefox will unload the add-on when you quit the browser. Load it again the same way next time. That is the supported personal Firefox path. The Firefox id is fixed as `stuff-grabber@local`, so you do not paste a Firefox id into the installer. If the installer asks for a Chromium extension ID, press Enter.
 
 How the folders work: `public/`, `asset/`, and `style/` stay at the repo root. Setup links them into `chromium/` (live junctions/symlinks — Chrome is fine with that). Firefox gets real copies of those folders, because Firefox often cannot load popup CSS/JS through Windows junctions (blank popup / Quirks Mode). After you edit shared extension files, run `python python/setup_browser_roots.py` again before reloading the Firefox temporary add-on.
 
@@ -283,13 +283,23 @@ Open a terminal in this folder and run:
 python python/install.py
 ```
 
-It will ask for your Chromium Extension ID (from Load unpacked). You can also pass that ID on the same line:
+Firefox does not have a Chrome extension ID. The add-on id is already `stuff-grabber@local`. When the installer asks for a Chromium ID, press Enter. Or skip the question:
+
+```text
+python python/install.py --firefox
+```
+
+That registers the helper for Firefox only. Chrome and Chromium are left alone.
+
+To register Chrome as well, pass the ID from `chrome://extensions`:
 
 ```text
 python python/install.py YOUR_EXTENSION_ID
 ```
 
-One run registers the native host for both Google Chrome and Firefox. The Firefox side uses the fixed id `stuff-grabber@local`. The script also installs or updates yt-dlp, cryptography, and pycryptodomex for that Python and checks for ffmpeg. On Windows it may try winget for ffmpeg if ffmpeg is missing.
+That run registers Chrome and Firefox. Firefox is still allowed only for `stuff-grabber@local`. The script also installs or updates yt-dlp, cryptography, and pycryptodomex for that Python and checks for ffmpeg. On Windows it may try winget for ffmpeg if ffmpeg is missing.
+
+On Linux, Firefox 147 and later read the host file from `~/.config/mozilla/native-messaging-hosts/`. Older Firefox still reads `~/.mozilla/native-messaging-hosts/`. The installer writes both. A manifest that exists only under `~/.mozilla/` is invisible to current Firefox, and the download card then says it lost the connection to the helper.
 
 You can still load the unpacked extension in Edge, Brave, and other Chromium browsers. If downloads do not start from those browsers, use Google Chrome for the download step, or re run the installer after loading the extension there.
 
@@ -524,7 +534,17 @@ Some pages only play inside workers or blob URLs that never show up as a normal 
 
 If something feels broken
 
-Native host missing or downloads never start. Run this again with the current Chromium Extension ID, then fully restart the browser. On Firefox, load the temporary add-on again after restart:
+Native host missing, or the card says "Lost connection to the download helper". The extension is up, but Firefox or Chrome could not start `python/host.py`.
+
+Firefox only, no extension ID:
+
+```text
+python python/install.py --firefox
+```
+
+Then fully quit Firefox and load the temporary add-on again. On Linux, confirm the manifest exists at `~/.config/mozilla/native-messaging-hosts/com.medzy.hlsgrabber.json`. The older `~/.mozilla/native-messaging-hosts/` path is not enough on Firefox 147 and later.
+
+Chrome, Edge, or Brave, using the current extension ID:
 
 ```text
 python python/install.py YOUR_EXTENSION_ID
@@ -656,7 +676,7 @@ pycryptodomex installed for that Python (other AES / yt-dlp decrypt)
 curl-cffi installed for that Python (Dailymotion and similar)
 Deno or Node on PATH if you care about YouTube
 This repo cloned and the folder loaded as an unpacked extension
-python python/install.py run with your Extension ID
+python python/install.py   (press Enter for Firefox only, or pass --firefox; Chromium users pass their Extension ID)
 A save folder set in Options
 Browser fully restarted after install
 ```

@@ -847,12 +847,17 @@ class _Serve(http.server.BaseHTTPRequestHandler):
             if status == 206:
                 self.send_header("Content-Range", f"bytes {start}-{end}/{len(self.body)}")
         self.end_headers()
-        if self.cut_after and len(chunk) > self.cut_after:
-            self.wfile.write(chunk[: self.cut_after])
+        try:
+            if self.cut_after and len(chunk) > self.cut_after:
+                self.wfile.write(chunk[: self.cut_after])
+                self.close_connection = True
+                type(self).cut_after = 0  # only break the first attempt
+                return
+            self.wfile.write(chunk)
+        except ConnectionError:
+            # The client hung up mid-body. On Linux that is a broken pipe;
+            # the handler thread would otherwise print a traceback.
             self.close_connection = True
-            type(self).cut_after = 0  # only break the first attempt
-            return
-        self.wfile.write(chunk)
 
 
 class PlainFilesAreCopiedNotDemuxed(unittest.TestCase):
@@ -999,8 +1004,10 @@ class CredentialsDoNotFollowARedirect(unittest.TestCase):
 
     def test_a_redirect_off_http_is_refused(self):
         _Bounce.target = "file:///C:/Windows/win.ini"
-        with self.assertRaises(urllib.error.HTTPError):
+        with self.assertRaises(urllib.error.HTTPError) as caught:
             host._http_get_bytes(f"http://127.0.0.1:{self.port}/go", self.BLOCK)
+        # Python 3.14 warns if this response is left for the garbage collector.
+        caught.exception.close()
 
 
 class FallbackFetchersDoNotLeakTheReferer(unittest.TestCase):
@@ -1216,15 +1223,37 @@ class SavedPlaylistStartsOnCurrentFfmpeg(unittest.TestCase):
         self.assertIn("-headers", cmd)
         self.assertIn("-user_agent", cmd)
 
+    def _segment_encode_args(self):
+        """
+        The fixture only has to be a real transport stream. libx264 is the
+        usual encoder, but some Linux builds (Fedora's) compile it out, and
+        the remux under test is a stream copy.
+        """
+        listed = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True,
+        )
+        names = set()
+        for line in (listed.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("V"):
+                names.add(parts[1])
+        if "libx264" in names:
+            return ["-c:v", "libx264", "-preset", "ultrafast"]
+        if "mpeg4" in names:
+            return ["-c:v", "mpeg4", "-q:v", "5"]
+        self.skipTest("ffmpeg has neither libx264 nor mpeg4")
+
     @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
     def test_ffmpeg_actually_runs_it(self):
+        encode = self._segment_encode_args()
         work = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, work, True)
         for i in range(3):
             subprocess.run(
                 ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
                  f"testsrc2=size=160x90:rate=10:duration={2.5 if i == 2 else 4}",
-                 "-c:v", "libx264", "-preset", "ultrafast", "-f", "mpegts",
+                 *encode, "-f", "mpegts",
                  os.path.join(work, f"seg{i}.ts")],
                 check=True, capture_output=True,
             )
