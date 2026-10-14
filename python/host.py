@@ -1769,17 +1769,79 @@ def _yt_dlp_target_is_youtube_like(target_url: str) -> bool:
     return t.startswith("ytsearch") or _url_is_youtube_page(target_url)
 
 
+def _js_runtime_search_dirs() -> List[str]:
+    """
+    Folders that may hold Deno or Node when the browser's PATH does not.
+
+    Firefox starts the helper with the desktop session PATH. A runtime
+    installed under the home directory (the Deno installer uses ~/.deno/bin)
+    is on the shell PATH only, so shutil.which misses it and YouTube's
+    n-challenge never runs.
+    """
+    home = os.path.expanduser("~")
+    extra = [
+        os.path.join(home, ".deno", "bin"),
+        os.path.join(home, ".local", "bin"),
+        os.path.join(home, ".bun", "bin"),
+        "/usr/local/bin",
+        "/usr/bin",
+    ]
+    nvm_root = os.path.join(home, ".nvm", "versions", "node")
+    if os.path.isdir(nvm_root):
+        versions = sorted(
+            name for name in os.listdir(nvm_root)
+            if os.path.isdir(os.path.join(nvm_root, name, "bin"))
+        )
+        if versions:
+            extra.append(os.path.join(nvm_root, versions[-1], "bin"))
+    found: List[str] = []
+    seen = set()
+    for directory in [p for p in (os.environ.get("PATH") or "").split(os.pathsep) if p] + extra:
+        key = os.path.normcase(os.path.normpath(directory))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(directory)
+    return found
+
+
+def _find_js_runtimes() -> List[Tuple[str, str]]:
+    """
+    Every usable runtime, in yt-dlp's priority order.
+
+    PATH is checked first, with shutil.which, so a Windows shim (deno.cmd,
+    node.exe via PATHEXT) still wins. Extra folders are only for a binary the
+    browser PATH cannot see.
+    """
+    suffix = ".exe" if os.name == "nt" else ""
+    found: List[Tuple[str, str]] = []
+    for runtime, filename in (("deno", "deno"), ("node", "node"), ("bun", "bun"), ("quickjs", "qjs")):
+        located = shutil.which(filename)
+        if located:
+            found.append((runtime, os.path.abspath(located)))
+            continue
+        leaf = filename + suffix
+        for directory in _js_runtime_search_dirs():
+            candidate = os.path.join(directory, leaf)
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                found.append((runtime, os.path.abspath(candidate)))
+                break
+    return found
+
+
 def _yt_dlp_youtube_cli_extras(message: dict, target_url: str) -> List[str]:
     """
     YouTube needs n/sig challenge solving (EJS). Plain `pip install yt-dlp` omits solver assets;
-    use --remote-components ejs:github plus a JS runtime (Deno or Node on PATH).
+    use --remote-components ejs:github plus a JS runtime (Deno or Node).
     See https://github.com/yt-dlp/yt-dlp/wiki/EJS
 
     Omit token-heavy clients by default: ios/android/mweb often need a GVS PO token
     (--extractor-args youtube:po_token=...), which we do not pass.
 
-    Do not pass `--js-runtimes deno,node` (one arg): yt-dlp treats that as an invalid name. Use
-    repeated `--js-runtimes deno` and `--js-runtimes node`.
+    Do not pass `--js-runtimes deno,node` (one arg): yt-dlp treats that as an invalid name.
+    Pass one runtime as `name:/absolute/path` so a browser-launched helper still finds a
+    binary that is not on its PATH. Deno is yt-dlp's default; another runtime has to
+    be enabled with --no-js-runtimes first or the missing deno stays preferred.
 
     Prefer web clients first on music/VEVO URLs: android/ios https often require PO tokens; web
     may still expose a combined progressive format (e.g. 360p) without them.
@@ -1797,14 +1859,15 @@ def _yt_dlp_youtube_cli_extras(message: dict, target_url: str) -> List[str]:
     if message.get("ytDlpSkipEjsBootstrap"):
         return ex
     ex.extend(["--remote-components", "ejs:github"])
-    runtimes: List[str] = []
-    if shutil.which("deno"):
-        runtimes.append("deno")
-    if shutil.which("node"):
-        runtimes.append("node")
-    # Keep explicit runtime list when available to avoid deprecated no-runtime extraction paths.
-    for rt in runtimes:
-        ex.extend(["--js-runtimes", rt])
+    found = _find_js_runtimes()
+    if found:
+        # Deno stays yt-dlp's default. Clearing it is only for a machine that
+        # has Node (or bun, or quickjs) and no Deno, otherwise the missing
+        # default is preferred over the runtime we actually found.
+        if all(runtime != "deno" for runtime, _path in found):
+            ex.append("--no-js-runtimes")
+        for runtime, runtime_path in found:
+            ex.extend(["--js-runtimes", f"{runtime}:{runtime_path}"])
     return ex
 
 

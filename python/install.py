@@ -149,6 +149,54 @@ def install_ytdlp(python_exe):
     return False
 
 
+def _js_runtime_present() -> bool:
+    for name in ("deno", "node", "bun", "qjs"):
+        if shutil.which(name):
+            return True
+    home = os.path.expanduser("~")
+    suffix = ".exe" if os.name == "nt" else ""
+    folders = [
+        os.path.join(home, ".deno", "bin"),
+        os.path.join(home, ".local", "bin"),
+        os.path.join(home, ".bun", "bin"),
+    ]
+    for folder in folders:
+        for name in ("deno", "node", "bun", "qjs"):
+            path = os.path.join(folder, name + suffix)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return True
+    return False
+
+
+def ensure_js_runtime():
+    """
+    YouTube's n challenge needs Deno or Node. The browser does not inherit a
+    shell PATH, so a copy under ~/.deno/bin is what the helper looks for.
+    """
+    if _js_runtime_present():
+        print("✓ JavaScript runtime found (needed for YouTube)")
+        return True
+    if sys.platform == "win32":
+        print("\nNo JavaScript runtime found. YouTube needs Deno or Node:")
+        print("  winget install DenoLand.Deno")
+        print("  winget install OpenJS.NodeJS.LTS")
+        return False
+    print("\nNo JavaScript runtime found. Installing Deno for YouTube into ~/.deno ...")
+    sys.stdout.flush()
+    r = _run_streaming(
+        ["sh", "-c", "curl -fsSL https://deno.land/install.sh | sh"],
+        label="Downloading Deno (YouTube challenge solver)...",
+    )
+    deno = os.path.expanduser("~/.deno/bin/deno")
+    if r.returncode == 0 and os.path.isfile(deno) and os.access(deno, os.X_OK):
+        print(f"✓ Deno installed: {deno}")
+        return True
+    print("WARNING: could not install Deno automatically.")
+    print("  curl -fsSL https://deno.land/install.sh | sh")
+    print("  or: sudo dnf install nodejs")
+    return False
+
+
 def ensure_ffmpeg():
     if shutil.which("ffmpeg"):
         print("✓ ffmpeg found")
@@ -482,6 +530,7 @@ def main():
         install_linux(ext_id)
 
     ensure_ffmpeg()
+    ensure_js_runtime()
     install_ytdlp(sys.executable)
     req = os.path.join(os.path.dirname(SCRIPT_DIR), "requirements.txt")
     if os.path.isfile(req):
@@ -499,8 +548,9 @@ def main():
         "\nAll set. Fully quit and reopen your browser so it picks up the host.\n"
         "Chromium: Load unpacked → select the chromium/ folder.\n"
         "Firefox:  about:debugging → This Firefox → Load Temporary Add-on → firefox/manifest.json\n"
-        "For YouTube music videos you also want one JS runtime on your PATH:\n"
-        "  Node.js  https://nodejs.org   or   Deno  https://docs.deno.com/runtime/getting_started/installation/\n"
+        "YouTube needs Deno or Node. On Linux this installer puts Deno in ~/.deno\n"
+        "when neither is already installed. The helper looks there even if Firefox\n"
+        "did not put that folder on PATH.\n"
     )
 
 

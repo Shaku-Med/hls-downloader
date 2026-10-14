@@ -1310,6 +1310,67 @@ class QualityListAnswers(unittest.TestCase):
         self.assertFalse(os.path.exists(written[0]), "the cookie file was left behind")
 
 
+class YoutubeChallengeRuntime(unittest.TestCase):
+    """
+    Firefox launches the helper with the desktop PATH. Deno installed for the
+    user lives in ~/.deno/bin, which that PATH does not include, so the
+    n-challenge never ran and yt-dlp reported that only images were available.
+    """
+
+    URL = "https://www.youtube.com/watch?v=ZUEVS8EwOcI"
+
+    def test_a_runtime_outside_path_is_named_by_absolute_path(self):
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, True)
+        deno = os.path.join(work, "deno")
+        with open(deno, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(deno, 0o755)
+        real_dirs = host._js_runtime_search_dirs
+        old_path = os.environ.get("PATH", "")
+        host._js_runtime_search_dirs = lambda: [work]
+        os.environ["PATH"] = ""
+        self.addCleanup(setattr, host, "_js_runtime_search_dirs", real_dirs)
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        args = host._yt_dlp_youtube_cli_extras({}, self.URL)
+        self.assertIn(f"deno:{os.path.abspath(deno)}", args)
+        self.assertNotIn("--no-js-runtimes", args)
+
+    def test_node_is_enabled_only_after_the_default_deno_is_cleared(self):
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, True)
+        node = os.path.join(work, "node")
+        with open(node, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(node, 0o755)
+        real_dirs = host._js_runtime_search_dirs
+        host._js_runtime_search_dirs = lambda: [work]
+        self.addCleanup(setattr, host, "_js_runtime_search_dirs", real_dirs)
+        args = host._yt_dlp_youtube_cli_extras({}, self.URL)
+        self.assertLess(args.index("--no-js-runtimes"), args.index("--js-runtimes"))
+        self.assertIn(f"node:{os.path.abspath(node)}", args)
+
+    def test_deno_and_node_are_both_passed_when_both_exist(self):
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, True)
+        for name in ("deno", "node"):
+            path = os.path.join(work, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n")
+            os.chmod(path, 0o755)
+        real_dirs = host._js_runtime_search_dirs
+        old_path = os.environ.get("PATH", "")
+        host._js_runtime_search_dirs = lambda: [work]
+        os.environ["PATH"] = work
+        self.addCleanup(setattr, host, "_js_runtime_search_dirs", real_dirs)
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
+        args = host._yt_dlp_youtube_cli_extras({}, self.URL)
+        self.assertNotIn("--no-js-runtimes", args)
+        deno_at = args.index(f"deno:{os.path.abspath(os.path.join(work, 'deno'))}")
+        node_at = args.index(f"node:{os.path.abspath(os.path.join(work, 'node'))}")
+        self.assertLess(deno_at, node_at)
+
+
 class SegmentsOnAnotherSiteGetNoCookies(unittest.TestCase):
     """
     The cookie and auth token were captured for the playlist's site. A playlist

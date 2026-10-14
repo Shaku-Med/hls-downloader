@@ -187,25 +187,33 @@ python -c "from Cryptodome.Cipher import AES; import Cryptodome; print('pycrypto
 ```
 
 
-7. A JavaScript runtime for YouTube (recommended)
+7. A JavaScript runtime for YouTube
 
-For a lot of YouTube downloads, yt-dlp wants Deno or Node on your PATH. Install one of them if YouTube keeps failing with challenge or solver style errors.
+YouTube downloads fail without one. The error looks like `n challenge solving failed` and then `Only images are available for download`. yt-dlp has to run a small script to unlock the real video formats. Deno or Node does that.
 
-Deno:
+On Windows:
 
 ```text
 winget install DenoLand.Deno
 ```
 
-or see the Deno install docs for your OS.
-
-Node:
+or:
 
 ```text
 winget install OpenJS.NodeJS.LTS
 ```
 
-or install Node from nodejs.org.
+On macOS: `brew install deno`.
+
+On Linux, `python python/install.py` installs Deno into `~/.deno` when nothing else is there. Firefox starts the helper with the desktop PATH, which does not include that folder, so the helper looks in `~/.deno/bin` itself. You can also install Node with your package manager (`sudo dnf install nodejs`, `sudo apt install nodejs`).
+
+Check it:
+
+```text
+~/.deno/bin/deno --version
+```
+
+or `node --version` if you installed Node instead.
 
 
 8. This project folder
