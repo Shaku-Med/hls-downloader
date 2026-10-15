@@ -132,7 +132,9 @@ def _link_shared(browser_dir: str, name: str) -> None:
                 f"Failed to create junction {link_path} -> {target}\n{r.stderr or r.stdout}"
             )
     else:
-        os.symlink(target, link_path, target_is_directory=True)
+        # Relative so the link does not embed this computer's home path.
+        # Windows keeps the junction above; that path is not a git symlink.
+        os.symlink(os.path.join("..", name), link_path, target_is_directory=True)
 
 
 def _copy_shared(browser_dir: str, name: str) -> None:
