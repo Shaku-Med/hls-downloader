@@ -3253,6 +3253,22 @@ function localPathToFileUrl(filePath) {
   return 'file://' + encodeURI(p).replace(/#/g, '%23');
 }
 
+function openLocalFileOnLinux(filePath) {
+  return (async () => {
+    const outDir = await getUserDownloadPath();
+    if (!outDir) {
+      return { ok: false, error: 'Set a save folder in Options, then try Open again.' };
+    }
+    return nativePathOp(
+      'open_path',
+      'open_path_result',
+      filePath,
+      outDir,
+      'Could not open the file'
+    );
+  })();
+}
+
 function openLocalFileInBrowserTab(filePath) {
   return new Promise((resolve) => {
     const fileUrl = localPathToFileUrl(filePath);
@@ -3277,25 +3293,43 @@ function openLocalFileInBrowserTab(filePath) {
       });
     };
 
+    const openInBrowser = () => {
+      try {
+        if (chrome.extension && typeof chrome.extension.isAllowedFileSchemeAccess === 'function') {
+          chrome.extension.isAllowedFileSchemeAccess((allowed) => {
+            if (!allowed) {
+              resolve({
+                ok: false,
+                error:
+                  'Turn on “Allow access to file URLs” for Stuff Grabber on the extensions page, then try Open again.',
+              });
+              return;
+            }
+            openTab();
+          });
+          return;
+        }
+      } catch (_) {
+        // fall through
+      }
+      openTab();
+    };
+
     try {
-      if (chrome.extension && typeof chrome.extension.isAllowedFileSchemeAccess === 'function') {
-        chrome.extension.isAllowedFileSchemeAccess((allowed) => {
-          if (!allowed) {
-            resolve({
-              ok: false,
-              error:
-                'Turn on “Allow access to file URLs” for Stuff Grabber on the extensions page, then try Open again.',
-            });
+      if (chrome.runtime && typeof chrome.runtime.getPlatformInfo === 'function') {
+        chrome.runtime.getPlatformInfo((info) => {
+          if (info && info.os === 'linux') {
+            openLocalFileOnLinux(filePath).then(resolve);
             return;
           }
-          openTab();
+          openInBrowser();
         });
         return;
       }
     } catch (_) {
-      // fall through
+      // fall through to the browser tab path
     }
-    openTab();
+    openInBrowser();
   });
 }
 

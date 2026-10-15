@@ -1700,7 +1700,9 @@
           openBtn.type = 'button';
           openBtn.className = 'btn btn-pri';
           openBtn.textContent = 'Open';
-          openBtn.title = 'Open this file in a new browser tab';
+          openBtn.title = /linux/i.test(navigator.userAgent || '')
+            ? 'Open this file with the default app'
+            : 'Open this file in a new browser tab';
           openBtn.addEventListener('click', () => {
             openBtn.disabled = true;
             chrome.runtime.sendMessage({ type: 'OPEN_JOB_FILE', jobId: job.id }, (r) => {

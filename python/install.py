@@ -11,6 +11,7 @@ import json
 import stat
 import shutil
 import subprocess
+import shlex
 
 NATIVE_HOST_NAME = "com.medzy.hlsgrabber"
 # Must match browser_specific_settings.gecko.id in firefox/manifest.json
@@ -430,10 +431,31 @@ def install_native_windows(ext_id):
     )
 
 
+def _write_linux_host_launcher(python_exe, host_script, launcher_path):
+    """
+    Firefox starts the helper with the desktop PATH and no -u.
+
+    A bare host.py shebang block-buffers stdout, so the browser never sees a
+    full native-messaging frame and reports that it lost the helper. The
+    Windows installer already launches with python -u. This wrapper does the
+    same, and puts user installs (Deno, pip scripts) on PATH.
+    """
+    body = (
+        "#!/bin/sh\n"
+        'export PATH="$HOME/.deno/bin:$HOME/.local/bin:$HOME/.bun/bin:$PATH"\n'
+        f"exec {shlex.quote(python_exe)} -u {shlex.quote(host_script)}\n"
+    )
+    with open(launcher_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(body)
+    os.chmod(launcher_path, 0o755)
+
+
 def install_linux(ext_id):
     st = os.stat(HOST_SCRIPT)
     os.chmod(HOST_SCRIPT, st.st_mode | stat.S_IEXEC)
-    host_path = os.path.abspath(HOST_SCRIPT)
+    launcher_path = os.path.abspath(os.path.join(SCRIPT_DIR, "host_linux.sh"))
+    _write_linux_host_launcher(os.path.abspath(sys.executable), os.path.abspath(HOST_SCRIPT), launcher_path)
+    host_path = launcher_path
     firefox_manifest = _firefox_host_manifest(host_path)
 
     if ext_id:
@@ -451,7 +473,7 @@ def install_linux(ext_id):
     else:
         print("\nNo Chromium extension ID, so Chrome and Chromium were left alone.")
 
-    print("✓ host.py made executable")
+    print(f"✓ Linux launcher: {launcher_path}")
     for firefox_dir in _linux_firefox_host_dirs():
         firefox_manifest_path = os.path.join(firefox_dir, f"{NATIVE_HOST_NAME}.json")
         _write_json(firefox_manifest_path, firefox_manifest)

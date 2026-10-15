@@ -272,12 +272,41 @@ def has_pycryptodomex() -> bool:
     return ok
 
 
+def _home_executable(name: str) -> Optional[str]:
+    """
+    A runtime installed for this user, including ones the desktop PATH misses.
+
+    The Deno installer uses ~/.deno/bin. Firefox does not put that folder on
+    PATH, so a plain `which` check still says Deno is missing after it installed.
+    """
+    located = which(name)
+    if located:
+        return located
+    suffix = ".exe" if is_windows() else ""
+    home = Path.home()
+    leaf = name + suffix
+    for folder in (home / ".deno" / "bin", home / ".local" / "bin", home / ".bun" / "bin"):
+        candidate = folder / leaf
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
 def has_deno() -> bool:
-    return has_command("deno")
+    return _home_executable("deno") is not None
 
 
 def has_node() -> bool:
-    return has_command("node")
+    return _home_executable("node") is not None
+
+
+def has_linux_native_host() -> bool:
+    """Firefox 147+ reads the XDG manifest. The older ~/.mozilla path is not enough."""
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    manifest = os.path.join(
+        xdg, "mozilla", "native-messaging-hosts", "com.medzy.hlsgrabber.json"
+    )
+    return os.path.isfile(manifest)
 
 
 def has_winget() -> bool:

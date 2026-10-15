@@ -87,6 +87,7 @@ out/
 # Local machine helper wrappers (paths are machine specific)
 host_wrapper.bat
 host_wrapper.ps1
+host_linux.sh
 
 # Local dumps / redis / misc junk
 dump.rdb

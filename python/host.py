@@ -5637,6 +5637,57 @@ def _path_under_save_folder(path: str, out_dir: str) -> Tuple[Optional[str], Opt
         return None, str(e)
 
 
+def _handle_open_path(message: dict) -> None:
+    """
+    Open a saved file with the desktop default app. Linux only.
+
+    Firefox has no "Allow access to file URLs" checkbox, and
+    isAllowedFileSchemeAccess stays false, so a file:// tab never opens.
+    Windows and macOS still open the file in a browser tab from the extension.
+    """
+    req_id = (message.get("requestId") or "").strip()
+
+    def reply(**fields: Any) -> None:
+        send_message({"type": "open_path_result", "requestId": req_id, **fields})
+
+    if sys.platform in ("win32", "darwin"):
+        reply(success=False, error="System open is only used on Linux.")
+        return
+
+    path = (message.get("path") or "").strip()
+    out_dir = (message.get("outputDirectory") or message.get("outputDir") or "").strip()
+    ap, err = _path_under_save_folder(path, out_dir)
+    if err or not ap:
+        reply(success=False, error=err or "Invalid path")
+        return
+    if not os.path.isfile(ap):
+        reply(success=False, error="That file is not on disk anymore.")
+        return
+    try:
+        proc = subprocess.run(
+            ["xdg-open", ap],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+    except FileNotFoundError:
+        reply(success=False, error="xdg-open is not installed, so the file could not be opened.")
+        return
+    except subprocess.TimeoutExpired:
+        reply(success=False, error="Opening the file took too long.")
+        return
+    except OSError as e:
+        reply(success=False, error=str(e))
+        return
+    if proc.returncode != 0:
+        tail = (proc.stderr or b"").decode("utf-8", "replace").strip()
+        reply(success=False, error=tail or "The system could not open that file.")
+        return
+    reply(success=True)
+
+
 def _handle_delete_output_file(message: dict) -> None:
     """Delete a partial/finished output file under the user's save folder (UI restart flow)."""
     req_id = (message.get("requestId") or "").strip()
@@ -7420,6 +7471,11 @@ def main():
                 args=(message,),
                 daemon=True,
             ).start()
+            continue
+        if mtype == "open_path":
+            # Inline, same as the recorder: the browser drops the port as soon
+            # as it has the reply, and a daemon thread would die with it.
+            _handle_open_path(message)
             continue
         if mtype == "save_file":
             # Keep on the reader thread so chunked writes stay ordered on one connection.
