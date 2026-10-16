@@ -1,4 +1,4 @@
-Stuff Grabber
+# Stuff Grabber
 
 Personal use only. This is not on the Chrome Web Store, the Edge Add ons store, Firefox Add-ons (AMO), or any other store. Use it by cloning the GitHub repo and loading it yourself.
 
