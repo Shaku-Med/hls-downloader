@@ -161,6 +161,12 @@ def setup() -> None:
     firefox_manifest = dict(base)
     firefox_manifest["background"] = dict(FIREFOX_BACKGROUND)
     firefox_manifest["browser_specific_settings"] = dict(FIREFOX_GECKO)
+    # filterResponseData needs a blocking webRequest listener. Chrome MV3 rejects
+    # this permission, so it stays on the Firefox manifest only.
+    firefox_perms = list(firefox_manifest.get("permissions") or [])
+    if "webRequestBlocking" not in firefox_perms:
+        firefox_perms.append("webRequestBlocking")
+    firefox_manifest["permissions"] = firefox_perms
     _write_json(os.path.join(firefox_dir, "manifest.json"), firefox_manifest)
 
     for name in SHARED_DIRS:

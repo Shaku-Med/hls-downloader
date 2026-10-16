@@ -720,6 +720,309 @@ class LocalHlsPlaylist(unittest.TestCase):
             host._is_hls_input("https://cdn.example/hls/playlist.html", {"streamKind": ""})
         )
 
+    def _master(self):
+        return (
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=1312915,RESOLUTION=1280x720\n"
+            "lo.m3u8\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=6127636,RESOLUTION=1920x1080\n"
+            "hi.m3u8\n"
+        )
+
+    def test_one_shot_master_is_followed_to_the_variant(self):
+        media = (
+            "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:1.0,\n"
+            "hi0.ts\n#EXT-X-ENDLIST\n"
+        )
+        seen = []
+        real = host._http_get_text
+
+        def fake(url, header_block, timeout=60.0):
+            seen.append(url)
+            return media
+
+        host._http_get_text = fake
+        try:
+            url, text = host._hls_playlist_from_message(
+                {
+                    "playlistText": self._master(),
+                    "playlistUrl": self.BASE,
+                    "oneShotHls": True,
+                },
+                self.BASE,
+                "User-Agent: test\r\n",
+            )
+        finally:
+            host._http_get_text = real
+        self.assertEqual(seen, ["https://cdn.example/pl/token/hi.m3u8"])
+        self.assertEqual(url, "https://cdn.example/pl/token/hi.m3u8")
+        self.assertIn("hi0.ts", text)
+        self.assertFalse(host._is_master_playlist(text))
+        self.assertIsNotNone(host._hls_segment_timeline(text))
+
+    def test_one_shot_media_playlist_is_not_fetched_again(self):
+        media = "#EXTM3U\n#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n"
+        real = host._http_get_text
+        host._http_get_text = lambda *a, **k: (_ for _ in ()).throw(AssertionError("fetched"))
+        try:
+            url, text = host._hls_playlist_from_message(
+                {"playlistText": media, "playlistUrl": self.BASE, "oneShotHls": True},
+                self.BASE,
+                "User-Agent: test\r\n",
+            )
+        finally:
+            host._http_get_text = real
+        self.assertEqual(url, self.BASE)
+        self.assertIn("seg.ts", text)
+
+    BLOCK = (
+        "Referer: https://lesson.example/watch\r\n"
+        "User-Agent: UA\r\n"
+        "Cookie: session=secret\r\n"
+        "Authorization: Bearer secret\r\n"
+    )
+
+    def test_same_site_variant_keeps_the_page_cookies(self):
+        media = "#EXTM3U\n#EXTINF:1,\nhi0.ts\n#EXT-X-ENDLIST\n"
+        seen = []
+        real = host._http_get_text
+
+        def fake(url, header_block, timeout=60.0):
+            seen.append((url, header_block))
+            return media
+
+        host._http_get_text = fake
+        try:
+            host._hls_playlist_from_message(
+                {"playlistText": self._master(), "playlistUrl": self.BASE},
+                self.BASE,
+                self.BLOCK,
+            )
+        finally:
+            host._http_get_text = real
+        self.assertEqual(seen[0][0], "https://cdn.example/pl/token/hi.m3u8")
+        self.assertIn("Cookie: session=secret", seen[0][1])
+        self.assertIn("Referer: https://lesson.example/watch", seen[0][1])
+        self.assertIn("User-Agent: UA", seen[0][1])
+
+    def test_variant_on_another_host_is_fetched_without_those_cookies(self):
+        master = (
+            "#EXTM3U\n"
+            "#EXT-X-STREAM-INF:BANDWIDTH=6127636,RESOLUTION=1920x1080\n"
+            "https://cdn.other/hi.m3u8\n"
+        )
+        media = "#EXTM3U\n#EXTINF:1,\nhi0.ts\n#EXT-X-ENDLIST\n"
+        seen = []
+        real = host._http_get_text
+
+        def fake(url, header_block, timeout=60.0):
+            seen.append((url, header_block))
+            return media
+
+        host._http_get_text = fake
+        try:
+            host._hls_playlist_from_message(
+                {"playlistText": master, "playlistUrl": self.BASE},
+                self.BASE,
+                self.BLOCK,
+            )
+        finally:
+            host._http_get_text = real
+        self.assertEqual(seen[0][0], "https://cdn.other/hi.m3u8")
+        self.assertNotIn("Cookie", seen[0][1])
+        self.assertNotIn("Authorization", seen[0][1])
+        self.assertIn("Referer: https://lesson.example/watch", seen[0][1])
+        self.assertIn("User-Agent: UA", seen[0][1])
+
+    def test_a_failed_variant_fetch_is_not_turned_into_the_master(self):
+        real = host._http_get_text
+
+        def boom(url, header_block, timeout=60.0):
+            raise urllib.error.URLError("variant rejected")
+
+        host._http_get_text = boom
+        try:
+            with self.assertRaises(urllib.error.URLError):
+                host._hls_playlist_from_message(
+                    {
+                        "playlistText": self._master(),
+                        "playlistUrl": self.BASE,
+                        "oneShotHls": True,
+                    },
+                    self.BASE,
+                    "User-Agent: test\r\n",
+                )
+        finally:
+            host._http_get_text = real
+
+    def test_captured_variant_is_used_when_urlopen_would_report_403(self):
+        """
+        Firefox's fetch answers HTTP 403 and the helper wraps that as
+        URLError("HTTP 403"). The card then says
+        "Could not open the playlist: <urlopen error HTTP 403>".
+        The page already received a variant, so that fetch must not run.
+        """
+        shown = host._format_playlist_fetch_error(urllib.error.URLError("HTTP 403"))
+        self.assertIn("<urlopen error HTTP 403>", shown)
+        self.assertTrue(shown.startswith("Could not open the playlist:"))
+
+        lo = "https://cdn.example/pl/token/lo.m3u8?e=1"
+        media = "#EXTM3U\n#EXTINF:1,\nlo0.ts\n#EXT-X-ENDLIST\n"
+        real = host._http_get_text
+
+        def boom(url, header_block, timeout=60.0):
+            raise urllib.error.URLError("HTTP 403")
+
+        host._http_get_text = boom
+        try:
+            url, text = host._hls_playlist_from_message(
+                {
+                    "playlistText": self._master(),
+                    "playlistUrl": self.BASE,
+                    "oneShotHls": True,
+                    "capturedPlaylists": [{"url": lo, "text": media}],
+                },
+                self.BASE,
+                self.BLOCK,
+            )
+        finally:
+            host._http_get_text = real
+        self.assertEqual(url, lo)
+        self.assertIn("lo0.ts", text)
+        self.assertFalse(host._is_master_playlist(text))
+
+    def test_captured_playlist_skips_the_urlopen_that_403s(self):
+        media = "#EXTM3U\n#EXTINF:1,\nseg.ts\n#EXT-X-ENDLIST\n"
+        real = host._http_get_text
+        host._http_get_text = lambda *a, **k: (_ for _ in ()).throw(
+            urllib.error.URLError("HTTP 403")
+        )
+        try:
+            url, text = host._hls_playlist_from_message(
+                {"capturedPlaylists": [{"url": self.BASE, "text": media}]},
+                self.BASE,
+                self.BLOCK,
+            )
+        finally:
+            host._http_get_text = real
+        self.assertEqual(url, self.BASE)
+        self.assertIn("seg.ts", text)
+
+    def test_ffmpeg_opens_the_variant_not_the_master_file(self):
+        local = os.path.join(tempfile.gettempdir(), "sg_hls_master.m3u8")
+        cmd, _ = host._build_ffmpeg_cmd_list(
+            self.BASE,
+            {"streamKind": "hls", "oneShotHls": True, "userAgent": "UA"},
+            os.path.join(tempfile.gettempdir(), "out.mp4"),
+            "Referer: https://cdn.example/\r\n",
+            playlist_text=self._master(),
+            playlist_url=self.BASE,
+            ffmpeg_input=local,
+        )
+        i = cmd.index("-i")
+        self.assertEqual(cmd[i + 1], "https://cdn.example/pl/token/hi.m3u8")
+        self.assertNotIn("sg_hls_master.m3u8", " ".join(cmd))
+        self.assertIn("-headers", cmd)
+        self.assertIn("-user_agent", cmd)
+
+
+class MasterPlaylistDoesNotMuxAnEmptyMp4(unittest.TestCase):
+    """
+    ffmpeg exit 234 is EINVAL. A multi-variant master opens as programs with
+    variant_bitrate and, when those playlists never become elementary streams,
+    -map 0:v:0? / 0:a:0? matches nothing. The mp4 muxer then reports
+    "Output file does not contain any stream" and "Invalid argument".
+    """
+
+    def _segment_encode_args(self):
+        listed = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True,
+        )
+        names = set()
+        for line in (listed.stdout or "").splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0].startswith("V"):
+                names.add(parts[1])
+        if "mpeg4" in names:
+            return ["-c:v", "mpeg4", "-q:v", "5"]
+        if "libx264" in names:
+            return ["-c:v", "libx264", "-preset", "ultrafast"]
+        self.skipTest("ffmpeg has neither mpeg4 nor libx264")
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_a_master_with_no_media_exits_234(self):
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, True)
+        master = os.path.join(work, "master.m3u8")
+        with open(master, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(
+                "#EXTM3U\n"
+                "#EXT-X-STREAM-INF:BANDWIDTH=6127636,RESOLUTION=1920x1080\n"
+                "hi.m3u8\n"
+                "#EXT-X-STREAM-INF:BANDWIDTH=1312915,RESOLUTION=1280x720\n"
+                "lo.m3u8\n"
+            )
+        out = os.path.join(work, "out.mp4")
+        cmd = [
+            "ffmpeg", "-y", "-nostdin", "-loglevel", "info",
+            "-allowed_extensions", "ALL", "-extension_picky", "0",
+            "-protocol_whitelist", "file,http,https,tcp,tls,crypto,ffurl",
+            "-f", "hls",
+            "-i", "file:" + master,
+            "-map", "0:v:0?", "-map", "0:a:0?",
+            "-c", "copy",
+            out,
+        ]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        err = r.stderr or ""
+        self.assertEqual(r.returncode, 234, err[-500:])
+        self.assertIn("does not contain any stream", err)
+        self.assertIn("Invalid argument", err)
+        self.assertIn("variant_bitrate", err)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_the_variant_playlist_muxes_to_mp4(self):
+        encode = self._segment_encode_args()
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work, True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+             "testsrc2=size=160x90:rate=10:duration=1",
+             "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+             *encode, "-c:a", "aac", "-f", "mpegts",
+             os.path.join(work, "seg0.ts")],
+            check=True, capture_output=True,
+        )
+        local = os.path.join(work, "index.m3u8")
+        media = (
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:2\n"
+            "#EXTINF:1.0,\nseg0.ts\n#EXT-X-ENDLIST\n"
+        )
+        with open(local, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(media)
+        out = os.path.join(work, "out.mp4")
+        old = os.environ.get("HLS_GRABBER_FFMPEG_STREAM_COPY")
+        os.environ["HLS_GRABBER_FFMPEG_STREAM_COPY"] = "1"
+        self.addCleanup(
+            lambda: os.environ.__setitem__("HLS_GRABBER_FFMPEG_STREAM_COPY", old)
+            if old is not None else os.environ.pop("HLS_GRABBER_FFMPEG_STREAM_COPY", None)
+        )
+        cmd, _ = host._build_ffmpeg_cmd_list(
+            "http://cdn.example/index.m3u8",
+            {"streamKind": "hls", "userAgent": "UA"},
+            out,
+            "Referer: http://cdn.example/\r\n",
+            playlist_text=media,
+            playlist_url="http://cdn.example/index.m3u8",
+            ffmpeg_input=local,
+        )
+        self.assertNotIn("-headers", cmd)
+        self.assertNotIn("-user_agent", cmd)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, (r.stderr or "")[-500:])
+        self.assertGreater(os.path.getsize(out), 1000)
+
 
 class MegaPublicLinks(unittest.TestCase):
     FILE = "https://mega.nz/file/AbCdEfGh#abcdefghijklmnopqr-stuvwx"
@@ -1008,6 +1311,81 @@ class CredentialsDoNotFollowARedirect(unittest.TestCase):
             host._http_get_bytes(f"http://127.0.0.1:{self.port}/go", self.BLOCK)
         # Python 3.14 warns if this response is left for the garbage collector.
         caught.exception.close()
+
+
+class _Forbid(http.server.BaseHTTPRequestHandler):
+    """Answers every GET with 403, the way a CDN rejects Python's TLS."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        body = b"no"
+        self.send_response(403)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class BrowserFetchCarriesThePageHeaders(unittest.TestCase):
+    """
+    A 403 from urllib is Python being turned away. The retry goes through the
+    browser, without the Cookie header that would make that fetch omit cookies.
+    """
+
+    BLOCK = (
+        "Referer: https://lesson.example/watch\r\n"
+        "User-Agent: UA\r\n"
+        "Cookie: session=secret\r\n"
+    )
+
+    def setUp(self):
+        self.job = host._CURRENT_JOB_ID
+        self.browser = host._CURRENT_BROWSER_HTTP
+        self.ext = host._http_get_bytes_extension
+        self.addCleanup(setattr, host, "_CURRENT_JOB_ID", self.job)
+        self.addCleanup(setattr, host, "_CURRENT_BROWSER_HTTP", self.browser)
+        self.addCleanup(setattr, host, "_http_get_bytes_extension", self.ext)
+
+    def _capture(self):
+        seen = {}
+
+        def fake(url, headers, **kwargs):
+            seen["url"] = url
+            seen["headers"] = headers
+            return b"#EXTM3U\n"
+
+        host._http_get_bytes_extension = fake
+        return seen
+
+    def test_the_browser_fetch_keeps_referer_and_drops_cookie(self):
+        host._CURRENT_JOB_ID = "job"
+        host._CURRENT_BROWSER_HTTP = True
+        seen = self._capture()
+        data = host._http_get_bytes("https://cdn.example/hi.m3u8", self.BLOCK)
+        self.assertEqual(data, b"#EXTM3U\n")
+        names = {k.lower() for k in seen["headers"]}
+        self.assertNotIn("cookie", names)
+        self.assertEqual(seen["headers"].get("Referer"), "https://lesson.example/watch")
+        self.assertEqual(seen["headers"].get("User-Agent"), "UA")
+
+    def test_a_python_403_is_retried_through_the_browser(self):
+        host._CURRENT_JOB_ID = "job"
+        host._CURRENT_BROWSER_HTTP = False
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Forbid)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        seen = self._capture()
+        url = f"http://127.0.0.1:{srv.server_address[1]}/hi.m3u8"
+        data = host._http_get_bytes(url, self.BLOCK)
+        self.assertEqual(data, b"#EXTM3U\n")
+        self.assertEqual(seen["url"], url)
+        self.assertNotIn("cookie", {k.lower() for k in seen["headers"]})
+        self.assertEqual(seen["headers"].get("Referer"), "https://lesson.example/watch")
+        self.assertEqual(seen["headers"].get("User-Agent"), "UA")
 
 
 class FallbackFetchersDoNotLeakTheReferer(unittest.TestCase):

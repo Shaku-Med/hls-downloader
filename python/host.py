@@ -194,34 +194,35 @@ def _hls_playlist_from_message(
     """
     Prefer the playlist the extension grabbed when the page first requested it.
     Fall back to fetching now. Follows master -> highest-bandwidth variant.
+
+    A master is only a list of qualities. It must not be handed to ffmpeg as the
+    media input: the demuxer then exposes programs (variant_bitrate) and no
+    elementary streams, optional -map 0:v / 0:a matches nothing, and the mp4
+    muxer exits 234 (EINVAL, "Output file does not contain any stream").
+    One-shot applies to the master URL the player already spent. The variant is
+    a different address, so it is read from a body the page already captured
+    when that body is here. Fetching the spent URL again is what Firefox reports
+    back as URLError("HTTP 403"), which the card shows as
+    "<urlopen error HTTP 403>".
     """
+    bodies = _playlist_bodies(message)
     cached = (message.get("playlistText") or "").strip() if message else ""
     cached_url = (
         ((message.get("playlistUrl") or "") if message else "").strip() or url or ""
     )
-    one_shot = bool((message or {}).get("oneShotHls")) or _hls_url_looks_one_shot(
-        url
-    ) or _hls_url_looks_one_shot(cached_url)
+    if not (cached and "#EXTM3U" in cached.upper()):
+        found_url, found = _lookup_playlist_body(bodies, url)
+        if found:
+            cached, cached_url = found, found_url or url
     if cached and "#EXTM3U" in cached.upper():
-        cur_url, text = cached_url, cached
-        guard = 0
-        while _is_master_playlist(text) and guard < 8:
-            guard += 1
-            var = _select_highest_bandwidth_variant_uri(text, _m3u8_base_url(cur_url))
-            if not var or var == cur_url:
-                break
-            if one_shot:
-                # Do not spend another signed GET; ffmpeg can follow a local master.
-                text = _rewrite_m3u8_absolute(text, cur_url)
-                break
-            try:
-                text = _http_get_text(var, header_block, timeout=45.0)
-                cur_url = var
-            except (urllib.error.URLError, OSError, ValueError, UnicodeError):
-                text = _rewrite_m3u8_absolute(text, cur_url)
-                break
-        return cur_url, text
-    return _resolve_variant_playlist_url(url, header_block)
+        return _resolve_variant_playlist_url(
+            cached_url or url,
+            header_block,
+            bodies,
+            start_text=cached,
+            owner_url=url or cached_url,
+        )
+    return _resolve_variant_playlist_url(url, header_block, bodies, owner_url=url or "")
 
 
 def _format_playlist_fetch_error(exc: BaseException) -> str:
@@ -3861,6 +3862,41 @@ def _http_error_looks_like_ssl(exc: BaseException) -> bool:
     )
 
 
+def _http_error_should_use_browser(exc: BaseException) -> bool:
+    """
+    Python's TLS fingerprint is often refused with 403 before the CDN looks at
+    cookies. The browser fetch is the path that still gets through. An HTTP 403
+    that already came back from that fetch is a URLError, not an HTTPError, so
+    this does not retry it.
+    """
+    if isinstance(exc, ssl.SSLError) or _http_error_looks_like_ssl(exc):
+        return True
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            return int(exc.code) == 403
+        except (TypeError, ValueError):
+            return False
+    return False
+
+
+def _headers_for_browser_fetch(headers: Dict[str, str]) -> Dict[str, str]:
+    """
+    Drop Cookie before the extension fetch.
+
+    Chrome will not send a Cookie header from fetch(), and the extension treats
+    a present Cookie as "send only this header" by setting credentials to omit.
+    The header is then discarded and the cookie jar is skipped, so the CDN sees
+    no cookies and returns 403. Leaving Cookie out makes that fetch use
+    credentials include, which attaches only the cookies stored for this URL
+    and never a cookie taken from some other host. Referer and User-Agent stay.
+    """
+    return {
+        k: v
+        for k, v in (headers or {}).items()
+        if k.lower() not in ("cookie", "cookie2") and v
+    }
+
+
 def _http_no_proxy_env() -> dict:
     env = os.environ.copy()
     for key in list(env):
@@ -4110,11 +4146,13 @@ def _http_get_bytes(
         _CURRENT_BROWSER_HTTP or _hls_url_looks_one_shot(url)
     )
     # Signed CDNs only accept the browser's TLS. Chrome fetch works on every OS;
-    # do not fall through to curl.exe or PowerShell.
+    # do not fall through to curl.exe or PowerShell. Cookie is omitted here so
+    # the extension attaches the jar for this URL instead of omitting cookies.
+    browser_headers = _headers_for_browser_fetch(headers)
     if use_browser:
         return _http_get_bytes_extension(
             url,
-            headers,
+            browser_headers,
             timeout=timeout,
             max_bytes=max_bytes,
             byte_range=byte_range,
@@ -4125,10 +4163,12 @@ def _http_get_bytes(
         with _http_direct_opener().open(req, timeout=timeout) as resp:
             return _read_resp(resp)
     except (urllib.error.URLError, OSError, ssl.SSLError) as e:
-        if job_id and (_http_error_looks_like_ssl(e) or isinstance(e, ssl.SSLError)):
+        if job_id and _http_error_should_use_browser(e):
+            if isinstance(e, urllib.error.HTTPError):
+                e.close()
             return _http_get_bytes_extension(
                 url,
-                headers,
+                browser_headers,
                 timeout=timeout,
                 max_bytes=max_bytes,
                 byte_range=byte_range,
@@ -4434,10 +4474,9 @@ def _is_master_playlist(text: str) -> bool:
     return "#EXT-X-STREAM-INF" in text
 
 
-def _select_highest_bandwidth_variant_uri(text: str, base_url: str) -> Optional[str]:
+def _playlist_variant_rows(text: str, base_url: str) -> List[Tuple[int, str]]:
     lines = [ln.strip() for ln in text.splitlines()]
-    best_bw = -1
-    best_uri: Optional[str] = None
+    rows: List[Tuple[int, str]] = []
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -4457,42 +4496,131 @@ def _select_highest_bandwidth_variant_uri(text: str, base_url: str) -> Optional[
                 uri = ln
                 break
             if uri:
-                if bw > best_bw:
-                    best_bw = bw
-                    best_uri = uri
+                rows.append((bw, urljoin(base_url, uri)))
             i = j + 1 if uri else i + 1
             continue
         i += 1
-    if best_uri:
-        return urljoin(base_url, best_uri)
-    # No BANDWIDTH match: first stream URI after any STREAM-INF
-    for i, line in enumerate(lines):
-        if line.startswith("#EXT-X-STREAM-INF"):
-            for j in range(i + 1, len(lines)):
-                ln = lines[j]
-                if not ln or ln.startswith("#"):
-                    continue
-                return urljoin(base_url, ln)
-            break
-    return None
+    return rows
 
 
-def _resolve_variant_playlist_url(start_url: str, header_block: str) -> Tuple[str, str]:
+def _select_highest_bandwidth_variant_uri(text: str, base_url: str) -> Optional[str]:
+    best_bw = -1
+    best_uri: Optional[str] = None
+    for bw, uri in _playlist_variant_rows(text, base_url):
+        if bw > best_bw:
+            best_bw = bw
+            best_uri = uri
+    return best_uri
+
+
+def _playlist_bodies(message: Optional[dict]) -> Dict[str, str]:
+    """Playlist texts the extension already saw, keyed by the URL that returned them."""
+    bodies: Dict[str, str] = {}
+
+    def add(url: object, text: object) -> None:
+        u = str(url or "").strip()
+        t = str(text or "").strip()
+        if u and "#EXTM3U" in t.upper():
+            bodies[u] = t
+
+    if not message:
+        return bodies
+    add(message.get("playlistUrl"), message.get("playlistText"))
+    raw = message.get("capturedPlaylists")
+    if isinstance(raw, list):
+        for item in raw:
+            if isinstance(item, dict):
+                add(item.get("url"), item.get("text"))
+    return bodies
+
+
+def _lookup_playlist_body(bodies: Dict[str, str], url: str) -> Tuple[str, str]:
+    """
+    Body for url.
+
+    The player often requests the same path with a cache-buster the master
+    playlist does not repeat. Match scheme, host and path so that copy is used
+    instead of fetching the path a second time.
+    """
+    if not url or not bodies:
+        return "", ""
+    hit = bodies.get(url)
+    if hit:
+        return url, hit
+    want = urlsplit(url)
+    if not want.scheme or not want.netloc or not want.path:
+        return "", ""
+    for key, text in bodies.items():
+        got = urlsplit(key)
+        if (
+            got.scheme == want.scheme
+            and got.netloc == want.netloc
+            and got.path == want.path
+            and text
+        ):
+            return key, text
+    return "", ""
+
+
+def _best_captured_variant(
+    bodies: Dict[str, str], master_text: str, base_url: str
+) -> Optional[Tuple[str, str]]:
+    """Highest-bandwidth variant of this master whose body we already have."""
+    best_bw = -1
+    best: Optional[Tuple[str, str]] = None
+    for bw, uri in _playlist_variant_rows(master_text, base_url):
+        stored_url, got = _lookup_playlist_body(bodies, uri)
+        if not got or _is_master_playlist(got):
+            continue
+        if bw > best_bw:
+            best_bw = bw
+            best = (stored_url or uri, got)
+    return best
+
+
+def _resolve_variant_playlist_url(
+    start_url: str,
+    header_block: str,
+    bodies: Optional[Dict[str, str]] = None,
+    start_text: str = "",
+    owner_url: str = "",
+) -> Tuple[str, str]:
     """
     Fetch playlist chain; if master, follow highest-bandwidth variant.
     Returns (variant_playlist_url, variant_playlist_text).
+
+    A captured body is used before any GET. Cookies in the header block belong
+    to owner_url and are removed when the variant is on another host.
     """
-    base0 = _m3u8_base_url(start_url)
-    text = _http_get_text(start_url, header_block, timeout=45.0)
-    cur_url = start_url
+    known = bodies or {}
+    owner = owner_url or start_url
+    if start_text and "#EXTM3U" in start_text.upper():
+        text = start_text
+        cur_url = start_url
+    else:
+        found_url, found = _lookup_playlist_body(known, start_url)
+        if found:
+            text = found
+            cur_url = found_url or start_url
+        else:
+            text = _http_get_text(start_url, header_block, timeout=45.0)
+            cur_url = start_url
     guard = 0
     while _is_master_playlist(text) and guard < 8:
         guard += 1
+        cached = _best_captured_variant(known, text, _m3u8_base_url(cur_url))
+        if cached:
+            cur_url, text = cached
+            continue
         var = _select_highest_bandwidth_variant_uri(text, _m3u8_base_url(cur_url))
-        if not var:
+        if not var or var == cur_url:
             break
+        # Cookies in this block were taken for the stream URL. A variant on
+        # another host must not receive them; referer and user-agent stay.
+        text = _http_get_text(
+            var, _scope_header_block(header_block, owner, var), timeout=45.0
+        )
         cur_url = var
-        text = _http_get_text(cur_url, header_block, timeout=45.0)
     return cur_url, text
 
 
@@ -5466,6 +5594,7 @@ def _build_ffmpeg_cmd_list(
     is_hls = _is_hls_input(url, message)
     is_fmp4: Optional[bool] = None
     audio_only = False
+    open_url = url
     effective_playlist = playlist_text
     if is_hls and effective_playlist is None:
         if not _hls_url_looks_one_shot(url) and not (message or {}).get("oneShotHls"):
@@ -5523,8 +5652,23 @@ def _build_ffmpeg_cmd_list(
                 "10",
             ]
         )
+    if effective_playlist and _is_master_playlist(effective_playlist):
+        # A master saved to disk is what produced exit 234. ffmpeg lists each
+        # quality as a program (variant_bitrate) and, when those playlists do
+        # not open, maps no elementary streams. -map 0:v:0? / 0:a:0? is optional
+        # so it does not fail the map; the mp4 muxer then refuses to open
+        # ("Output file does not contain any stream", EINVAL). Point -i at the
+        # chosen variant URL instead. That input is http(s), so -headers and
+        # -user_agent are consumed. A saved media playlist still omits them,
+        # which is what ffmpeg 9 requires.
+        variant = _select_highest_bandwidth_variant_uri(
+            effective_playlist, _m3u8_base_url(playlist_url or url or "")
+        )
+        if variant and variant.lower().startswith(("http://", "https://")):
+            ffmpeg_input = None
+            open_url = variant
     if not ffmpeg_input:
-        pre.extend(_ffmpeg_network_timeout_args(url))
+        pre.extend(_ffmpeg_network_timeout_args(open_url))
         # These are HTTP options. Against a playlist saved to disk the input
         # opens through the file protocol, which has no use for them: ffmpeg
         # never passed them on to the segments even when it accepted them, and
@@ -5537,7 +5681,7 @@ def _build_ffmpeg_cmd_list(
     pre.extend(
         [
             "-i",
-            _ffmpeg_file_input(ffmpeg_input) if ffmpeg_input else url,
+            _ffmpeg_file_input(ffmpeg_input) if ffmpeg_input else open_url,
         ]
     )
     cmd = list(pre)
@@ -5728,13 +5872,233 @@ def _split_filename_ext(filename: str) -> Tuple[str, str]:
     return stem, ext.lower()
 
 
+# How long to watch a new recorder before believing the window stayed open.
+# Import failures (missing tkinter, bad Python) exit in well under a second.
+# Kept short so the button does not sit on "Opening" longer than it has to.
+_RECORDER_START_GRACE_SEC = 1.5
+
+
+def _host_stdout_is_unbuffered(flags, stdout, environ) -> bool:
+    """
+    True when this process will flush native-messaging frames immediately.
+
+    python -u does not set PYTHONUNBUFFERED, and Python 3.14 dropped
+    sys.flags.unbuffered. write_through is what -u actually turns on, and it
+    is present on the versions this project still runs.
+    """
+    if environ.get("PYTHONUNBUFFERED"):
+        return True
+    if getattr(flags, "unbuffered", 0):
+        return True
+    return bool(getattr(stdout, "write_through", False))
+
+
+def _unbuffered_host_argv(unbuffered: bool, executable: str, script: str) -> Optional[List[str]]:
+    """
+    argv to re-exec the helper with python -u, or None when that is unnecessary.
+
+    macOS registers host.py itself, so the shebang starts Python without -u.
+    Stdout is then block-buffered and a short reply such as "recorder failed"
+    never reaches the browser. Windows and Linux launchers already pass -u.
+    """
+    if unbuffered or not executable or not script:
+        return None
+    return [executable, "-u", script]
+
+
+def _reexec_unbuffered() -> None:
+    argv = _unbuffered_host_argv(
+        _host_stdout_is_unbuffered(sys.flags, sys.stdout, os.environ),
+        sys.executable or "",
+        os.path.abspath(__file__),
+    )
+    if not argv:
+        return
+    # A second exec must not loop if -u failed to stick.
+    if os.environ.get("HLS_GRABBER_NO_REEXEC") == "1":
+        return
+    os.environ["HLS_GRABBER_NO_REEXEC"] = "1"
+    try:
+        os.execve(argv[0], argv, os.environ)
+    except OSError:
+        return
+
+
+def _tkinter_missing_message() -> str:
+    """What to install, for the OS this helper is actually running on."""
+    if sys.platform.startswith("win"):
+        return (
+            "The screen recorder needs tkinter, and this Python does not have it. "
+            "Reinstall Python from python.org (that installer includes tkinter), then try again."
+        )
+    if sys.platform == "darwin":
+        return (
+            "The screen recorder needs tkinter, and this Python does not have it. "
+            "If you use Homebrew, run: brew install python-tk. "
+            "Otherwise reinstall Python from python.org."
+        )
+    if shutil.which("dnf"):
+        cmd = "sudo dnf install -y python3-tkinter"
+    elif shutil.which("apt-get"):
+        cmd = "sudo apt-get install -y python3-tk"
+    elif shutil.which("pacman"):
+        cmd = "sudo pacman -S --needed tk"
+    elif shutil.which("zypper"):
+        cmd = "sudo zypper install -y python3-tk"
+    else:
+        return (
+            "The screen recorder needs tkinter, and this Python does not have it. "
+            "Install your distribution's python3 tkinter package (python3-tkinter or python3-tk), then try again."
+        )
+    return (
+        "The screen recorder needs tkinter, and this Python does not have it. "
+        f"Install it, then try again: {cmd}"
+    )
+
+
+def _recorder_failure_text(raw: str) -> str:
+    text = (raw or "").strip()
+    low = text.lower()
+    if (
+        "no module named 'tkinter'" in low
+        or 'no module named "tkinter"' in low
+        or "no module named tkinter" in low
+    ):
+        return _tkinter_missing_message()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return "The screen recorder closed as soon as it started."
+    tail = lines[-1]
+    if len(tail) > 240:
+        tail = tail[:240] + "…"
+    return tail
+
+
+def _dedupe_existing_files(paths: List[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for raw in paths:
+        if not raw:
+            continue
+        if not os.path.isfile(raw):
+            continue
+        key = os.path.normcase(os.path.abspath(raw))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(raw)
+    return out
+
+
+def _recorder_python_candidates() -> List[str]:
+    """
+    Interpreters that might be able to open the recorder window.
+
+    The helper's own Python is first. On Windows, pythonw.exe beside it is
+    preferred so a console does not flash behind the bar. Other Pythons on
+    PATH are only a fallback when that one cannot import tkinter.
+    """
+    host_py = sys.executable or ""
+    ordered: List[str] = []
+    if sys.platform.startswith("win") and host_py:
+        ordered.append(os.path.join(os.path.dirname(os.path.abspath(host_py)), "pythonw.exe"))
+        ordered.append(host_py)
+    elif host_py:
+        ordered.append(host_py)
+    for name in ("python3", "python"):
+        found = shutil.which(name)
+        if found:
+            ordered.append(found)
+    return _dedupe_existing_files(ordered)
+
+
+def _python_has_tk(python: str) -> bool:
+    run_kwargs: Dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+        "timeout": 8,
+        "check": False,
+    }
+    if sys.platform.startswith("win"):
+        # Keep the probe itself from flashing a console.
+        run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(
+            [python, "-c", "import sys, tkinter; raise SystemExit(0 if sys.version_info[:2] >= (3, 9) else 1)"],
+            **run_kwargs,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return proc.returncode == 0
+
+
+def _pick_recorder_python() -> Tuple[str, str]:
+    """Return (executable, "") or ("", error the button can show)."""
+    candidates = _recorder_python_candidates()
+    if not candidates:
+        return "", "Could not work out which Python to use."
+    for python in candidates:
+        if _python_has_tk(python):
+            return python, ""
+    return "", _tkinter_missing_message()
+
+
+def _wait_recorder(proc: subprocess.Popen, timeout: float) -> Optional[int]:
+    """Exit code, or None if the recorder is still running after timeout."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        code = proc.poll()
+        if code is not None:
+            return code
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.05)
+
+
+def _popen_recorder(argv: List[str], cwd: str, err_handle) -> subprocess.Popen:
+    """
+    Start the recorder so it outlives this helper.
+
+    The browser kills the helper as soon as the reply is sent. On Windows that
+    kill covers every process in the helper's job, so the recorder has to
+    break out of the job or the window dies with the connection. On macOS and
+    Linux a new session is enough: the window stays in the same login session,
+    which is what lets it draw, and it is not signalled when the helper exits.
+    """
+    kwargs: Dict[str, Any] = {
+        "cwd": cwd,
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": err_handle,
+        "close_fds": True,
+    }
+    if sys.platform.startswith("win"):
+        detached = (
+            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        )
+        breakaway = detached | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000)
+        try:
+            return subprocess.Popen(argv, creationflags=breakaway, **kwargs)
+        except OSError:
+            # The job does not allow breakaway. Detach anyway; a console-less
+            # process still outlives a normal parent exit.
+            return subprocess.Popen(argv, creationflags=detached, **kwargs)
+    return subprocess.Popen(argv, start_new_session=True, **kwargs)
+
+
 def _handle_launch_recorder(message: dict) -> None:
     """
     Start the screen recorder app.
 
     Sites that protect their video cannot be downloaded, so the extension
-    offers to record the screen instead and asks us to open the recorder. It is
-    launched detached, so it keeps running once this connection closes.
+    offers to record the screen instead and asks us to open the recorder.
+
+    Spawning is not the same as the window opening. The process used to be
+    started with its output discarded, and success was reported immediately,
+    so a recorder that exited in the same breath (no tkinter, bad Python, a
+    crash on startup) looked to the button like it had opened.
     """
     req_id = (message.get("requestId") or "").strip()
 
@@ -5747,30 +6111,10 @@ def _handle_launch_recorder(message: dict) -> None:
         reply(success=False, error="The screen recorder is not installed next to the helper.")
         return
 
-    python = sys.executable
-    if not python:
-        reply(success=False, error="Could not work out which Python to use.")
+    python, err = _pick_recorder_python()
+    if err or not python:
+        reply(success=False, error=err or "Could not work out which Python to use.")
         return
-    # pythonw avoids a console window flashing up on Windows.
-    if os.name == "nt":
-        windowless = os.path.join(os.path.dirname(python), "pythonw.exe")
-        if os.path.isfile(windowless):
-            python = windowless
-
-    kwargs: Dict[str, Any] = {
-        "cwd": project_root,
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.DEVNULL,
-        "stderr": subprocess.DEVNULL,
-    }
-    if os.name == "nt":
-        # Detached, so closing the browser does not take the recorder with it.
-        kwargs["creationflags"] = (
-            getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-        )
-    else:
-        kwargs["start_new_session"] = True
 
     argv = [python, "-m", "screen_recorder"]
     # Recordings belong with the rest of the downloads, so the save folder from
@@ -5779,11 +6123,39 @@ def _handle_launch_recorder(message: dict) -> None:
     if out_dir and os.path.isdir(out_dir):
         argv += ["--output-dir", out_dir]
 
+    fd, err_path = tempfile.mkstemp(prefix="sg-recorder-", suffix=".log")
+    os.close(fd)
+    err_handle = open(err_path, "w+b")
     try:
-        subprocess.Popen(argv, **kwargs)
+        proc = _popen_recorder(argv, project_root, err_handle)
     except Exception as e:
+        err_handle.close()
+        try:
+            os.remove(err_path)
+        except OSError:
+            pass
         reply(success=False, error=str(e))
         return
+    err_handle.close()
+
+    code = _wait_recorder(proc, _RECORDER_START_GRACE_SEC)
+    if code is not None:
+        detail = ""
+        try:
+            with open(err_path, "rb") as fh:
+                detail = fh.read(8000).decode("utf-8", "replace")
+        except OSError as e:
+            detail = str(e)
+        try:
+            os.remove(err_path)
+        except OSError:
+            pass
+        reply(success=False, error=_recorder_failure_text(detail))
+        return
+    try:
+        os.remove(err_path)
+    except OSError:
+        pass
     reply(success=True)
 
 
@@ -6967,6 +7339,24 @@ def run_ffmpeg_with_updates(url, filename, message):
                     )
                 )
                 return
+            if _is_master_playlist(var_text_r):
+                # No variant URI we could follow. Opening this master as mp4
+                # yields programs and zero streams (ffmpeg exit 234).
+                send_message(
+                    with_job_id(
+                        {
+                            "type": "done",
+                            "success": False,
+                            "error": (
+                                "This HLS link is a list of qualities, and the video "
+                                "playlist for the best quality could not be opened. "
+                                "Reload the page, let the video play, and try again."
+                            ),
+                        },
+                        job_id,
+                    )
+                )
+                return
             try:
                 local_pl_path = _write_local_hls_playlist(
                     var_text_r, var_url_r or url
@@ -7431,6 +7821,7 @@ def _handle_health(message: dict) -> None:
 
 
 def main():
+    _reexec_unbuffered()
     _refresh_tool_path(force=True)
     while True:
         message = read_message()
@@ -7482,8 +7873,9 @@ def main():
             _handle_save_file(message)
             continue
         if mtype == "launch_recorder":
-            # Handled inline: spawning is quick, and a daemon thread would be
-            # killed if the connection closed before it got going.
+            # Inline, not a daemon thread. The browser drops the port as soon
+            # as it has the reply, and a daemon would die before the recorder
+            # had been checked and detached.
             _handle_launch_recorder(message)
             continue
         if mtype in ("health", "ping"):

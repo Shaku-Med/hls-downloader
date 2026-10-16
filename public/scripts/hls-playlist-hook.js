@@ -140,29 +140,36 @@
     return xhrOpen.call(this, method, url, ...rest);
   };
   XMLHttpRequest.prototype.send = function sgHlsXhrSend(...args) {
-    if (this.__sgHlsPeek) {
-      this.addEventListener('load', function () {
-        const url = this.responseURL || this.__sgHlsUrl;
+    this.addEventListener('load', function () {
+      let peek = this.__sgHlsPeek;
+      if (!peek) {
         try {
-          if (typeof this.responseText === 'string' && this.responseText) {
-            emit(url, this.responseText);
-            return;
-          }
+          peek = typeLooksLikePlaylist(this.getResponseHeader('content-type'));
         } catch (_) {
-          // responseText throws when responseType is arraybuffer/blob
+          peek = false;
         }
-        try {
-          const r = this.response;
-          if (r instanceof ArrayBuffer) {
-            emit(url, new TextDecoder('utf-8').decode(new Uint8Array(r)));
-          } else if (typeof Blob !== 'undefined' && r instanceof Blob) {
-            r.text().then((t) => emit(url, t)).catch(() => {});
-          }
-        } catch (_) {
-          // ignore
+      }
+      if (!peek) return;
+      const url = this.responseURL || this.__sgHlsUrl;
+      try {
+        if (typeof this.responseText === 'string' && this.responseText) {
+          emit(url, this.responseText);
+          return;
         }
-      });
-    }
+      } catch (_) {
+        // responseText throws when responseType is arraybuffer/blob
+      }
+      try {
+        const r = this.response;
+        if (r instanceof ArrayBuffer) {
+          emit(url, new TextDecoder('utf-8').decode(new Uint8Array(r)));
+        } else if (typeof Blob !== 'undefined' && r instanceof Blob) {
+          r.text().then((t) => emit(url, t)).catch(() => {});
+        }
+      } catch (_) {
+        // ignore
+      }
+    });
     return xhrSend.apply(this, args);
   };
 })();
