@@ -1,8 +1,6 @@
-from .gui import run_app
+from .__main__ import main
 
-
-def main() -> None:
-    run_app()
+__all__ = ["main"]
 
 
 if __name__ == "__main__":

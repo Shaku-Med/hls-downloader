@@ -9,7 +9,7 @@ The extension watches what a page loads when a video or track plays, then hands 
 
 Auto Download GUI
 
-Easiest way to get the tools. Use the launcher for your system.
+This is the easiest way to get the tools after you clone the repo. Use the launcher for your system. That is the path that works best on most machines.
 
 On Windows, double click:
 
@@ -23,17 +23,21 @@ On macOS or Linux, run:
 sh auto_download/run.sh
 ```
 
-If you already have Python, you can also just run:
+The launcher looks for Python 3.9 or newer that can open a desktop window (tkinter). On Windows it prefers a full install from python.org over a minimal one that happens to sit earlier on PATH. If nothing usable is found, it shows the install command and asks before running it. Nothing installs unless you say yes.
+
+On Windows it uses winget and picks the newest Python it can find. On macOS it uses Homebrew. On Linux it uses apt, dnf, pacman, zypper, or apk, and includes the tk package so the window can open. After install it checks that Python works. If that check fails, it stops, prints why, saves an error log, and tells you what to do by hand.
+
+You can still run this if you already have a full Python:
 
 ```text
 python -m auto_download
 ```
 
-The launchers work even when Python is missing. They detect Windows, macOS, or Linux, look for Python 3.9 or newer, and if none is there they show you the exact install command and ask before running it. Nothing installs unless you answer yes. On Windows it uses winget and picks the newest Python available. On macOS it uses Homebrew. On Linux it uses whichever of apt, dnf, pacman, zypper, or apk you have. After installing it tests that Python and pip actually work. If that test fails it stops, prints the reason, saves an error log, and tells you how to install Python yourself.
+If that fails with a tkinter error, your Python install is incomplete. Use the launcher instead.
 
-Once Python is running, the app window checks the rest of the tools like ffmpeg, yt-dlp, cryptography, pycryptodomex, Deno, and Node. Every install command is shown first and asks you to Allow or Deny. Prerequisites are checked first, so a package will not try to install until what it needs is ready. If a required tool fails to install, the run stops and you get the error log plus manual steps. Errors also show in the log pane.
+Once the window is open, it checks the rest of the tools like ffmpeg, yt-dlp, cryptography, pycryptodomex, Deno, and Node. Every command is shown first. Nothing runs until you click Allow. If something required fails, the run stops and you get the error log plus manual steps. Errors also show in the log pane.
 
-After the tools are ready, keep going with Load the extension and Install the helper below.
+When the tools are ready, keep going with Load the extension and Install the helper below.
 
 
 Install everything first
@@ -58,9 +62,9 @@ Any Chromium based browser with unpacked extension support should be fine. Firef
 
 2. Python 3
 
-You can skip this step if you use the Auto Download launcher above, since it offers to install Python for you.
+Skip this if you use the Auto Download launcher above. It can install Python for you.
 
-Install Python 3.9 or newer from python.org if you can. During setup on Windows, turn on the option that adds Python to PATH.
+If you install by hand, get Python 3.9 or newer from python.org. On Windows, turn on "Add python.exe to PATH" on the first setup screen. Use a full install, not a minimal or embeddable one, or the Auto Download window will not open.
 
 Check that a terminal can see it:
 
