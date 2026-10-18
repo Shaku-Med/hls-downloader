@@ -12,7 +12,8 @@
     "cookies",
     "alarms",
     "downloads",
-    "contextMenus"
+    "contextMenus",
+    "webRequestBlocking"
   ],
   "host_permissions": [
     "<all_urls>"

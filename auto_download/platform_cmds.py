@@ -238,6 +238,15 @@ def deno_plans() -> List[CommandPlan]:
     plan = _linux_install({"pacman": ("deno",), "apk": ("deno",)}, "Install Deno with {manager}")
     if plan:
         plans.append(plan)
+        return plans
+    # Fedora, Debian, and openSUSE do not ship Deno in the default repos.
+    # The official installer drops it in ~/.deno, which the helper already searches.
+    plans.append(
+        CommandPlan(
+            label="Install Deno into ~/.deno (YouTube challenge solver)",
+            argv=["sh", "-c", "curl -fsSL https://deno.land/install.sh | sh"],
+        )
+    )
     return plans
 
 
@@ -267,6 +276,19 @@ def node_plans() -> List[CommandPlan]:
     if plan:
         plans.append(plan)
     return plans
+
+
+def linux_host_plans() -> List[CommandPlan]:
+    """Register the native host. Linux only; Windows and macOS keep install.py."""
+    from .paths import PROJECT_ROOT
+
+    script = str(PROJECT_ROOT / "python" / "install.py")
+    return [
+        CommandPlan(
+            label="Register the download helper for Firefox on Linux",
+            argv=[*detect.helper_python_argv(), script, "--firefox"],
+        )
+    ]
 
 
 def package_manager_hint() -> str:

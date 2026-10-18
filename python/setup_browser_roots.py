@@ -132,7 +132,9 @@ def _link_shared(browser_dir: str, name: str) -> None:
                 f"Failed to create junction {link_path} -> {target}\n{r.stderr or r.stdout}"
             )
     else:
-        os.symlink(target, link_path, target_is_directory=True)
+        # Relative so the link does not embed this computer's home path.
+        # Windows keeps the junction above; that path is not a git symlink.
+        os.symlink(os.path.join("..", name), link_path, target_is_directory=True)
 
 
 def _copy_shared(browser_dir: str, name: str) -> None:
@@ -159,6 +161,12 @@ def setup() -> None:
     firefox_manifest = dict(base)
     firefox_manifest["background"] = dict(FIREFOX_BACKGROUND)
     firefox_manifest["browser_specific_settings"] = dict(FIREFOX_GECKO)
+    # filterResponseData needs a blocking webRequest listener. Chrome MV3 rejects
+    # this permission, so it stays on the Firefox manifest only.
+    firefox_perms = list(firefox_manifest.get("permissions") or [])
+    if "webRequestBlocking" not in firefox_perms:
+        firefox_perms.append("webRequestBlocking")
+    firefox_manifest["permissions"] = firefox_perms
     _write_json(os.path.join(firefox_dir, "manifest.json"), firefox_manifest)
 
     for name in SHARED_DIRS:

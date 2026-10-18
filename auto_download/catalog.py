@@ -10,6 +10,7 @@ from .platform_cmds import (
     pycryptodomex_plans,
     deno_plans,
     ffmpeg_plans,
+    linux_host_plans,
     node_plans,
     package_manager_hint,
     python_plans,
@@ -132,6 +133,19 @@ def build_catalog() -> List[Package]:
             + " Deno can be used instead if you prefer.",
         ),
     ]
+    if osinfo.is_linux():
+        packages.append(
+            Package(
+                id="native_host",
+                title="Download helper",
+                summary="Lets Firefox start the helper. Without it every download says the connection was lost.",
+                required=True,
+                detect=detect.has_linux_native_host,
+                prerequisites=("python",),
+                build_plans=linux_host_plans,
+                missing_hint="From this folder run:  python python/install.py --firefox",
+            )
+        )
     return packages
 
 

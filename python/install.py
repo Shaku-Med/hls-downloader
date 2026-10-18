@@ -11,6 +11,7 @@ import json
 import stat
 import shutil
 import subprocess
+import shlex
 
 NATIVE_HOST_NAME = "com.medzy.hlsgrabber"
 # Must match browser_specific_settings.gecko.id in firefox/manifest.json
@@ -20,13 +21,44 @@ HOST_SCRIPT = os.path.join(SCRIPT_DIR, "host.py")
 
 
 def get_extension_id():
+    """
+    Chromium extension id, or None for a Firefox-only install.
+
+    Firefox's id is fixed (FIREFOX_EXTENSION_ID). Chrome and Edge mint a new
+    one per unpacked load, so that id is only needed when those browsers
+    should be registered too.
+    """
     for arg in sys.argv[1:]:
         a = arg.strip()
+        if a in ("--firefox", "--firefox-only"):
+            return None
         if a and not a.startswith("-"):
             return a
-    return input(
-        "Paste your Chromium extension ID (from chrome://extensions or edge://extensions): "
+    if not sys.stdin.isatty():
+        return None
+    print(
+        "Firefox does not use a pasted extension ID. "
+        f"Its id is fixed as {FIREFOX_EXTENSION_ID}."
+    )
+    entered = input(
+        "Chromium extension ID (chrome://extensions), or press Enter for Firefox only: "
     ).strip()
+    return entered or None
+
+
+def _linux_firefox_host_dirs():
+    """
+    Directories Firefox searches for native-messaging manifests.
+
+    Firefox 147 and later follow XDG and read
+    $XDG_CONFIG_HOME/mozilla/native-messaging-hosts (usually
+    ~/.config/mozilla/...). Older builds still read ~/.mozilla/...
+    """
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return [
+        os.path.join(xdg, "mozilla", "native-messaging-hosts"),
+        os.path.expanduser("~/.mozilla/native-messaging-hosts"),
+    ]
 
 
 def _run(cmd):
@@ -115,6 +147,54 @@ def install_ytdlp(python_exe):
     if tail:
         print("  " + tail.replace("\n", "\n  "))
     print(f'  Do it by hand:  "{python_exe}" -m pip install -U --user yt-dlp')
+    return False
+
+
+def _js_runtime_present() -> bool:
+    for name in ("deno", "node", "bun", "qjs"):
+        if shutil.which(name):
+            return True
+    home = os.path.expanduser("~")
+    suffix = ".exe" if os.name == "nt" else ""
+    folders = [
+        os.path.join(home, ".deno", "bin"),
+        os.path.join(home, ".local", "bin"),
+        os.path.join(home, ".bun", "bin"),
+    ]
+    for folder in folders:
+        for name in ("deno", "node", "bun", "qjs"):
+            path = os.path.join(folder, name + suffix)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return True
+    return False
+
+
+def ensure_js_runtime():
+    """
+    YouTube's n challenge needs Deno or Node. The browser does not inherit a
+    shell PATH, so a copy under ~/.deno/bin is what the helper looks for.
+    """
+    if _js_runtime_present():
+        print("✓ JavaScript runtime found (needed for YouTube)")
+        return True
+    if sys.platform == "win32":
+        print("\nNo JavaScript runtime found. YouTube needs Deno or Node:")
+        print("  winget install DenoLand.Deno")
+        print("  winget install OpenJS.NodeJS.LTS")
+        return False
+    print("\nNo JavaScript runtime found. Installing Deno for YouTube into ~/.deno ...")
+    sys.stdout.flush()
+    r = _run_streaming(
+        ["sh", "-c", "curl -fsSL https://deno.land/install.sh | sh"],
+        label="Downloading Deno (YouTube challenge solver)...",
+    )
+    deno = os.path.expanduser("~/.deno/bin/deno")
+    if r.returncode == 0 and os.path.isfile(deno) and os.access(deno, os.X_OK):
+        print(f"✓ Deno installed: {deno}")
+        return True
+    print("WARNING: could not install Deno automatically.")
+    print("  curl -fsSL https://deno.land/install.sh | sh")
+    print("  or: sudo dnf install nodejs")
     return False
 
 
@@ -231,29 +311,34 @@ def install_windows_wsl(ext_id):
         ["wslpath", local_app_data], capture_output=True, text=True
     ).stdout.strip()
 
-    chrome_dir = os.path.join(local_app_data_wsl, "Google", "Chrome", "NativeMessagingHosts")
-    chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
-    _write_json(chrome_manifest_path, _chrome_host_manifest(win_wrapper.replace("/", "\\"), ext_id))
+    chrome_manifest_path = None
+    if ext_id:
+        chrome_dir = os.path.join(local_app_data_wsl, "Google", "Chrome", "NativeMessagingHosts")
+        chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
+        _write_json(chrome_manifest_path, _chrome_host_manifest(win_wrapper.replace("/", "\\"), ext_id))
+    else:
+        print("\nNo Chromium extension ID, so Chrome was left alone.")
 
     firefox_dir = os.path.join(local_app_data_wsl, "Mozilla", "NativeMessagingHosts")
     # Firefox on Windows uses registry; also keep a copy under LocalAppData for reference.
     firefox_manifest_path = os.path.join(firefox_dir, f"{NATIVE_HOST_NAME}.json")
     _write_json(firefox_manifest_path, _firefox_host_manifest(win_wrapper.replace("/", "\\")))
 
-    win_chrome_manifest = subprocess.run(
-        ["wslpath", "-w", chrome_manifest_path], capture_output=True, text=True
-    ).stdout.strip()
     win_firefox_manifest = subprocess.run(
         ["wslpath", "-w", firefox_manifest_path], capture_output=True, text=True
     ).stdout.strip()
 
-    subprocess.run(
-        [
-            "powershell.exe",
-            "-Command",
-            f'New-Item -Path "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_HOST_NAME}" -Force | Set-ItemProperty -Name "(default)" -Value "{win_chrome_manifest}"',
-        ]
-    )
+    if chrome_manifest_path:
+        win_chrome_manifest = subprocess.run(
+            ["wslpath", "-w", chrome_manifest_path], capture_output=True, text=True
+        ).stdout.strip()
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-Command",
+                f'New-Item -Path "HKCU:\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_HOST_NAME}" -Force | Set-ItemProperty -Name "(default)" -Value "{win_chrome_manifest}"',
+            ]
+        )
     subprocess.run(
         [
             "powershell.exe",
@@ -263,9 +348,12 @@ def install_windows_wsl(ext_id):
     )
 
     print(f"\n✓ Wrapper written: {ps_wrapper}")
-    print(f"✓ Chrome manifest: {chrome_manifest_path}")
+    if chrome_manifest_path:
+        print(f"✓ Chrome manifest: {chrome_manifest_path}")
+        print("✓ Registry: Chrome + Mozilla NativeMessagingHosts")
+    else:
+        print("✓ Registry: Mozilla NativeMessagingHosts")
     print(f"✓ Firefox manifest: {firefox_manifest_path}")
-    print("✓ Registry: Chrome + Mozilla NativeMessagingHosts")
     print("\nRestart Chrome/Firefox and test the extension!")
 
 
@@ -302,15 +390,19 @@ def install_native_windows(ext_id):
             "        so host_wrapper.bat uses that python.exe instead of the Store shim.\n"
         )
 
-    chrome_dir = os.path.join(
-        local_app_data, "Google", "Chrome", "User Data", "NativeMessagingHosts"
-    )
-    chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
-    _write_json(chrome_manifest_path, _chrome_host_manifest(bat_path, ext_id))
-    _register_windows_native_host(
-        rf"Software\Google\Chrome\NativeMessagingHosts\{NATIVE_HOST_NAME}",
-        chrome_manifest_path,
-    )
+    chrome_manifest_path = None
+    if ext_id:
+        chrome_dir = os.path.join(
+            local_app_data, "Google", "Chrome", "User Data", "NativeMessagingHosts"
+        )
+        chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
+        _write_json(chrome_manifest_path, _chrome_host_manifest(bat_path, ext_id))
+        _register_windows_native_host(
+            rf"Software\Google\Chrome\NativeMessagingHosts\{NATIVE_HOST_NAME}",
+            chrome_manifest_path,
+        )
+    else:
+        print("\nNo Chromium extension ID, so Chrome was left alone.")
 
     # Firefox reads the path from the Mozilla registry key (manifest file can live anywhere).
     firefox_dir = os.path.join(local_app_data, "Mozilla", "NativeMessagingHosts")
@@ -322,9 +414,10 @@ def install_native_windows(ext_id):
     )
 
     print(f"\n✓ Wrapper written: {bat_path}")
-    print(f"✓ Chrome manifest: {chrome_manifest_path}")
+    if chrome_manifest_path:
+        print(f"✓ Chrome manifest: {chrome_manifest_path}")
+        print(f"✓ Registry: HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_HOST_NAME}")
     print(f"✓ Firefox manifest: {firefox_manifest_path}")
-    print(f"✓ Registry: HKCU\\Software\\Google\\Chrome\\NativeMessagingHosts\\{NATIVE_HOST_NAME}")
     print(f"✓ Registry: HKCU\\Software\\Mozilla\\NativeMessagingHosts\\{NATIVE_HOST_NAME}")
     print(f"✓ Firefox allowed extension id: {FIREFOX_EXTENSION_ID}")
     print("\nRestart Chrome and/or Firefox and test the extension!")
@@ -338,31 +431,55 @@ def install_native_windows(ext_id):
     )
 
 
+def _write_linux_host_launcher(python_exe, host_script, launcher_path):
+    """
+    Firefox starts the helper with the desktop PATH and no -u.
+
+    A bare host.py shebang block-buffers stdout, so the browser never sees a
+    full native-messaging frame and reports that it lost the helper. The
+    Windows installer already launches with python -u. This wrapper does the
+    same, and puts user installs (Deno, pip scripts) on PATH.
+    """
+    body = (
+        "#!/bin/sh\n"
+        'export PATH="$HOME/.deno/bin:$HOME/.local/bin:$HOME/.bun/bin:$PATH"\n'
+        f"exec {shlex.quote(python_exe)} -u {shlex.quote(host_script)}\n"
+    )
+    with open(launcher_path, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(body)
+    os.chmod(launcher_path, 0o755)
+
+
 def install_linux(ext_id):
     st = os.stat(HOST_SCRIPT)
     os.chmod(HOST_SCRIPT, st.st_mode | stat.S_IEXEC)
-    host_path = os.path.normpath(HOST_SCRIPT)
+    launcher_path = os.path.abspath(os.path.join(SCRIPT_DIR, "host_linux.sh"))
+    _write_linux_host_launcher(os.path.abspath(sys.executable), os.path.abspath(HOST_SCRIPT), launcher_path)
+    host_path = launcher_path
+    firefox_manifest = _firefox_host_manifest(host_path)
 
-    chrome_dir = os.path.expanduser("~/.config/google-chrome/NativeMessagingHosts")
-    chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
-    _write_json(chrome_manifest_path, _chrome_host_manifest(host_path, ext_id))
+    if ext_id:
+        chrome_dir = os.path.expanduser("~/.config/google-chrome/NativeMessagingHosts")
+        chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
+        _write_json(chrome_manifest_path, _chrome_host_manifest(host_path, ext_id))
 
-    # Chromium / Brave common paths (best effort)
-    chromium_dir = os.path.expanduser("~/.config/chromium/NativeMessagingHosts")
-    _write_json(
-        os.path.join(chromium_dir, f"{NATIVE_HOST_NAME}.json"),
-        _chrome_host_manifest(host_path, ext_id),
-    )
+        # Chromium / Brave common paths (best effort)
+        chromium_dir = os.path.expanduser("~/.config/chromium/NativeMessagingHosts")
+        _write_json(
+            os.path.join(chromium_dir, f"{NATIVE_HOST_NAME}.json"),
+            _chrome_host_manifest(host_path, ext_id),
+        )
+        print(f"\n✓ Chrome manifest: {chrome_manifest_path}")
+    else:
+        print("\nNo Chromium extension ID, so Chrome and Chromium were left alone.")
 
-    firefox_dir = os.path.expanduser("~/.mozilla/native-messaging-hosts")
-    firefox_manifest_path = os.path.join(firefox_dir, f"{NATIVE_HOST_NAME}.json")
-    _write_json(firefox_manifest_path, _firefox_host_manifest(host_path))
-
-    print(f"\n✓ host.py made executable")
-    print(f"✓ Chrome manifest: {chrome_manifest_path}")
-    print(f"✓ Firefox manifest: {firefox_manifest_path}")
+    print(f"✓ Linux launcher: {launcher_path}")
+    for firefox_dir in _linux_firefox_host_dirs():
+        firefox_manifest_path = os.path.join(firefox_dir, f"{NATIVE_HOST_NAME}.json")
+        _write_json(firefox_manifest_path, firefox_manifest)
+        print(f"✓ Firefox manifest: {firefox_manifest_path}")
     print(f"✓ Firefox allowed extension id: {FIREFOX_EXTENSION_ID}")
-    print("\nRestart Chrome/Firefox and test the extension!")
+    print("\nRestart Firefox and test the extension!")
 
 
 def install_macos(ext_id):
@@ -370,11 +487,15 @@ def install_macos(ext_id):
     os.chmod(HOST_SCRIPT, st.st_mode | stat.S_IEXEC)
     host_path = os.path.normpath(HOST_SCRIPT)
 
-    chrome_dir = os.path.expanduser(
-        "~/Library/Application Support/Google/Chrome/NativeMessagingHosts"
-    )
-    chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
-    _write_json(chrome_manifest_path, _chrome_host_manifest(host_path, ext_id))
+    if ext_id:
+        chrome_dir = os.path.expanduser(
+            "~/Library/Application Support/Google/Chrome/NativeMessagingHosts"
+        )
+        chrome_manifest_path = os.path.join(chrome_dir, f"{NATIVE_HOST_NAME}.json")
+        _write_json(chrome_manifest_path, _chrome_host_manifest(host_path, ext_id))
+        print(f"✓ Chrome manifest: {chrome_manifest_path}")
+    else:
+        print("\nNo Chromium extension ID, so Chrome was left alone.")
 
     firefox_dir = os.path.expanduser(
         "~/Library/Application Support/Mozilla/NativeMessagingHosts"
@@ -383,7 +504,6 @@ def install_macos(ext_id):
     _write_json(firefox_manifest_path, _firefox_host_manifest(host_path))
 
     print(f"\n✓ host.py made executable")
-    print(f"✓ Chrome manifest: {chrome_manifest_path}")
     print(f"✓ Firefox manifest: {firefox_manifest_path}")
     print(f"✓ Firefox allowed extension id: {FIREFOX_EXTENSION_ID}")
     print("\nRestart Chrome/Firefox and test the extension!")
@@ -411,8 +531,7 @@ def main():
 
     ext_id = get_extension_id()
     if not ext_id:
-        print("ERROR: Chromium Extension ID required")
-        sys.exit(1)
+        print("No Chromium extension ID. Registering the Firefox host only.\n")
 
     is_wsl = (
         os.path.exists("/proc/version")
@@ -433,6 +552,7 @@ def main():
         install_linux(ext_id)
 
     ensure_ffmpeg()
+    ensure_js_runtime()
     install_ytdlp(sys.executable)
     req = os.path.join(os.path.dirname(SCRIPT_DIR), "requirements.txt")
     if os.path.isfile(req):
@@ -450,8 +570,9 @@ def main():
         "\nAll set. Fully quit and reopen your browser so it picks up the host.\n"
         "Chromium: Load unpacked → select the chromium/ folder.\n"
         "Firefox:  about:debugging → This Firefox → Load Temporary Add-on → firefox/manifest.json\n"
-        "For YouTube music videos you also want one JS runtime on your PATH:\n"
-        "  Node.js  https://nodejs.org   or   Deno  https://docs.deno.com/runtime/getting_started/installation/\n"
+        "YouTube needs Deno or Node. On Linux this installer puts Deno in ~/.deno\n"
+        "when neither is already installed. The helper looks there even if Firefox\n"
+        "did not put that folder on PATH.\n"
     )
 
 

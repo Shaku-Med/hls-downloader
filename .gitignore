@@ -87,6 +87,13 @@ out/
 # Local machine helper wrappers (paths are machine specific)
 host_wrapper.bat
 host_wrapper.ps1
+host_linux.sh
+
+# Chromium loads these as links. setup_browser_roots.py recreates them
+# with this machine's paths, so they must not be committed.
+chromium/asset
+chromium/public
+chromium/style
 
 # Local dumps / redis / misc junk
 dump.rdb

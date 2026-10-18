@@ -525,7 +525,24 @@ function isHlsStreamKind(kind) {
   return kind === 'hls' || kind === 'hls_by_header';
 }
 
-function headersForPlaylistFetch(captured) {
+function hostOf(url) {
+  try {
+    let h = new URL(url).hostname.toLowerCase();
+    if (h.startsWith('www.')) h = h.slice(4);
+    return h;
+  } catch (_) {
+    return '';
+  }
+}
+
+function sameSite(a, b) {
+  const ha = hostOf(a);
+  const hb = hostOf(b);
+  if (!ha || !hb) return false;
+  return ha === hb || ha.endsWith(`.${hb}`) || hb.endsWith(`.${ha}`);
+}
+
+function headersForPlaylistFetch(captured, targetUrl, ownerUrl) {
   const src = captured || {};
   const out = {};
   const map = {
@@ -540,6 +557,13 @@ function headersForPlaylistFetch(captured) {
   Object.keys(map).forEach((k) => {
     if (src[k]) out[map[k]] = src[k];
   });
+  if (ownerUrl && targetUrl && !sameSite(ownerUrl, targetUrl)) {
+    delete out.Cookie;
+    delete out.Authorization;
+  }
+  // Firefox and Chrome both refuse to send a Cookie header set from fetch().
+  // credentials: 'include' attaches only the cookies stored for targetUrl.
+  delete out.Cookie;
   if (!out['User-Agent']) {
     try {
       out['User-Agent'] = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
@@ -628,19 +652,14 @@ function playlistRecordFromFamily(tabId, url) {
   return null;
 }
 
-async function fetchHlsPlaylistText(url, captured) {
-  const headers = headersForPlaylistFetch(captured);
-  if (!headers.Cookie) {
-    try {
-      const cookies = await chrome.cookies.getAll({ url });
-      if (cookies && cookies.length) {
-        headers.Cookie = cookies.map((c) => `${c.name}=${c.value}`).join('; ');
-      }
-    } catch (_) {
-      // ignore
-    }
-  }
-  const res = await fetch(url, { method: 'GET', headers, redirect: 'follow' });
+async function fetchHlsPlaylistText(url, captured, ownerUrl) {
+  const headers = headersForPlaylistFetch(captured, url, ownerUrl || url);
+  const res = await fetch(url, {
+    method: 'GET',
+    headers,
+    redirect: 'follow',
+    credentials: 'include',
+  });
   if (!res.ok) {
     throw new Error(`HTTP ${res.status}`);
   }
@@ -660,10 +679,18 @@ function storeHlsPlaylist(tabId, url, text, playlistUrl) {
   const rec = { text, playlistUrl: playlistUrl || url, at: Date.now() };
   hlsPlaylistCache.set(url, rec);
   if (playlistUrl && playlistUrl !== url) hlsPlaylistCache.set(playlistUrl, rec);
+  const famKeys = [];
   const fam = hlsPlaylistFamilyKey(url);
-  if (fam) hlsPlaylistCache.set(fam, rec);
+  if (fam) famKeys.push(fam);
   const fam2 = playlistUrl ? hlsPlaylistFamilyKey(playlistUrl) : '';
-  if (fam2 && fam2 !== fam) hlsPlaylistCache.set(fam2, rec);
+  if (fam2 && fam2 !== fam) famKeys.push(fam2);
+  const incomingIsMedia = playlistIsMedia(text);
+  famKeys.forEach((famKey) => {
+    const prev = hlsPlaylistCache.get(famKey);
+    // A later master must not replace the media playlist the player already got.
+    if (prev && prev.text && playlistIsMedia(prev.text) && !incomingIsMedia) return;
+    hlsPlaylistCache.set(famKey, rec);
+  });
   attachPlaylistToStream(tabId, url, rec);
   if (playlistUrl && playlistUrl !== url) attachPlaylistToStream(tabId, playlistUrl, rec);
   persistHlsPlaylistRec(url, rec);
@@ -675,8 +702,14 @@ function storeHlsPlaylist(tabId, url, text, playlistUrl) {
  * the same headers. Signed CDN tokens often work for concurrent hits and fail
  * if we wait until the user clicks Download.
  */
+function playlistIsMedia(text) {
+  return /#EXTM3U/i.test(text || '') && !/#EXT-X-STREAM-INF/i.test(text || '');
+}
+
 function prefetchHlsPlaylist(tabId, url, capturedHeaders) {
-  if (!url) return;
+  // Firefox copies the page's own response. A second GET spends a one-shot URL
+  // and comes back 403, which is the failure the download card shows.
+  if (!url || isFirefoxBrowser()) return;
   const existing = hlsPlaylistCache.get(url);
   if (existing && existing.text) return;
   const fam = hlsPlaylistFamilyKey(url);
@@ -686,8 +719,12 @@ function prefetchHlsPlaylist(tabId, url, capturedHeaders) {
     return;
   }
   if (existing && existing.pending) return;
+  const slot = {};
+  const raced = hlsPlaylistCache.get(url);
+  if (raced && raced.text) return;
+  hlsPlaylistCache.set(url, slot);
   const pending = (async () => {
-    let text = await fetchHlsPlaylistText(url, capturedHeaders);
+    let text = await fetchHlsPlaylistText(url, capturedHeaders, url);
     let playlistUrl = url;
     try {
       let guard = 0;
@@ -695,20 +732,20 @@ function prefetchHlsPlaylist(tabId, url, capturedHeaders) {
         guard += 1;
         const variant = pickHighestBandwidthVariant(text, playlistUrl);
         if (!variant || variant === playlistUrl) break;
-        text = await fetchHlsPlaylistText(variant, capturedHeaders);
+        text = await fetchHlsPlaylistText(variant, capturedHeaders, url);
         playlistUrl = variant;
       }
     } catch (_) {
       // Keep the master playlist if a later variant GET is rejected.
     }
+    const now = hlsPlaylistCache.get(url);
+    if (now && now.text && now !== slot) return now;
     return storeHlsPlaylist(tabId, url, text, playlistUrl);
   })();
-  hlsPlaylistCache.set(url, { pending });
+  slot.pending = pending;
   pending.catch(() => {
     const cur = hlsPlaylistCache.get(url);
-    if (cur && cur.pending === pending && !cur.text) {
-      hlsPlaylistCache.delete(url);
-    }
+    if (cur === slot && !cur.text) hlsPlaylistCache.delete(url);
   });
 }
 
@@ -1226,6 +1263,103 @@ chrome.webRequest.onHeadersReceived.addListener(
   { urls: ['<all_urls>'] },
   WEB_REQUEST_RES_EXTRA
 );
+
+/**
+ * Firefox: copy the playlist body from the page's own response.
+ * filterResponseData sees worker and XHR traffic the page hook misses, and it
+ * does not issue a second GET. Chrome has no filterResponseData; it still prefetches.
+ */
+function urlLooksLikePlaylist(url) {
+  const u = String(url || '');
+  if (/\.m3u8?(?:[?#]|$)/i.test(u)) return true;
+  return /H4sIAAAA/i.test(u) && /\/pl\//i.test(u);
+}
+
+function contentTypeIsPlaylist(ct) {
+  const t = String(ct || '').toLowerCase();
+  return t.indexOf('mpegurl') !== -1 || t.indexOf('vnd.apple.mpegurl') !== -1;
+}
+
+function captureFirefoxPlaylistBody(details) {
+  let filter;
+  try {
+    filter = chrome.webRequest.filterResponseData(details.requestId);
+  } catch (_) {
+    return;
+  }
+  const chunks = [];
+  let size = 0;
+  filter.ondata = (event) => {
+    const chunk = event.data;
+    if (size <= HLS_PLAYLIST_CACHE_MAX) {
+      try {
+        chunks.push(chunk.slice(0));
+        size += chunk.byteLength;
+      } catch (_) {
+        // ignore
+      }
+    }
+    try {
+      filter.write(chunk);
+    } catch (_) {
+      // ignore
+    }
+  };
+  filter.onstop = () => {
+    try {
+      filter.close();
+    } catch (_) {
+      // ignore
+    }
+    if (!chunks.length || size > HLS_PLAYLIST_CACHE_MAX) return;
+    let text = '';
+    try {
+      const buf = new Uint8Array(size);
+      let off = 0;
+      for (const c of chunks) {
+        const u8 = new Uint8Array(c);
+        buf.set(u8, off);
+        off += u8.byteLength;
+      }
+      text = new TextDecoder('utf-8').decode(buf);
+    } catch (_) {
+      return;
+    }
+    if (!/#EXTM3U/i.test(text)) return;
+    const tabId = details.tabId > 0 ? details.tabId : null;
+    storeHlsPlaylist(tabId, details.url, text, details.url);
+  };
+  filter.onerror = () => {
+    try {
+      filter.disconnect();
+    } catch (_) {
+      // ignore
+    }
+  };
+}
+
+if (
+  isFirefoxBrowser() &&
+  chrome.webRequest &&
+  typeof chrome.webRequest.filterResponseData === 'function'
+) {
+  try {
+    chrome.webRequest.onHeadersReceived.addListener(
+      (details) => {
+        if (!details || !details.url) return;
+        if (details.statusCode && (details.statusCode < 200 || details.statusCode >= 300)) return;
+        const ct = getHeaderValue(details.responseHeaders, 'content-type');
+        if (!urlLooksLikePlaylist(details.url) && !contentTypeIsPlaylist(ct)) return;
+        captureFirefoxPlaylistBody(details);
+      },
+      { urls: ['<all_urls>'] },
+      ['blocking', 'responseHeaders']
+    );
+  } catch (_) {
+    // Without webRequestBlocking the listener cannot be registered. Playlist
+    // capture then falls back to the page hook.
+  }
+}
 
 function isSocialOrYtPageUrl(url) {
   const api = socialPostApi();
@@ -2557,6 +2691,137 @@ function progressWriteIsDue(jobId, patch, prevDetail) {
   return false;
 }
 
+function replyHttpBytes(reply, bytes) {
+  const buf = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+  const chunkSize = 240000;
+  const total = Math.max(1, Math.ceil(buf.length / chunkSize) || 1);
+  if (!buf.length) {
+    reply({ ok: true, chunk: 0, total: 1, data: '' });
+    return;
+  }
+  for (let i = 0; i < total; i += 1) {
+    const slice = buf.subarray(i * chunkSize, Math.min(buf.length, (i + 1) * chunkSize));
+    let bin = '';
+    const step = 0x8000;
+    for (let j = 0; j < slice.length; j += step) {
+      bin += String.fromCharCode.apply(null, slice.subarray(j, j + step));
+    }
+    reply({ ok: true, chunk: i, total, data: btoa(bin) });
+  }
+}
+
+async function exactPlaylistText(url) {
+  const rec = hlsPlaylistCache.get(url);
+  if (rec && rec.text && /#EXTM3U/i.test(rec.text) && (rec.playlistUrl || url) === url) {
+    return rec.text;
+  }
+  if (typeof chrome === 'undefined' || !chrome.storage || !chrome.storage.session) return '';
+  try {
+    const got = await chrome.storage.session.get(HLS_PLAYLIST_SESSION_KEY);
+    const bag = (got && got[HLS_PLAYLIST_SESSION_KEY]) || {};
+    const saved = bag[url];
+    if (saved && saved.text && /#EXTM3U/i.test(saved.text) && (saved.playlistUrl || url) === url) {
+      return saved.text;
+    }
+  } catch (_) {
+    // ignore
+  }
+  return '';
+}
+
+function urlMightBePlaylist(url) {
+  if (urlLooksLikePlaylist(url)) return true;
+  try {
+    return /playlist|manifest|\.m3u8?$/i.test(new URL(url).pathname || '');
+  } catch (_) {
+    return false;
+  }
+}
+
+function familiesRelated(a, b) {
+  const fa = hlsPlaylistFamilyKey(a);
+  const fb = hlsPlaylistFamilyKey(b);
+  if (!fa || !fb) return false;
+  if (fa === fb) return true;
+  const left = fa.endsWith('/') ? fa : `${fa}/`;
+  const right = fb.endsWith('/') ? fb : `${fb}/`;
+  return left.startsWith(right) || right.startsWith(left);
+}
+
+function capturedPlaylistEntries(url, tabId) {
+  const out = [];
+  const seen = new Set();
+  const add = (entryUrl, text) => {
+    const u = String(entryUrl || '').trim();
+    const t = String(text || '');
+    if (!u || !/^https?:/i.test(u) || !/#EXTM3U/i.test(t) || seen.has(u)) return;
+    if (u !== url && !familiesRelated(url, u)) return;
+    seen.add(u);
+    out.push({
+      url: u,
+      text: t.length > HLS_PLAYLIST_CACHE_MAX ? t.slice(0, HLS_PLAYLIST_CACHE_MAX) : t,
+    });
+  };
+  hlsPlaylistCache.forEach((rec, key) => {
+    if (!rec || !rec.text) return;
+    const owner = rec.playlistUrl || (String(key).startsWith('http') ? String(key) : '');
+    add(owner, rec.text);
+  });
+  const list = (tabId && detectedStreams[tabId]) || [];
+  for (const e of list) {
+    if (e && e.playlistText) add(e.playlistUrl || e.url, e.playlistText);
+  }
+  const ordered = out.filter((e) => playlistIsMedia(e.text)).concat(out.filter((e) => !playlistIsMedia(e.text)));
+  const packed = [];
+  let total = 0;
+  for (const item of ordered) {
+    if (packed.length >= 6) break;
+    if (total + item.text.length > 700000) continue;
+    packed.push(item);
+    total += item.text.length;
+  }
+  return packed;
+}
+
+/**
+ * Fetch from the player frame so Firefox sends that page's cookies and referer.
+ * A background fetch cannot set Referer, and Firefox does not attach it for us.
+ * No Cookie header is copied; the browser attaches only cookies stored for url.
+ */
+async function fetchPlaylistInPage(tabId, url) {
+  if (tabId == null || tabId < 0 || !chrome.scripting || !chrome.scripting.executeScript) return '';
+  let injected = [];
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      args: [url],
+      func: async (targetUrl) => {
+        try {
+          if (!document.querySelector('video, audio')) return { ok: false };
+          const res = await fetch(targetUrl, {
+            method: 'GET',
+            credentials: 'include',
+            redirect: 'follow',
+          });
+          if (!res.ok) return { ok: false, status: res.status };
+          const text = await res.text();
+          if (!/#EXTM3U/i.test(text) || text.length > 500000) return { ok: false };
+          return { ok: true, text };
+        } catch (err) {
+          return { ok: false, error: String((err && err.message) || err) };
+        }
+      },
+    });
+  } catch (_) {
+    return '';
+  }
+  for (const row of injected || []) {
+    if (row && row.result && row.result.ok && row.result.text) return row.result.text;
+  }
+  return '';
+}
+
 async function fulfillHostHttpGet(msg, slotIndex) {
   const port = slots[slotIndex] && slots[slotIndex].port;
   const requestId = msg && msg.requestId;
@@ -2572,38 +2837,44 @@ async function fulfillHostHttpGet(msg, slotIndex) {
   try {
     const url = String((msg && msg.url) || '');
     if (!url) throw new Error('No URL');
+    const ranged = msg.byteRange && msg.byteRange.length === 2;
+    if (!ranged) {
+      const cached = await exactPlaylistText(url);
+      if (cached) {
+        replyHttpBytes(reply, new TextEncoder().encode(cached));
+        return;
+      }
+    }
     const headers = { ...((msg && msg.headers) || {}) };
-    if (msg.byteRange && msg.byteRange.length === 2) {
+    // Never forward a Cookie header. credentials include uses the jar for this URL only.
+    delete headers.Cookie;
+    delete headers.cookie;
+    if (ranged) {
       const rs = Number(msg.byteRange[0]);
       const ln = Number(msg.byteRange[1]);
       if (Number.isFinite(rs) && Number.isFinite(ln) && ln > 0) {
         headers.Range = `bytes=${rs}-${rs + ln - 1}`;
       }
     }
-    const hasCookie = !!(headers.Cookie || headers.cookie);
     const res = await fetch(url, {
       method: 'GET',
       headers,
       redirect: 'follow',
-      credentials: hasCookie ? 'omit' : 'include',
+      credentials: 'include',
     });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const buf = new Uint8Array(await res.arrayBuffer());
-    const chunkSize = 240000;
-    const total = Math.max(1, Math.ceil(buf.length / chunkSize) || 1);
-    if (!buf.length) {
-      reply({ ok: true, chunk: 0, total: 1, data: '' });
-      return;
-    }
-    for (let i = 0; i < total; i += 1) {
-      const slice = buf.subarray(i * chunkSize, Math.min(buf.length, (i + 1) * chunkSize));
-      let bin = '';
-      const step = 0x8000;
-      for (let j = 0; j < slice.length; j += step) {
-        bin += String.fromCharCode.apply(null, slice.subarray(j, j + step));
+    if (!res.ok) {
+      if (!ranged && res.status === 403 && urlMightBePlaylist(url)) {
+        const tabId = slots[slotIndex] && slots[slotIndex].tabId;
+        const text = await fetchPlaylistInPage(tabId, url);
+        if (text) {
+          storeHlsPlaylist(tabId, url, text, url);
+          replyHttpBytes(reply, new TextEncoder().encode(text));
+          return;
+        }
       }
-      reply({ ok: true, chunk: i, total, data: btoa(bin) });
+      throw new Error(`HTTP ${res.status}`);
     }
+    replyHttpBytes(reply, new Uint8Array(await res.arrayBuffer()));
   } catch (e) {
     reply({ ok: false, error: String((e && e.message) || e) });
   }
@@ -2706,6 +2977,7 @@ function recycleSlotPort(slotIndex) {
   const port = slots[slotIndex].port;
   slots[slotIndex].port = null;
   slots[slotIndex].jobId = null;
+  slots[slotIndex].tabId = null;
   if (!port) return;
   try {
     port.disconnect();
@@ -2718,6 +2990,7 @@ function onSlotDisconnect(slotIndex) {
   const j = slots[slotIndex].jobId;
   slots[slotIndex].port = null;
   slots[slotIndex].jobId = null;
+  slots[slotIndex].tabId = null;
   const err = chrome.runtime.lastError?.message;
   (async () => {
     if (j) {
@@ -2763,6 +3036,7 @@ async function launchOnSlot(slotIndex, jobId, basePayload) {
     return;
   }
   slots[slotIndex].jobId = jobId;
+  slots[slotIndex].tabId = basePayload.tabId != null ? basePayload.tabId : null;
   await patchJob(jobId, {
     status: 'connecting',
     detail: 'Starting',
@@ -2773,6 +3047,7 @@ async function launchOnSlot(slotIndex, jobId, basePayload) {
     ensurePort(slotIndex).postMessage(full);
   } catch (e) {
     slots[slotIndex].jobId = null;
+    slots[slotIndex].tabId = null;
     await patchJob(jobId, { status: 'error', error: String(e), detail: '' });
     tryDispatch();
   }
@@ -3253,6 +3528,22 @@ function localPathToFileUrl(filePath) {
   return 'file://' + encodeURI(p).replace(/#/g, '%23');
 }
 
+function openLocalFileOnLinux(filePath) {
+  return (async () => {
+    const outDir = await getUserDownloadPath();
+    if (!outDir) {
+      return { ok: false, error: 'Set a save folder in Options, then try Open again.' };
+    }
+    return nativePathOp(
+      'open_path',
+      'open_path_result',
+      filePath,
+      outDir,
+      'Could not open the file'
+    );
+  })();
+}
+
 function openLocalFileInBrowserTab(filePath) {
   return new Promise((resolve) => {
     const fileUrl = localPathToFileUrl(filePath);
@@ -3277,25 +3568,43 @@ function openLocalFileInBrowserTab(filePath) {
       });
     };
 
+    const openInBrowser = () => {
+      try {
+        if (chrome.extension && typeof chrome.extension.isAllowedFileSchemeAccess === 'function') {
+          chrome.extension.isAllowedFileSchemeAccess((allowed) => {
+            if (!allowed) {
+              resolve({
+                ok: false,
+                error:
+                  'Turn on “Allow access to file URLs” for Stuff Grabber on the extensions page, then try Open again.',
+              });
+              return;
+            }
+            openTab();
+          });
+          return;
+        }
+      } catch (_) {
+        // fall through
+      }
+      openTab();
+    };
+
     try {
-      if (chrome.extension && typeof chrome.extension.isAllowedFileSchemeAccess === 'function') {
-        chrome.extension.isAllowedFileSchemeAccess((allowed) => {
-          if (!allowed) {
-            resolve({
-              ok: false,
-              error:
-                'Turn on “Allow access to file URLs” for Stuff Grabber on the extensions page, then try Open again.',
-            });
+      if (chrome.runtime && typeof chrome.runtime.getPlatformInfo === 'function') {
+        chrome.runtime.getPlatformInfo((info) => {
+          if (info && info.os === 'linux') {
+            openLocalFileOnLinux(filePath).then(resolve);
             return;
           }
-          openTab();
+          openInBrowser();
         });
         return;
       }
     } catch (_) {
-      // fall through
+      // fall through to the browser tab path
     }
-    openTab();
+    openInBrowser();
   });
 }
 
@@ -4556,10 +4865,23 @@ async function startDownloadJob(payload, fallbackTabId) {
         // Host will try once more with the same headers.
       }
     }
-    if (rec && rec.text) {
+    const captured = capturedPlaylistEntries(payload.url, tabIdForJob);
+    const master = captured.find((e) => e && e.text && !playlistIsMedia(e.text));
+    const medias = captured.filter((e) => playlistIsMedia(e.text));
+    if (master) {
+      // Keep the master as the text so the helper can pick a captured variant
+      // instead of fetching the highest one again.
+      base.playlistText = master.text;
+      base.playlistUrl = master.url;
+    } else if (medias.length) {
+      const played = medias[medias.length - 1];
+      base.playlistText = played.text;
+      base.playlistUrl = played.url;
+    } else if (rec && rec.text) {
       base.playlistText = rec.text;
       base.playlistUrl = rec.playlistUrl || payload.url;
     }
+    if (captured.length) base.capturedPlaylists = captured;
     if (
       isOneShotHlsUrl(payload.url) ||
       (fromStream && fromStream.oneShotHls) ||
