@@ -5,6 +5,7 @@ Run from the repo root:  python -m unittest discover test
 Or directly:             python test/test_host.py
 """
 
+import glob
 import http.server
 import io
 import os
@@ -1774,6 +1775,155 @@ class SegmentsOnAnotherSiteGetNoCookies(unittest.TestCase):
     def test_the_same_site_and_its_cdn_keep_them(self):
         for target in ("https://tube.example/seg1.ts", "https://cdn.tube.example/seg1.ts"):
             self.assertEqual(host._scope_header_block(self.BLOCK, self.PLAYLIST, target), self.BLOCK)
+
+
+YT_JAR = [{"name": "SID", "value": "x", "domain": ".youtube.com", "path": "/", "secure": True}]
+YT_PAGE = "https://www.youtube.com/watch?v=d2RVycC06gI"
+BOT_CHECK = (
+    "ERROR: [youtube] d2RVycC06gI: Sign in to confirm you\ufffdre not a bot. "
+    "Use --cookies-from-browser or --cookies for the authentication."
+)
+
+
+class YoutubeSignInIsRecognised(unittest.TestCase):
+    def test_the_bot_check_as_it_actually_arrived(self):
+        # The apostrophe came through mangled; the match must not depend on it.
+        self.assertTrue(host._looks_like_youtube_sign_in(BOT_CHECK))
+
+    def test_the_age_gate_needs_the_login_too(self):
+        self.assertTrue(host._looks_like_youtube_sign_in(
+            "ERROR: [youtube] x: Sign in to confirm your age."))
+
+    def test_other_failures_are_left_alone(self):
+        for tail in ("ERROR: Video unavailable", "HTTP Error 404", ""):
+            self.assertFalse(host._looks_like_youtube_sign_in(tail), tail)
+
+    def test_only_youtube_cookies_count(self):
+        self.assertTrue(host._jar_has_youtube(YT_JAR))
+        self.assertFalse(host._jar_has_youtube(
+            [{"name": "sp_dc", "value": "x", "domain": ".spotify.com"}]))
+        self.assertFalse(host._jar_has_youtube(None))
+
+
+class YoutubeCookiesOnlyAfterYoutubeAsks(unittest.TestCase):
+    def setUp(self):
+        fd, self.jar = tempfile.mkstemp(prefix="sg_cookies_t_", suffix=".txt")
+        os.close(fd)
+        self.addCleanup(host._remove_temp_file_quietly, self.jar)
+
+    def test_anonymous_by_default(self):
+        self.assertEqual(host._yt_dlp_cookies_args({"_ytDlpCookieFile": self.jar}, YT_PAGE), [])
+
+    def test_the_login_goes_once_youtube_has_asked(self):
+        msg = {"_ytDlpCookieFile": self.jar, "_ytDlpYoutubeCookies": True}
+        self.assertEqual(host._yt_dlp_cookies_args(msg, YT_PAGE), ["--cookies", self.jar])
+
+    def test_never_the_browser_store_for_youtube(self):
+        msg = {"_ytDlpYoutubeCookies": True, "ytDlpCookiesFromBrowser": "chrome"}
+        self.assertNotIn("--cookies-from-browser", host._yt_dlp_cookies_args(msg, YT_PAGE))
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
+class YoutubeBotCheckIsRetriedWithTheLogin(unittest.TestCase):
+    """
+    The full download path, with yt-dlp swapped for a stand-in that refuses
+    anonymous requests the way YouTube's bot check does.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        cls.video = os.path.join(cls.dir, "small.mp4")
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=2",
+             "-f", "lavfi", "-i", "sine=duration=2", "-c:v", "libx264", "-preset", "ultrafast",
+             "-c:a", "aac", "-shortest", cls.video],
+            check=True, capture_output=True,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, True)
+
+    def _run(self, jar):
+        attempts, sent = [], []
+        out = os.path.join(self.dir, "out.mp4")
+        if os.path.exists(out):
+            os.remove(out)
+        video = self.video
+        real_popen = host.subprocess.Popen
+
+        class Proc:
+            def __init__(self, cmd):
+                jar_file = cmd[cmd.index("--cookies") + 1] if "--cookies" in cmd else None
+                attempts.append(bool(jar_file and os.path.isfile(jar_file)))
+                if attempts[-1]:
+                    shutil.copyfile(video, out)
+                    self.code, self.stderr = 0, io.BytesIO(b"[download] 100%\n")
+                else:
+                    self.code, self.stderr = 1, io.BytesIO(BOT_CHECK.encode("utf-8") + b"\n")
+
+            def wait(self, timeout=None):
+                return self.code
+
+            def poll(self):
+                return self.code
+
+        saved = (host.subprocess.Popen, host.send_message, host._yt_dlp_invocation_prefix)
+        host.subprocess.Popen = lambda cmd, *a, **k: (
+            Proc(cmd) if cmd and cmd[0] == "yt-dlp" else real_popen(cmd, *a, **k))
+        host.send_message = sent.append
+        host._yt_dlp_invocation_prefix = lambda: ["yt-dlp"]
+        try:
+            msg = {"pageUrl": YT_PAGE, "url": "", "jobId": "t"}
+            if jar is not None:
+                msg["cookieJar"] = jar
+            ok, err = host.run_yt_dlp_with_updates(YT_PAGE, msg, out, "t", "YouTube")
+        finally:
+            host.subprocess.Popen, host.send_message, host._yt_dlp_invocation_prefix = saved
+        return ok, err, attempts
+
+    def test_signed_in_it_retries_with_the_login_and_succeeds(self):
+        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "sg_cookies_*")))
+        ok, err, attempts = self._run(YT_JAR)
+        self.assertEqual(attempts, [False, True], "anonymous first, then with the login")
+        self.assertTrue(ok, err)
+        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "sg_cookies_*")))
+        self.assertEqual(after - before, set(), "the cookie file was left behind")
+
+    def test_signed_out_it_says_to_sign_in_instead_of_naming_flags(self):
+        ok, err, attempts = self._run([])
+        self.assertEqual(attempts, [False], "nothing to retry with")
+        self.assertFalse(ok)
+        self.assertIn("Sign in to YouTube", err)
+        self.assertNotIn("--cookies", err)
+
+
+class QualityListGetsTheSameRetry(unittest.TestCase):
+    def test_it_retries_with_the_login_and_answers(self):
+        sent, cmds = [], []
+
+        class R:
+            def __init__(self, code, out, err):
+                self.returncode, self.stdout, self.stderr = code, out, err
+
+        def fake_run(cmd, **kw):
+            cmds.append(cmd)
+            if "--cookies" in cmd:
+                return R(0, '{"formats": []}', "")
+            return R(1, "", BOT_CHECK)
+
+        saved = (host.send_message, host._yt_dlp_invocation_prefix, host.subprocess.run)
+        host.send_message = sent.append
+        host._yt_dlp_invocation_prefix = lambda: ["yt-dlp"]
+        host.subprocess.run = fake_run
+        try:
+            host._handle_ytdlp_formats({"requestId": "q", "pageUrl": YT_PAGE, "cookieJar": YT_JAR})
+        finally:
+            host.send_message, host._yt_dlp_invocation_prefix, host.subprocess.run = saved
+        self.assertEqual(["--cookies" in c for c in cmds], [False, True])
+        reply = [m for m in sent if m.get("type") == "ytdlp_formats_result"][0]
+        self.assertNotEqual(reply.get("success"), False, reply.get("error"))
 
 
 if __name__ == "__main__":

@@ -2069,6 +2069,39 @@ def _looks_like_youtube_blocked(err_tail: str) -> bool:
     )
 
 
+def _looks_like_youtube_sign_in(err_tail: str) -> bool:
+    """YouTube wants a signed in visit: its bot check, or an age gate."""
+    t = (err_tail or "").lower()
+    return (
+        "sign in to confirm" in t
+        or "not a bot" in t
+        or "use --cookies-from-browser or --cookies" in t
+    )
+
+
+def _jar_has_youtube(cookie_jar: Any) -> bool:
+    """Whether the cookies the extension sent include any for YouTube itself."""
+    for c in cookie_jar if isinstance(cookie_jar, list) else []:
+        d = str((c or {}).get("domain") or "").lower().lstrip(".")
+        if d == "youtube.com" or d.endswith(".youtube.com"):
+            return True
+    return False
+
+
+def _youtube_sign_in_help(tried_with_login: bool) -> str:
+    if tried_with_login:
+        return (
+            "YouTube turned the request away even with your YouTube login. Reload the "
+            "video page so the login is fresh and try again. If it keeps happening, "
+            "YouTube is limiting this connection for a while."
+        )
+    return (
+        "YouTube wants a signed in visit before it hands this video over, and this "
+        "browser is not signed in to YouTube. Sign in to YouTube here, reload the "
+        "video, and download again."
+    )
+
+
 def _looks_like_cookie_db_locked(err_tail: str) -> bool:
     """Windows holds the cookie DB open while the browser runs, so yt-dlp cannot copy it."""
     t = (err_tail or "").lower()
@@ -3007,9 +3040,14 @@ def _yt_dlp_cookies_args(message: dict, target_url: str) -> List[str]:
     Prefer the cookie jar the extension handed us (already written to a temp file), then fall back
     to reading the browser store directly. YouTube stays cookie-free by default either way.
     """
-    if _yt_dlp_target_is_youtube_like(target_url):
-        return []
     jar_file = message.get("_ytDlpCookieFile")
+    if _yt_dlp_target_is_youtube_like(target_url):
+        # Signed in requests draw YouTube's attention to the account, so they
+        # only happen once YouTube has refused an anonymous one, and only with
+        # the cookies the extension handed over, never the browser's own store.
+        if message.get("_ytDlpYoutubeCookies") and jar_file and os.path.isfile(jar_file):
+            return ["--cookies", jar_file]
+        return []
     if jar_file and os.path.isfile(jar_file):
         return ["--cookies", jar_file]
     return _yt_dlp_cookies_from_browser_args(message, target_url)
@@ -3143,15 +3181,18 @@ def _handle_ytdlp_formats(message: dict) -> None:
     cookie_file = _write_netscape_cookie_file(message.get("cookieJar"))
     if cookie_file:
         message["_ytDlpCookieFile"] = cookie_file
-    cmd: List[str] = list(prefix) + [
-        "--dump-single-json",
-        "--no-download",
-        "--skip-download",
-    ]
-    cmd.extend(_yt_dlp_youtube_cli_extras(message, target))
-    cmd.extend(_yt_dlp_cookies_args(message, target))
-    cmd.extend(_yt_dlp_header_args(message, target))
-    cmd.append(target)
+    def build_cmd() -> List[str]:
+        cmd: List[str] = list(prefix) + [
+            "--dump-single-json",
+            "--no-download",
+            "--skip-download",
+        ]
+        cmd.extend(_yt_dlp_youtube_cli_extras(message, target))
+        cmd.extend(_yt_dlp_cookies_args(message, target))
+        cmd.extend(_yt_dlp_header_args(message, target))
+        cmd.append(target)
+        return cmd
+
     run_kw: Dict[str, Any] = {
         "capture_output": True,
         "text": True,
@@ -3160,7 +3201,17 @@ def _handle_ytdlp_formats(message: dict) -> None:
         "errors": "replace",
     }
     try:
-        r = subprocess.run(cmd, **run_kw)
+        r = subprocess.run(build_cmd(), **run_kw)
+        # Same rule as the download: one more go with the YouTube login, only
+        # after YouTube has refused to answer without it.
+        if (
+            r.returncode != 0
+            and _yt_dlp_target_is_youtube_like(target)
+            and _looks_like_youtube_sign_in((r.stderr or "") + (r.stdout or ""))
+            and _jar_has_youtube(message.get("cookieJar"))
+        ):
+            message["_ytDlpYoutubeCookies"] = True
+            r = subprocess.run(build_cmd(), **run_kw)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
         send_message(
             {
@@ -3176,6 +3227,8 @@ def _handle_ytdlp_formats(message: dict) -> None:
         _remove_temp_file_quietly(cookie_file)
     if r.returncode != 0 or not (r.stdout or "").strip():
         tail = ((r.stderr or "") + (r.stdout or ""))[-800:]
+        if _looks_like_youtube_sign_in(tail):
+            tail = _youtube_sign_in_help(bool(message.get("_ytDlpYoutubeCookies")))
         send_message(
             {
                 "type": "ytdlp_formats_result",
@@ -3399,6 +3452,34 @@ def run_yt_dlp_with_updates(
         _clear_active_if(proc)
         return code, stderr_lines
 
+    def run_target(target: str) -> Tuple[int, List[str]]:
+        code, lines = run_one(target)
+        if code == 0 or run_message.get("_ytDlpYoutubeCookies"):
+            return code, lines
+        if not _yt_dlp_target_is_youtube_like(target):
+            return code, lines
+        if not _looks_like_youtube_sign_in("".join(lines[-35:])):
+            return code, lines
+        # Without YouTube cookies there is nothing to retry with, and the
+        # error that follows says to sign in.
+        if not _jar_has_youtube(run_message.get("cookieJar")):
+            return code, lines
+        send_message(
+            with_job_id(
+                {
+                    "type": "progress",
+                    "phase": "downloading",
+                    "detail": "YouTube wants a signed in visit, retrying with your YouTube login",
+                    "output": output_path,
+                },
+                job_id,
+            )
+        )
+        # Kept for the rest of the job: once YouTube has asked, every later
+        # attempt needs it too, and asking anonymously again only wastes a try.
+        run_message["_ytDlpYoutubeCookies"] = True
+        return run_one(target)
+
     primary = _yt_dlp_primary_input_url(page_url, stream_url)
     plat = (platform_label or "").strip().lower()
     spotify_flow = plat == "spotify"
@@ -3429,7 +3510,7 @@ def run_yt_dlp_with_updates(
             job_id,
         )
     )
-    code, err_lines = run_one(primary)
+    code, err_lines = run_target(primary)
     if (
         code != 0
         and stream_url
@@ -3446,7 +3527,7 @@ def run_yt_dlp_with_updates(
                 job_id,
             )
         )
-        code, err_lines = run_one(stream_url)
+        code, err_lines = run_target(stream_url)
 
     # Windows locks Chrome's cookie DB while Chrome is running, so yt-dlp cannot
     # copy it. Most sites do not need those cookies at all, so drop them and try
@@ -3465,9 +3546,9 @@ def run_yt_dlp_with_updates(
                 job_id,
             )
         )
-        code, err_lines = run_one(primary)
+        code, err_lines = run_target(primary)
         if code != 0 and stream_url and primary != stream_url:
-            code, err_lines = run_one(stream_url)
+            code, err_lines = run_target(stream_url)
         tail = "".join(err_lines[-35:]).strip()
 
     if code != 0 and music_service:
@@ -3488,7 +3569,7 @@ def run_yt_dlp_with_updates(
         picked = _music_youtube_target(meta)
         if picked:
             music_match_found = True
-            code, err_lines = run_one(picked)
+            code, err_lines = run_target(picked)
             if code != 0 and _looks_like_youtube_blocked("".join(err_lines[-35:])):
                 # The right video was found; YouTube just refused this client.
                 send_message(
@@ -3508,7 +3589,7 @@ def run_yt_dlp_with_updates(
                 )
                 saved, run_message = run_message, retry_message
                 try:
-                    code, err_lines = run_one(picked)
+                    code, err_lines = run_target(picked)
                 finally:
                     run_message = saved
         else:
@@ -3524,7 +3605,7 @@ def run_yt_dlp_with_updates(
                     filter(None, [", ".join((meta.get("artists") or [])[:2]), meta["title"]])
                 ).strip()
             if q:
-                code, err_lines = run_one("ytsearch1:" + q)
+                code, err_lines = run_target("ytsearch1:" + q)
 
     _remove_temp_file_quietly(cookie_file)
 
@@ -3593,6 +3674,10 @@ def run_yt_dlp_with_updates(
             "cookie file open so they could not be read. Close the browser fully and "
             "run the download again, or sign in to the site in a different browser."
         )
+    elif _looks_like_youtube_sign_in(tail):
+        # yt-dlp's own text tells you to pass it cookie flags, which means
+        # nothing from inside the extension.
+        err = _youtube_sign_in_help(bool(run_message.get("_ytDlpYoutubeCookies")))
     if music_service:
         # Two different failures reach here and they need different words. It
         # used to blame the search either way, which read as "nothing found"
