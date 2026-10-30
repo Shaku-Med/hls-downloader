@@ -35,6 +35,7 @@ FIREFOX_BACKGROUND = {
         "public/scripts/ytdlp-sites.js",
         "public/scripts/zip-store.js",
         "public/scripts/social-post-urls.js",
+        "public/scripts/player-copy-fallback.js",
         "public/scripts/background.js",
     ]
 }
@@ -163,7 +164,10 @@ def setup() -> None:
     firefox_manifest["browser_specific_settings"] = dict(FIREFOX_GECKO)
     # filterResponseData needs a blocking webRequest listener. Chrome MV3 rejects
     # this permission, so it stays on the Firefox manifest only.
-    firefox_perms = list(firefox_manifest.get("permissions") or [])
+    # The player copy reads response bodies through chrome.debugger on Chrome.
+    # Firefox has no such permission and gets the same bytes from the blocking
+    # listener above, so the template's entry is dropped rather than copied.
+    firefox_perms = [p for p in (firefox_manifest.get("permissions") or []) if p != "debugger"]
     if "webRequestBlocking" not in firefox_perms:
         firefox_perms.append("webRequestBlocking")
     firefox_manifest["permissions"] = firefox_perms

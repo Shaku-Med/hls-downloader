@@ -24,6 +24,7 @@
       "public/scripts/ytdlp-sites.js",
       "public/scripts/zip-store.js",
       "public/scripts/social-post-urls.js",
+      "public/scripts/player-copy-fallback.js",
       "public/scripts/background.js"
     ]
   },
@@ -55,7 +56,8 @@
       ],
       "js": [
         "public/scripts/devtools-cloak.js",
-        "public/scripts/hls-playlist-hook.js"
+        "public/scripts/hls-playlist-hook.js",
+        "public/scripts/hls-player-copy.js"
       ],
       "all_frames": true,
       "match_about_blank": true,
@@ -70,7 +72,8 @@
         "file:///*"
       ],
       "js": [
-        "public/scripts/hls-playlist-bridge.js"
+        "public/scripts/hls-playlist-bridge.js",
+        "public/scripts/hls-player-copy-bridge.js"
       ],
       "all_frames": true,
       "match_about_blank": true,

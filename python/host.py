@@ -27,6 +27,11 @@ import ssl
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 from typing import Optional, Set, Any, Dict, List, Tuple
 
+try:
+    from player_copy import collect_player_copy
+except ImportError:
+    collect_player_copy = None
+
 DEFAULT_DOWNLOAD_DIR = os.path.abspath(
     os.path.normpath(os.path.expanduser(os.path.join("~", "Downloads", "TOB")))
 )
@@ -4967,6 +4972,7 @@ def _ffmpeg_remux_combined_to_output(
     *,
     container: str,
     message: Optional[dict] = None,
+    done_detail: Optional[str] = None,
 ) -> None:
     """ffmpeg mux combined TS/fMP4 to MP4; default re-encodes video for stable PTS/GOP."""
     global _active_ffmpeg
@@ -5136,7 +5142,7 @@ def _ffmpeg_remux_combined_to_output(
                     "type": "done",
                     "success": True,
                     "output": output_path,
-                    "detail": "Finished",
+                    "detail": done_detail or "Finished",
                 },
                 job_id,
             )
@@ -7969,6 +7975,24 @@ def main():
                 args=(message,),
                 daemon=True,
             ).start()
+            continue
+        # Parts only mean something to the collector reading them. One that
+        # turns up here has outlived its job and must not start a download.
+        if mtype in ("player_copy_part", "player_copy_end", "player_copy_playlists"):
+            continue
+        if mtype == "player_copy" and collect_player_copy:
+            collect_player_copy(
+                message,
+                {
+                    "read": read_message,
+                    "send": send_message,
+                    "job": with_job_id,
+                    "remux": _ffmpeg_remux_combined_to_output,
+                    "dir": _resolve_output_dir,
+                    "path": _resolve_output_path,
+                    "cancel": _CANCEL_EVENT,
+                },
+            )
             continue
         url = message.get("url", "")
         filename = message.get("filename", "stream")

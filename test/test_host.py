@@ -977,7 +977,9 @@ class MasterPlaylistDoesNotMuxAnEmptyMp4(unittest.TestCase):
         ]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         err = r.stderr or ""
-        self.assertEqual(r.returncode, 234, err[-500:])
+        # ffmpeg exits with -22. Linux keeps the low byte, 234; Windows reports
+        # the whole 32 bit value, 4294967274. The low byte is 234 on both.
+        self.assertEqual(r.returncode & 0xFF, 234, err[-500:])
         self.assertIn("does not contain any stream", err)
         self.assertIn("Invalid argument", err)
         self.assertIn("variant_bitrate", err)
@@ -1698,13 +1700,28 @@ class YoutubeChallengeRuntime(unittest.TestCase):
 
     URL = "https://www.youtube.com/watch?v=ZUEVS8EwOcI"
 
+    @staticmethod
+    def _fake(work, name):
+        # Windows only runs and finds deno.exe and node.exe, never a bare name.
+        path = os.path.join(work, name + (".exe" if os.name == "nt" else ""))
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(path, 0o755)
+        return path
+
+    @staticmethod
+    def _at(args, runtime, path):
+        # shutil.which on Windows hands back PATHEXT's casing, deno.EXE.
+        want = os.path.normcase(os.path.abspath(path))
+        for i, a in enumerate(args):
+            if a.startswith(runtime + ":") and os.path.normcase(a[len(runtime) + 1:]) == want:
+                return i
+        raise AssertionError(f"{runtime}:{path} not in {args}")
+
     def test_a_runtime_outside_path_is_named_by_absolute_path(self):
         work = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, work, True)
-        deno = os.path.join(work, "deno")
-        with open(deno, "w", encoding="utf-8") as fh:
-            fh.write("#!/bin/sh\n")
-        os.chmod(deno, 0o755)
+        deno = self._fake(work, "deno")
         real_dirs = host._js_runtime_search_dirs
         old_path = os.environ.get("PATH", "")
         host._js_runtime_search_dirs = lambda: [work]
@@ -1712,31 +1729,29 @@ class YoutubeChallengeRuntime(unittest.TestCase):
         self.addCleanup(setattr, host, "_js_runtime_search_dirs", real_dirs)
         self.addCleanup(os.environ.__setitem__, "PATH", old_path)
         args = host._yt_dlp_youtube_cli_extras({}, self.URL)
-        self.assertIn(f"deno:{os.path.abspath(deno)}", args)
+        self._at(args, "deno", deno)
         self.assertNotIn("--no-js-runtimes", args)
 
     def test_node_is_enabled_only_after_the_default_deno_is_cleared(self):
         work = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, work, True)
-        node = os.path.join(work, "node")
-        with open(node, "w", encoding="utf-8") as fh:
-            fh.write("#!/bin/sh\n")
-        os.chmod(node, 0o755)
+        node = self._fake(work, "node")
         real_dirs = host._js_runtime_search_dirs
+        old_path = os.environ.get("PATH", "")
         host._js_runtime_search_dirs = lambda: [work]
+        # Any node already installed would be found on PATH instead of this one.
+        os.environ["PATH"] = ""
         self.addCleanup(setattr, host, "_js_runtime_search_dirs", real_dirs)
+        self.addCleanup(os.environ.__setitem__, "PATH", old_path)
         args = host._yt_dlp_youtube_cli_extras({}, self.URL)
         self.assertLess(args.index("--no-js-runtimes"), args.index("--js-runtimes"))
-        self.assertIn(f"node:{os.path.abspath(node)}", args)
+        self._at(args, "node", node)
 
     def test_deno_and_node_are_both_passed_when_both_exist(self):
         work = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, work, True)
-        for name in ("deno", "node"):
-            path = os.path.join(work, name)
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write("#!/bin/sh\n")
-            os.chmod(path, 0o755)
+        deno = self._fake(work, "deno")
+        node = self._fake(work, "node")
         real_dirs = host._js_runtime_search_dirs
         old_path = os.environ.get("PATH", "")
         host._js_runtime_search_dirs = lambda: [work]
@@ -1745,8 +1760,8 @@ class YoutubeChallengeRuntime(unittest.TestCase):
         self.addCleanup(os.environ.__setitem__, "PATH", old_path)
         args = host._yt_dlp_youtube_cli_extras({}, self.URL)
         self.assertNotIn("--no-js-runtimes", args)
-        deno_at = args.index(f"deno:{os.path.abspath(os.path.join(work, 'deno'))}")
-        node_at = args.index(f"node:{os.path.abspath(os.path.join(work, 'node'))}")
+        deno_at = self._at(args, "deno", deno)
+        node_at = self._at(args, "node", node)
         self.assertLess(deno_at, node_at)
 
 

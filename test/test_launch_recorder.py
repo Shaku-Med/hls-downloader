@@ -85,6 +85,8 @@ class LaunchRecorder(unittest.TestCase):
         self.assertIn("not installed", reply["error"])
 
     def test_a_python_without_tkinter_does_not_count_as_opened(self):
+        # The Linux hint; the Windows one has its own test below.
+        host.sys.platform = "linux"
         host.subprocess.run = lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1)
         host.shutil.which = lambda name: "/usr/bin/dnf" if name == "dnf" else None
         host._handle_launch_recorder({"requestId": "r", "outputDirectory": ""})
@@ -147,6 +149,8 @@ class LaunchRecorder(unittest.TestCase):
         self.assertNotIn("python3-tkinter", reply["error"])
 
     def test_a_recorder_that_stays_up_is_success_and_keeps_the_save_folder(self):
+        # The POSIX launch. Windows starts pythonw detached, tested below.
+        host.sys.platform = "linux"
         launched = []
         work = tempfile.mkdtemp()
         self.addCleanup(lambda: os.path.isdir(work) and __import__("shutil").rmtree(work, True))
@@ -271,6 +275,28 @@ class UnbufferedHost(unittest.TestCase):
     def test_missing_pieces_do_not_invent_a_command(self):
         self.assertIsNone(host._unbuffered_host_argv(False, "", "/tmp/host.py"))
         self.assertIsNone(host._unbuffered_host_argv(False, "/usr/bin/python3", ""))
+
+
+class LaunchRecorderOnWindows(LaunchRecorder):
+    def test_it_starts_pythonw_detached_so_no_console_flashes(self):
+        host.sys.platform = "win32"
+        launched = []
+        work = tempfile.mkdtemp()
+        self.addCleanup(lambda: os.path.isdir(work) and __import__("shutil").rmtree(work, True))
+
+        def popen(argv, **kwargs):
+            launched.append((list(argv), kwargs))
+            return _Alive()
+
+        host.subprocess.Popen = popen
+        host._handle_launch_recorder({"requestId": "r", "outputDirectory": work})
+        self.assertTrue(self._last()["success"])
+        argv, kwargs = launched[0]
+        beside = os.path.join(os.path.dirname(os.path.abspath(host.sys.executable)), "pythonw.exe")
+        # pythonw whenever the install has it; only without it the helper's own Python.
+        self.assertEqual(argv[0], beside if os.path.isfile(beside) else host.sys.executable)
+        self.assertTrue(kwargs.get("creationflags"))
+        self.assertNotIn("start_new_session", kwargs)
 
 
 if __name__ == "__main__":

@@ -50,6 +50,11 @@ if (typeof importScripts === 'function') {
   } catch (e) {
     console.warn('Stuff Grabber: social-post-urls failed to load', e);
   }
+  try {
+    importScripts('player-copy-fallback.js');
+  } catch (e) {
+    console.warn('Stuff Grabber: player copy fallback failed to load', e);
+  }
 }
 
 /** @type {Record<number, ReturnType<typeof setTimeout>>} */
@@ -1734,7 +1739,11 @@ async function reinjectPageContentScripts(tabIds) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
-        files: ['public/scripts/devtools-cloak.js', 'public/scripts/hls-playlist-hook.js'],
+        files: [
+          'public/scripts/devtools-cloak.js',
+          'public/scripts/hls-playlist-hook.js',
+          'public/scripts/hls-player-copy.js',
+        ],
         world: 'MAIN',
       });
     } catch (_) {
@@ -1743,7 +1752,7 @@ async function reinjectPageContentScripts(tabIds) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId, allFrames: true },
-        files: ['public/scripts/hls-playlist-bridge.js'],
+        files: ['public/scripts/hls-playlist-bridge.js', 'public/scripts/hls-player-copy-bridge.js'],
       });
     } catch (_) {
       // Restricted pages, discarded tabs, missing file-access, etc.
@@ -2959,14 +2968,29 @@ function onHostMessage(msg, slotIndex) {
       const job = (jobs || []).find((j) => j && j.id === jobId);
       if (job && job.tabId != null) notifyTabDownloadProgress(job.tabId, job);
     } else {
-      const jobs = await patchJob(jobId, {
-        status: 'error',
-        error: msg.error || 'Failed',
-        detail: '',
-        outputPath: null,
-      });
-      const job = (jobs || []).find((j) => j && j.id === jobId);
-      if (job && job.tabId != null) notifyTabDownloadProgress(job.tabId, job);
+      const knownFail = _jobCache.get(jobId);
+      recycleSlotPort(slotIndex);
+      let retried = false;
+      try {
+        if (typeof tryPlayerCopyFallback === 'function') {
+          retried = await tryPlayerCopyFallback(jobId, knownFail, msg.error || '');
+        }
+      } catch (_) {
+        retried = false;
+      }
+      if (!retried) {
+        const jobs = await patchJob(jobId, {
+          status: 'error',
+          error: msg.error || 'Failed',
+          detail: '',
+          outputPath: null,
+        });
+        const job = (jobs || []).find((j) => j && j.id === jobId);
+        if (job) _jobCache.set(jobId, job);
+        if (job && job.tabId != null) notifyTabDownloadProgress(job.tabId, job);
+      }
+      tryDispatch();
+      return;
     }
     recycleSlotPort(slotIndex);
     tryDispatch();
@@ -3045,6 +3069,9 @@ async function launchOnSlot(slotIndex, jobId, basePayload) {
   const full = { ...basePayload, jobId, outputDirectory: outDir };
   try {
     ensurePort(slotIndex).postMessage(full);
+    if (full.type === 'player_copy' && typeof pumpPlayerCopyParts === 'function') {
+      await pumpPlayerCopyParts(slotIndex, jobId, full);
+    }
   } catch (e) {
     slots[slotIndex].jobId = null;
     slots[slotIndex].tabId = null;

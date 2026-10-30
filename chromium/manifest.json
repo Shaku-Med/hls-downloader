@@ -12,7 +12,8 @@
     "cookies",
     "alarms",
     "downloads",
-    "contextMenus"
+    "contextMenus",
+    "debugger"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -48,7 +49,8 @@
       ],
       "js": [
         "public/scripts/devtools-cloak.js",
-        "public/scripts/hls-playlist-hook.js"
+        "public/scripts/hls-playlist-hook.js",
+        "public/scripts/hls-player-copy.js"
       ],
       "all_frames": true,
       "match_about_blank": true,
@@ -63,7 +65,8 @@
         "file:///*"
       ],
       "js": [
-        "public/scripts/hls-playlist-bridge.js"
+        "public/scripts/hls-playlist-bridge.js",
+        "public/scripts/hls-player-copy-bridge.js"
       ],
       "all_frames": true,
       "match_about_blank": true,
