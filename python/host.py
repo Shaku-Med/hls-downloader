@@ -2074,6 +2074,38 @@ def _looks_like_youtube_blocked(err_tail: str) -> bool:
     )
 
 
+_YOUTUBE_FALLBACK_CLIENTS = "youtube:player_client=default,-web_embedded"
+
+
+def _looks_like_youtube_formats_missing(err_tail: str) -> bool:
+    """
+    YouTube answered, but none of the video formats came back usable.
+
+    Usually the web player's challenge could not be solved: YouTube changes its
+    player and yt-dlp catches up a release later. yt-dlp's own default clients
+    often still get the video in the meantime.
+    """
+    t = (err_tail or "").lower()
+    return (
+        "challenge solving failed" in t
+        or "signature solving failed" in t
+        or "only images are available" in t
+        or "requested format is not available" in t
+    )
+
+
+def _looks_like_youtube_challenge_failed(err_tail: str) -> bool:
+    t = (err_tail or "").lower()
+    return "challenge solving failed" in t or "signature solving failed" in t
+
+
+def _youtube_outdated_help() -> str:
+    return (
+        "YouTube changed its player and this copy of yt-dlp cannot read it yet. "
+        f'Update yt-dlp with "{sys.executable}" -m pip install -U yt-dlp and try again.'
+    )
+
+
 def _looks_like_youtube_sign_in(err_tail: str) -> bool:
     """YouTube wants a signed in visit: its bot check, or an age gate."""
     t = (err_tail or "").lower()
@@ -3217,6 +3249,15 @@ def _handle_ytdlp_formats(message: dict) -> None:
         ):
             message["_ytDlpYoutubeCookies"] = True
             r = subprocess.run(build_cmd(), **run_kw)
+        # The listing can exit cleanly with only storyboard images in it, so
+        # this goes by what yt-dlp warned about rather than the exit code.
+        if (
+            _yt_dlp_target_is_youtube_like(target)
+            and not message.get("ytDlpYoutubeExtractorArgs")
+            and _looks_like_youtube_formats_missing(r.stderr or "")
+        ):
+            message["ytDlpYoutubeExtractorArgs"] = _YOUTUBE_FALLBACK_CLIENTS
+            r = subprocess.run(build_cmd(), **run_kw)
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
         send_message(
             {
@@ -3234,6 +3275,8 @@ def _handle_ytdlp_formats(message: dict) -> None:
         tail = ((r.stderr or "") + (r.stdout or ""))[-800:]
         if _looks_like_youtube_sign_in(tail):
             tail = _youtube_sign_in_help(bool(message.get("_ytDlpYoutubeCookies")))
+        elif _looks_like_youtube_challenge_failed(tail):
+            tail = _youtube_outdated_help()
         send_message(
             {
                 "type": "ytdlp_formats_result",
@@ -3459,6 +3502,27 @@ def run_yt_dlp_with_updates(
 
     def run_target(target: str) -> Tuple[int, List[str]]:
         code, lines = run_one(target)
+        if (
+            code != 0
+            and not _CANCEL_EVENT.is_set()
+            and _yt_dlp_target_is_youtube_like(target)
+            and not run_message.get("ytDlpYoutubeExtractorArgs")
+            and _looks_like_youtube_formats_missing("".join(lines[-35:]))
+        ):
+            send_message(
+                with_job_id(
+                    {
+                        "type": "progress",
+                        "phase": "downloading",
+                        "detail": "YouTube gave no video this way, trying its other players",
+                        "output": output_path,
+                    },
+                    job_id,
+                )
+            )
+            # Kept for the rest of the job so later attempts start from what worked.
+            run_message["ytDlpYoutubeExtractorArgs"] = _YOUTUBE_FALLBACK_CLIENTS
+            code, lines = run_one(target)
         if code == 0 or run_message.get("_ytDlpYoutubeCookies"):
             return code, lines
         if not _yt_dlp_target_is_youtube_like(target):
@@ -3575,7 +3639,11 @@ def run_yt_dlp_with_updates(
         if picked:
             music_match_found = True
             code, err_lines = run_target(picked)
-            if code != 0 and _looks_like_youtube_blocked("".join(err_lines[-35:])):
+            if (
+                code != 0
+                and run_message.get("ytDlpYoutubeExtractorArgs") != _YOUTUBE_FALLBACK_CLIENTS
+                and _looks_like_youtube_blocked("".join(err_lines[-35:]))
+            ):
                 # The right video was found; YouTube just refused this client.
                 send_message(
                     with_job_id(
@@ -3589,9 +3657,7 @@ def run_yt_dlp_with_updates(
                     )
                 )
                 retry_message = dict(run_message)
-                retry_message["ytDlpYoutubeExtractorArgs"] = (
-                    "youtube:player_client=default,-web_embedded"
-                )
+                retry_message["ytDlpYoutubeExtractorArgs"] = _YOUTUBE_FALLBACK_CLIENTS
                 saved, run_message = run_message, retry_message
                 try:
                     code, err_lines = run_target(picked)
@@ -3683,6 +3749,8 @@ def run_yt_dlp_with_updates(
         # yt-dlp's own text tells you to pass it cookie flags, which means
         # nothing from inside the extension.
         err = _youtube_sign_in_help(bool(run_message.get("_ytDlpYoutubeCookies")))
+    elif _looks_like_youtube_challenge_failed(tail):
+        err = _youtube_outdated_help()
     if music_service:
         # Two different failures reach here and they need different words. It
         # used to blame the search either way, which read as "nothing found"

@@ -1941,5 +1941,136 @@ class QualityListGetsTheSameRetry(unittest.TestCase):
         self.assertNotEqual(reply.get("success"), False, reply.get("error"))
 
 
+CHALLENGE_FAILED = (
+    "WARNING: [youtube] NfyTNQ51Pn4: n challenge solving failed: Some formats may be missing. "
+    "Ensure you have a supported JavaScript runtime and challenge solver script distribution "
+    "installed.\n"
+    "WARNING: [youtube] NfyTNQ51Pn4: Some web_embedded client https formats have been skipped "
+    "as they are missing a URL.\n"
+    "WARNING: Only images are available for download. use --list-formats to see them\n"
+    "ERROR: [youtube] NfyTNQ51Pn4: Requested format is not available. Use --list-formats for a "
+    "list of available formats\n"
+)
+
+
+class YoutubeMissingFormatsAreRecognised(unittest.TestCase):
+    def test_the_failure_as_it_arrived(self):
+        self.assertTrue(host._looks_like_youtube_formats_missing(CHALLENGE_FAILED))
+        self.assertTrue(host._looks_like_youtube_challenge_failed(CHALLENGE_FAILED))
+
+    def test_other_failures_are_left_alone(self):
+        for tail in ("ERROR: Video unavailable", BOT_CHECK, "HTTP Error 404", ""):
+            self.assertFalse(host._looks_like_youtube_formats_missing(tail), tail)
+            self.assertFalse(host._looks_like_youtube_challenge_failed(tail), tail)
+
+    def test_the_update_hint_names_this_python(self):
+        self.assertIn(sys.executable, host._youtube_outdated_help())
+        self.assertIn("pip install -U yt-dlp", host._youtube_outdated_help())
+
+
+@unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "ffmpeg not installed")
+class YoutubeMissingFormatsTryTheOtherPlayers(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = tempfile.mkdtemp()
+        cls.video = os.path.join(cls.dir, "small.mp4")
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=10:duration=2",
+             "-f", "lavfi", "-i", "sine=duration=2", "-c:v", "libx264", "-preset", "ultrafast",
+             "-c:a", "aac", "-shortest", cls.video],
+            check=True, capture_output=True,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.dir, True)
+
+    def _run(self, works_with_fallback, extra=None):
+        clients, sent = [], []
+        out = os.path.join(self.dir, "out.mp4")
+        if os.path.exists(out):
+            os.remove(out)
+        video = self.video
+        real_popen = host.subprocess.Popen
+
+        class Proc:
+            def __init__(self, cmd):
+                arg = cmd[cmd.index("--extractor-args") + 1] if "--extractor-args" in cmd else ""
+                clients.append(arg)
+                if works_with_fallback and arg == host._YOUTUBE_FALLBACK_CLIENTS:
+                    shutil.copyfile(video, out)
+                    self.code, self.stderr = 0, io.BytesIO(b"[download] 100%\n")
+                else:
+                    self.code, self.stderr = 1, io.BytesIO(CHALLENGE_FAILED.encode("utf-8"))
+
+            def wait(self, timeout=None):
+                return self.code
+
+            def poll(self):
+                return self.code
+
+        saved = (host.subprocess.Popen, host.send_message, host._yt_dlp_invocation_prefix)
+        host.subprocess.Popen = lambda cmd, *a, **k: (
+            Proc(cmd) if cmd and cmd[0] == "yt-dlp" else real_popen(cmd, *a, **k))
+        host.send_message = sent.append
+        host._yt_dlp_invocation_prefix = lambda: ["yt-dlp"]
+        try:
+            msg = {"pageUrl": YT_PAGE, "url": "", "jobId": "t", **(extra or {})}
+            ok, err = host.run_yt_dlp_with_updates(YT_PAGE, msg, out, "t", "YouTube")
+        finally:
+            host.subprocess.Popen, host.send_message, host._yt_dlp_invocation_prefix = saved
+        return ok, err, clients
+
+    def test_it_retries_with_the_default_players_and_succeeds(self):
+        ok, err, clients = self._run(True)
+        self.assertTrue(ok, err)
+        self.assertEqual(len(clients), 2)
+        self.assertNotEqual(clients[0], host._YOUTUBE_FALLBACK_CLIENTS)
+        self.assertEqual(clients[1], host._YOUTUBE_FALLBACK_CLIENTS)
+
+    def test_when_nothing_works_it_says_to_update_yt_dlp(self):
+        ok, err, clients = self._run(False)
+        self.assertFalse(ok)
+        self.assertEqual(len(clients), 2, "one retry, not a loop")
+        self.assertIn("pip install -U yt-dlp", err)
+        self.assertNotIn("--list-formats", err)
+
+    def test_a_players_choice_from_the_settings_is_not_overridden(self):
+        ok, _err, clients = self._run(True, {"ytDlpYoutubeExtractorArgs": "youtube:player_client=tv"})
+        self.assertFalse(ok)
+        self.assertEqual(clients, ["youtube:player_client=tv"])
+
+
+class QualityListTriesTheOtherPlayersToo(unittest.TestCase):
+    def test_a_list_of_only_images_is_retried(self):
+        sent, cmds = [], []
+
+        class R:
+            def __init__(self, code, out, err):
+                self.returncode, self.stdout, self.stderr = code, out, err
+
+        good = '{"formats": [{"format_id": "18", "vcodec": "avc1", "acodec": "mp4a", "height": 360, "ext": "mp4"}]}'
+
+        def fake_run(cmd, **kw):
+            cmds.append(cmd)
+            if host._YOUTUBE_FALLBACK_CLIENTS in cmd:
+                return R(0, good, "")
+            return R(0, '{"formats": [{"format_id": "sb0", "vcodec": "none", "acodec": "none"}]}',
+                     CHALLENGE_FAILED)
+
+        saved = (host.send_message, host._yt_dlp_invocation_prefix, host.subprocess.run)
+        host.send_message = sent.append
+        host._yt_dlp_invocation_prefix = lambda: ["yt-dlp"]
+        host.subprocess.run = fake_run
+        try:
+            host._handle_ytdlp_formats({"requestId": "q", "pageUrl": YT_PAGE})
+        finally:
+            host.send_message, host._yt_dlp_invocation_prefix, host.subprocess.run = saved
+        self.assertEqual(len(cmds), 2)
+        reply = [m for m in sent if m.get("type") == "ytdlp_formats_result"][0]
+        self.assertNotEqual(reply.get("success"), False, reply.get("error"))
+        self.assertTrue(reply.get("formats"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -195,6 +195,8 @@ python -c "from Cryptodome.Cipher import AES; import Cryptodome; print('pycrypto
 
 YouTube downloads fail without one. The error looks like `n challenge solving failed` and then `Only images are available for download`. yt-dlp has to run a small script to unlock the real video formats. Deno or Node does that.
 
+The same error with a runtime installed means YouTube changed its player and yt-dlp has not caught up. That happens every few months. The helper then tries once more with yt-dlp's other YouTube players, which usually still get the video. If that fails too, the card tells you to update yt-dlp (see Troubleshooting).
+
 On Windows:
 
 ```text
@@ -586,6 +588,8 @@ python -m yt_dlp --version
 ```
 
 Then run `python python/install.py` again with the same Python.
+
+YouTube suddenly fails on every video with `challenge solving failed`, or the card says YouTube changed its player: yt-dlp is out of date. Update it with the command above, using the Python the helper runs (the card shows its full path). Nothing needs reloading; the next download uses the new version.
 
 MEGA downloads fail with a missing cryptography package:
 
